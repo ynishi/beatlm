@@ -1,0 +1,18 @@
+[package]
+name          = "beatlm-core"
+description   = "Domain core of beatlm: frame budgets, sync promises, execution plans and kernel IR, free of GPU APIs"
+documentation = "https://docs.rs/beatlm-core"
+readme        = "../../README.md"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+authors.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+
+[dependencies]
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

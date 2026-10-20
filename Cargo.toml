@@ -1,0 +1,41 @@
+[workspace]
+resolver = "3"
+members = [
+    # The domain: time budgets, sync promises, plans, kernel IR. Pure, and
+    # free of wgpu and naga, so it reads the same on native and on wasm.
+    "crates/beatlm-core",
+    # The umbrella: what a user depends on. Turns the core's decisions into
+    # GPU work through wgpu, and owns the translation from outside formats.
+    "crates/beatlm",
+]
+
+[workspace.package]
+version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.87"
+authors      = ["Yutaka Nishimura <ytk.nishimura@gmail.com>"]
+license      = "MIT OR Apache-2.0"
+repository   = "https://github.com/ynishi/beatlm"
+homepage     = "https://github.com/ynishi/beatlm"
+
+[workspace.dependencies]
+beatlm-core = { path = "crates/beatlm-core", version = "0.1.0" }
+thiserror   = "2"
+# Native backends we target first, plus the browser. `wgsl` is the only
+# shader input: kernels are generated as WGSL text and validated by naga.
+wgpu = { version = "30", default-features = false, features = [
+    "std",
+    "wgsl",
+    "metal",
+    "vulkan",
+    "webgpu",
+] }
+naga = { version = "30", default-features = false, features = ["wgsl-in"] }
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_code  = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"

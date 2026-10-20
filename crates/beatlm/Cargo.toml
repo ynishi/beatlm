@@ -1,0 +1,21 @@
+[package]
+name          = "beatlm"
+description   = "Frame-budgeted neural inference engine for real-time audio/visual work on wgpu"
+documentation = "https://docs.rs/beatlm"
+readme        = "../../README.md"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+authors.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+
+[dependencies]
+beatlm-core = { workspace = true }
+naga        = { workspace = true }
+thiserror   = { workspace = true }
+wgpu        = { workspace = true }
+
+[lints]
+workspace = true

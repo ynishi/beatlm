@@ -1,0 +1,26 @@
+# Rust build artifact
+target
+
+# Local git worktrees (`just worktree-new`)
+.worktrees
+
+# Model weights and other files fetched at test or bench time. They are
+# third-party material under their own terms and are never committed; see
+# PUBLIC_DEVELOPMENT.md, "Third-party material".
+models
+
+# What this repository tells an agent is AGENTS.md. Claude Code reads
+# CLAUDE.md instead, so the one tracked file under .claude/ is a symlink back
+# to AGENTS.md. Everything else a session leaves — a personal CLAUDE.local.md,
+# a CLAUDE.md beside a crate, local settings — is somebody's local state.
+# `CLAUDE*.md` matches at every depth; `**/.claude/*` is the directory itself.
+# The negation goes last because git takes the last matching pattern.
+CLAUDE*.md
+**/.claude/*
+!.claude/CLAUDE.md
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/

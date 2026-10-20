@@ -1,0 +1,60 @@
+# Runs `just check`, the definition of green. The gates live in the Justfile;
+# this file only provides a machine to run them on.
+#
+# What this does not cover: tests that need a real GPU adapter. A hosted
+# runner gives no guarantee of one, and a GPU test that skips itself would
+# contribute a green step that checked nothing. Those run locally, and a
+# report says when they were run.
+
+name: check
+
+on:
+  pull_request:
+    paths-ignore:
+      - '.claude/**'
+      - 'AGENTS.md'
+      - 'CHANGELOG.md'
+      - 'CONTRIBUTING.md'
+      - 'LICENSE-APACHE'
+      - 'LICENSE-MIT'
+      - 'PUBLIC_DEVELOPMENT.md'
+      - 'README.md'
+      - 'SECURITY.md'
+      - 'docs/**'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '.claude/**'
+      - 'AGENTS.md'
+      - 'CHANGELOG.md'
+      - 'CONTRIBUTING.md'
+      - 'LICENSE-APACHE'
+      - 'LICENSE-MIT'
+      - 'PUBLIC_DEVELOPMENT.md'
+      - 'README.md'
+      - 'SECURITY.md'
+      - 'docs/**'
+
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    # Metal is the first native backend, so the hosted machine is macOS.
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      # rust-toolchain.toml pins the version, components and the wasm target.
+      - run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+      - uses: extractions/setup-just@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - run: just check
