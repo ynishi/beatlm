@@ -10,9 +10,11 @@ tracks. Nothing to wire up; nothing said twice.
 - Issue, branch, commit and PR conventions:
   [CONTRIBUTING.md](CONTRIBUTING.md)
 - Security reports: [SECURITY.md](SECURITY.md)
-- Decisions that outlive a change: `docs/adr/`
-- API detail lives in RustDoc (`cargo doc`); code documentation outranks stale
-  issue text.
+- Design — architecture, rules and their owners, decisions with the
+  measurements that settled them — lives in the crate docs (`cargo doc`):
+  start at `beatlm-core`'s crate root. There is no design directory; write
+  design where the code it constrains is defined. Code documentation outranks
+  stale issue text.
 - Never work on `main`; one branch per issue, cut from `origin/main` after a
   fetch. `just worktree-new <type> <slug>` from the main checkout does that and
   runs `just branch-check`.
