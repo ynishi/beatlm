@@ -12,3 +12,10 @@ and this project adheres to
 
 - Workspace with `beatlm-core` (pure domain) and `beatlm` (wgpu umbrella),
   building for native targets and `wasm32-unknown-unknown`.
+- `beatlm-core` timing domain: frame budgets, a measurement-fed cost model,
+  delivery promises (fixed latency, same frame, on beat) and a scheduler that
+  delivers results exactly on their promised frame or reports the miss.
+
+### Changed
+
+- Design is documented in the crate docs; the separate ADR directory is gone.
