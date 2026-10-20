@@ -1,0 +1,21 @@
+[package]
+name          = "beatlm-bench"
+description   = "Headless benchmark for beatlm: a synthetic GPU load driven through the frame loop, reporting GPU and CPU timing"
+publish       = false
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+authors.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+
+[dependencies]
+anyhow      = { workspace = true }
+beatlm      = { workspace = true }
+beatlm-core = { workspace = true }
+pollster    = { workspace = true }
+wgpu        = { workspace = true }
+
+[lints]
+workspace = true

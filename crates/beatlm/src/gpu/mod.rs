@@ -1,0 +1,31 @@
+//! The GPU side of beatlm: what wgpu reports, translated into the core's
+//! vocabulary.
+//!
+//! This module is the one place wgpu timestamp queries are seen. Everything
+//! past it deals in [`beatlm_core::time::Micros`] and
+//! [`beatlm_core::time::FrameIndex`], which is what lets the
+//! [`CostModel`](beatlm_core::cost::CostModel) be fed from measurements without
+//! knowing what a tick is. The rules this module owns:
+//!
+//! - **A tick is converted once, here.** A timestamp pair becomes a duration in
+//!   microseconds using the queue's timestamp period, and nothing outside this
+//!   module sees a raw tick.
+//! - **Readback never stalls the frame loop.** Results come back through a
+//!   ring of buffers, one slot per frame in flight. A frame whose slot is still
+//!   in flight is not timed and the skip is counted; waiting for the slot would
+//!   move GPU latency onto the host's frame, which is the cost this module
+//!   exists to avoid.
+//! - **Nothing here blocks or reads a clock.** The host decides when to poll
+//!   the device, and the module only reports what has completed by then. That
+//!   keeps one code path valid on native, where polling is the host's call, and
+//!   in a browser, where it can never block.
+//! - **Only timestamps are read back.** Timing data is eight bytes per query;
+//!   the steady-state loop reads nothing else from the GPU.
+//!
+//! [`SliceTimer`] is the entry point; the host's side of the frame it plugs into
+//! is described in the [crate documentation](crate#the-hosts-side-of-a-frame).
+
+mod ring;
+mod timer;
+
+pub use timer::{FrameTimestamps, FrameTiming, RING_DEPTH, SliceTimer, TimerError, TimerStats};
