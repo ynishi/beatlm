@@ -20,7 +20,6 @@ on:
       - 'PUBLIC_DEVELOPMENT.md'
       - 'README.md'
       - 'SECURITY.md'
-      - 'docs/**'
   workflow_dispatch:
   push:
     branches: [main]
@@ -34,7 +33,6 @@ on:
       - 'PUBLIC_DEVELOPMENT.md'
       - 'README.md'
       - 'SECURITY.md'
-      - 'docs/**'
 
 concurrency:
   group: check-${{ github.ref }}

@@ -7,7 +7,7 @@ default:
     @just --list
 
 # Everything a change owes before it is handed over.
-check: rust-fmt-check rust-clippy rust-test wasm-check deny
+check: rust-fmt-check rust-clippy rust-test rust-doc wasm-check deny
 
 rust-fmt-check:
     cargo fmt --all -- --check
@@ -17,6 +17,11 @@ rust-clippy:
 
 rust-test:
     cargo test --workspace
+
+# The design lives in the crate docs, so a missing doc or a broken link is a
+# broken design document, and fails like one.
+rust-doc:
+    RUSTDOCFLAGS="-D warnings -D missing_docs" cargo doc --workspace --no-deps
 
 # The browser is a first-class target: the umbrella must build for it on
 # every change, not when someone gets round to the demo.

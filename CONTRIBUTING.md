@@ -107,9 +107,14 @@ rule. The test is whether deleting it lets somebody repeat the mistake. If
 deleting it costs nothing it is a report on how a change went, and that belongs
 in the commit message.
 
-Decisions that outlive a single change — a concurrency model, a sync promise —
-are recorded under `docs/adr/`, one decision per file, with the measurement that
-settled it.
+**Design lives in the crate docs.** Architecture, the rules and who owns them,
+and decisions that outlive a single change — a concurrency model, a sync
+promise — are written as `//!` documentation in the crate or module that owns
+them, with the measurement that settled them. There is no separate design
+directory: a design document beside the code is edited by hand, drifts, and
+stops being read, while a crate doc is changed in the same commit as the code
+it describes and is checked by `just check`. A decision still open is written
+there as open, with what will settle it.
 
 ## Preferred commit format
 
