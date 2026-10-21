@@ -16,6 +16,12 @@ usage: beatlm-bench [options]
   --workload W      synthetic or net                        (default synthetic)
   --mode M          concurrency candidate: sync, thread or async (default sync)
   --runs N          repeat the whole run N times on one device (default 1)
+  --estimator E     cost estimate: mean-sigmas, quantile or capped
+                                                           (default quantile)
+  --background-load run a competing GPU load from a second device on the
+                    same adapter, from before the first frame to after the last
+  --background-iters N  loop iterations per invocation of the competing load's
+                    kernel                                  (default 4000)
   --help            print this text";
 
 /// Loop iterations per slice-kernel invocation that put one slice at 0.8 to
@@ -25,6 +31,34 @@ pub const DEFAULT_SLICE_ITERS: u32 = 500;
 /// Loop iterations per pixel that put the render pass at about 2 ms on an
 /// Apple M1 Pro (Metal); see the crate documentation.
 pub const DEFAULT_RENDER_ITERS: u32 = 50;
+
+/// Loop iterations per invocation of the competing load's kernel; see the
+/// crate documentation for what it did to the slices' measured times.
+pub const DEFAULT_BACKGROUND_ITERS: u32 = 4_000;
+
+/// Which statistic the cost model reads a slice's measurements with; the
+/// parameters of each are constants in `engine.rs`. The default is the one the
+/// measurements in `beatlm_core::cost` chose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EstimatorKind {
+    /// `beatlm_core::cost::Estimator::MeanPlusSigmas`.
+    MeanSigmas,
+    /// `beatlm_core::cost::Estimator::WindowedQuantile`.
+    Quantile,
+    /// `beatlm_core::cost::Estimator::CappedDeviation`.
+    Capped,
+}
+
+impl EstimatorKind {
+    /// The spelling `--estimator` accepts and the report prints.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::MeanSigmas => "mean-sigmas",
+            Self::Quantile => "quantile",
+            Self::Capped => "capped",
+        }
+    }
+}
 
 /// Which concurrency candidate drives the frame; the crate documentation says
 /// what each one does and what stays the same between them.
@@ -92,6 +126,13 @@ pub struct Args {
     pub mode: Mode,
     /// How many times the whole run is repeated in one process.
     pub runs: u32,
+    /// The statistic the cost model estimates a slice with.
+    pub estimator: EstimatorKind,
+    /// Whether a second device on the same adapter competes for the GPU for
+    /// the length of each run.
+    pub background_load: bool,
+    /// Loop iterations per invocation of the competing load's kernel.
+    pub background_iters: u32,
 }
 
 impl Default for Args {
@@ -106,6 +147,9 @@ impl Default for Args {
             workload: WorkloadKind::Synthetic,
             mode: Mode::Sync,
             runs: 1,
+            estimator: EstimatorKind::Quantile,
+            background_load: false,
+            background_iters: DEFAULT_BACKGROUND_ITERS,
         }
     }
 }
@@ -133,6 +177,7 @@ where
 {
     let mut out = Args::default();
     let mut slices_given = false;
+    let mut background_iters_given = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let (name, inline) = match arg.split_once('=') {
@@ -161,6 +206,12 @@ where
             "--workload" => out.workload = workload(&value()?)?,
             "--mode" => out.mode = mode(&value()?)?,
             "--runs" => out.runs = number(&name, &value()?)?,
+            "--estimator" => out.estimator = estimator(&value()?)?,
+            "--background-load" => out.background_load = true,
+            "--background-iters" => {
+                out.background_iters = number(&name, &value()?)?;
+                background_iters_given = true;
+            }
             _ => bail!("unknown option {name}"),
         }
     }
@@ -172,6 +223,12 @@ where
     }
     if out.runs == 0 {
         bail!("--runs must be at least 1");
+    }
+    if out.background_iters == 0 {
+        bail!("--background-iters must be at least 1");
+    }
+    if background_iters_given && !out.background_load {
+        bail!("--background-iters has no effect without --background-load");
     }
     if out.workload == WorkloadKind::Net {
         // The network's operations are its slices.
@@ -192,6 +249,18 @@ fn workload(text: &str) -> Result<WorkloadKind> {
         .into_iter()
         .find(|w| w.name() == text)
         .with_context(|| format!("--workload: {text:?} is not one of synthetic, net"))
+}
+
+/// Parses the value of `--estimator`.
+fn estimator(text: &str) -> Result<EstimatorKind> {
+    [
+        EstimatorKind::MeanSigmas,
+        EstimatorKind::Quantile,
+        EstimatorKind::Capped,
+    ]
+    .into_iter()
+    .find(|e| e.name() == text)
+    .with_context(|| format!("--estimator: {text:?} is not one of mean-sigmas, quantile, capped"))
 }
 
 /// Parses the value of `--mode`.
@@ -285,6 +354,31 @@ mod tests {
         assert!(parse_strs(&["--workload", "net", "--slices", &ops]).is_ok());
         assert!(parse_strs(&["--workload", "net", "--slices", "3"]).is_err());
         assert!(parse_strs(&["--workload", "gpt"]).is_err());
+    }
+
+    #[test]
+    fn the_estimator_and_the_background_load_are_parsed() {
+        let a = Args::default();
+        assert_eq!(a.estimator, EstimatorKind::Quantile);
+        assert!(!a.background_load);
+        for kind in [
+            EstimatorKind::MeanSigmas,
+            EstimatorKind::Quantile,
+            EstimatorKind::Capped,
+        ] {
+            let Command::Run(a) = parse_strs(&["--estimator", kind.name()]).unwrap() else {
+                panic!("expected a run");
+            };
+            assert_eq!(a.estimator, kind);
+        }
+        let Command::Run(a) = parse_strs(&["--background-load", "--background-iters=900"]).unwrap()
+        else {
+            panic!("expected a run");
+        };
+        assert_eq!((a.background_load, a.background_iters), (true, 900));
+        assert!(parse_strs(&["--estimator", "median"]).is_err());
+        assert!(parse_strs(&["--background-load", "--background-iters", "0"]).is_err());
+        assert!(parse_strs(&["--background-iters", "900"]).is_err());
     }
 
     #[test]

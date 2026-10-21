@@ -338,6 +338,7 @@ impl Scheduler {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::cost::Estimator;
 
     const PERIOD: u64 = 1_000;
 
@@ -363,7 +364,14 @@ mod tests {
 
     /// Every unmeasured slice costs 100 us.
     fn cost() -> CostModel {
-        CostModel::new(Micros::new(100), 1.0, 0.0).unwrap()
+        CostModel::new(
+            Micros::new(100),
+            Estimator::MeanPlusSigmas {
+                alpha: 1.0,
+                sigmas: 0.0,
+            },
+        )
+        .unwrap()
     }
 
     fn slices(ids: &[u32]) -> Vec<SliceId> {
