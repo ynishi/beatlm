@@ -52,11 +52,15 @@
 //!   models that fit one frame's budget.
 //! - **On beat** — the result lands on the first frame starting at or after a
 //!   beat. The beat is chosen when the input is submitted, far enough ahead to
-//!   cover the measured cost of the work plus a margin, so generation can be
-//!   started early and still hit the bar.
+//!   cover the measured cost of the work queued ahead of it and its own, spread
+//!   over frames of the budget the host expects, plus a margin, so generation
+//!   can be started early and still hit the bar. The beats are the policy's
+//!   grid until the host changes tempo.
 //!
 //! A promise that cannot be kept is reported, never stretched: the host is told
-//! the deadline was missed and what to show instead ([`sync::MissPolicy`]).
+//! the deadline was missed and what to show instead ([`sync::MissPolicy`]). A
+//! job that can no longer make its deadline is given up as soon as the
+//! scheduler expects it, so its GPU time goes to the jobs behind it.
 //!
 //! ## Rules
 //!
@@ -70,8 +74,11 @@
 //! | A job's output stays intact until its delivery frame is rendered: the host keeps one output slot per in-flight job. | [`sync::SyncPolicy::max_in_flight`] |
 //! | The summed estimate of the slices run in a frame never exceeds that frame's budget. | [`schedule::Scheduler::plan_frame`] |
 //! | A frame's budget is its period minus measured render time minus a margin, never negative. | [`budget::Budget::for_frame`] |
-//! | An on-beat deadline is the first beat at or after submission time plus estimated work plus margin. | [`schedule::Scheduler::submit`] |
-//! | A missed deadline is always reported, with the policy that says what to show. | [`schedule::Scheduler::plan_frame`] |
+//! | Work on frames not yet planned is projected one way: pending jobs' remaining slices in submission order, a frame filled until a slice does not fit, the planned frame at its own budget and later frames at the budget the host expects. | [`schedule`](schedule#projecting-the-queue-onto-frames-to-come) (the expected budget set by [`schedule::Scheduler::set_expected_budget`]) |
+//! | An on-beat deadline is the first beat at or after the job's projected finish plus margin, after the work kept ahead of it; it is fixed at submission, and neither a later budget nor a tempo change moves it. | [`schedule::Scheduler::submit`] |
+//! | A job projected to finish after the frame that keeps its deadline gets no more slices and is reported missed in that plan, so the jobs behind it are not held up. | [`schedule::Scheduler::plan_frame`] |
+//! | A missed deadline is always reported, no later than the frame its deadline arrives with, with the deadline it is for and the policy that says what to show. | [`schedule::Scheduler::plan_frame`] |
+//! | A beat comes from the grid in effect at that beat; a grid put in effect from an instant governs the beats from that instant on. | [`time::BeatMap`] (changed through [`schedule::Scheduler::replace_beat_grid`]) |
 //! | Cost estimates change only through measurements. | [`cost::CostModel::record`] |
 //! | Dispatches are planned to fit a duration bound, because a GPU cannot be preempted mid-dispatch: a kernel whose measured duration exceeds the bound is split into parts expected to fit it. The bound is a planning target, not a guarantee; measured dispatches can still exceed it, and how often is measured, not assumed. | [`kernel::Program::parts_within`] (carried out by [`kernel::Program::split`], whose parts cover the output exactly once: the [`kernel#rules`] list) |
 //! | Tensors whose lifetimes overlap never share memory; arenas respect the adapter's binding size and offset alignment; a tensor too large for an arena is an error, never split. | [`memory::MemoryPlan`] |

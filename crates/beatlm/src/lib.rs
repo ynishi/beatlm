@@ -39,8 +39,11 @@
 //! The promises in [`beatlm_core`] hold only if the host keeps this order
 //! every frame, on the queue the renderer uses:
 //!
-//! 1. Report the frame's start and the render time measured last frame, and
-//!    submit the frame's input, so a same-frame job is planned with it.
+//! 1. Report the frame's start and the render time measured last frame, bring
+//!    the scheduler's forecast of later frames' budget and, on a tempo change,
+//!    its beats up to date, and submit the frame's input, so a same-frame job
+//!    is planned with it and an on-beat job is placed with the current
+//!    forecast.
 //! 2. Submit the slices the frame's plan hands out.
 //! 3. Render, using the results the plan delivers and delaying the source by
 //!    the promised latency.

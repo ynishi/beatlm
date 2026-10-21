@@ -311,25 +311,31 @@
 //!
 //! **One input at a time.** A job of this model takes several frames' budget,
 //! and jobs run in submission order and never interleave (the core's
-//! scheduler owns the rule). Submitting every frame's input then starves every
-//! job after the first: each reaches the queue only when the one before it
-//! has held the budget up to its own deadline, gets its deadline frame and
-//! misses. The engine's test
-//! `a_job_longer_than_a_frame_starves_when_every_frame_submits_and_not_when_free`
+//! scheduler owns the rule). Submitting every frame's input then queues most
+//! jobs behind work that leaves them too few frames, and the scheduler
+//! abandons each of those in the frame it arrives and reports it missed (it
+//! owns that rule too). The engine's test
+//! `a_job_longer_than_a_frame_misses_most_inputs_when_every_frame_submits_and_none_when_free`
 //! shows it on the scheduler alone, with a job of five frames' estimates under
-//! latency 5: every frame's input delivers 1 result in 120 frames and misses
-//! 114, where submitting only when the engine is free delivers 23 and misses
-//! none. So `--submit` (default `every`, and `free` for `depth`) has a second
-//! mode: a frame submits its input only when the job submitted last has had
-//! all its slices handed out, or has left the scheduler; otherwise that
-//! frame's input is not run, as a host skips frames of its source for a model
-//! slower than its frame rate. The promise is unchanged for every input that
-//! is run: its result is delivered exactly `k` frames after it. At most one
-//! job has slices left at a time, so the loop's timer holds one job's slices
-//! (`engine::jobs_with_slices`), and the unsplit model's 155 kernels times
-//! `k + 1` jobs, which the timer could not hold for `k` past 12, never has to
-//! be timed. `submitted` in the report counts the inputs run; `delivered` per
-//! second is the rate depth results arrive at.
+//! latency 5: every frame's input delivers 26 results in 120 frames and misses
+//! 93, where submitting only when the engine is free delivers 23 and misses
+//! none. Before the scheduler abandoned such jobs it was worse: each kept job
+//! held the budget to its deadline, the one behind it started too late, and
+//! every frame's input delivered 1 and missed 114. So `--submit` (default
+//! `every`, and `free` for `depth`) has a second mode: a frame submits its
+//! input only when the job submitted last has had all its slices handed out,
+//! or has left the scheduler; otherwise that frame's input is not run, as a
+//! host skips frames of its source for a model slower than its frame rate. The
+//! promise is unchanged for every input that is run: its result is delivered
+//! exactly `k` frames after it. It stays the depth default although `every`
+//! now delivers about as many results, for two reasons: each input it runs is
+//! delivered, so `missed` counts broken promises and not inputs that could
+//! never have been kept; and at most one job has slices left at a time, so the
+//! loop's timer holds one job's slices (`engine::jobs_with_slices`), and the
+//! unsplit model's 155 kernels times `k + 1` jobs, which the timer could not
+//! hold for `k` past 12, never has to be timed. `submitted` in the report
+//! counts the inputs run; `delivered` per second is the rate depth results
+//! arrive at.
 //!
 //! **The warm-up runs one slot per submission.** It used to encode every slot
 //! into one command buffer; at 434 pixels and `--latency 13` that was 14 runs

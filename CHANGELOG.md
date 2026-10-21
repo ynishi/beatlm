@@ -91,3 +91,9 @@ and this project adheres to
   64x32 outputs per workgroup, 4x4 per invocation); the 3x3 convolution is an
   implicit GEMM. Splits fall on 64-row boundaries. Depth Anything V2 Small
   runs about four times faster with unchanged results.
+- On-beat deadlines are projected against the expected frame budget and the
+  jobs queued ahead (`Scheduler::set_expected_budget`); a job that cannot make
+  its deadline is abandoned and reported at once (`Missed::due`); the beat
+  grid lives in `SyncPolicy::OnBeat` and can be replaced mid-session
+  (`replace_beat_grid`, `time::BeatMap`). `Scheduler::new` no longer takes a
+  grid or returns a `Result` (breaking).
