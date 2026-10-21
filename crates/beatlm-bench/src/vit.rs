@@ -20,7 +20,10 @@ use beatlm_core::kernel::{
 };
 use beatlm_core::memory::TensorId;
 
-use crate::harness::{assert_close, device, run_on_gpu};
+use crate::harness::{
+    CHAIN as H, CHAIN_OUT as Y, assert_chain_matches, assert_close, chain as graph, device,
+    run_on_gpu, weights,
+};
 use crate::net::uniform;
 use crate::reference;
 
@@ -34,61 +37,16 @@ const PATCH: u32 = 14;
 const X: TensorId = TensorId::new(0);
 const W: TensorId = TensorId::new(1);
 const B: TensorId = TensorId::new(2);
-const H: TensorId = TensorId::new(10);
-const Y: TensorId = TensorId::new(20);
 
 /// Part counts each operation is split into: whole, counts that do and do not
 /// divide the kernels' extents, the 86 tile rows of 1370 query rows, and a
 /// count past what the tiled kernels allow, which clamps.
 const PARTS: [u32; 5] = [1, 3, 7, 86, 200];
 
-/// A graph of `ops` in order, the first reading `inputs`, each writing the
-/// next tensor from `H` and the last writing `Y`.
-fn graph(inputs: &[(TensorId, &Vec<f32>)], ops: &[OpKind]) -> Graph {
-    let mut g = Graph::new();
-    for &(id, v) in inputs {
-        g.tensor(id, TensorRole::Weight, v.len() as u64).unwrap();
-    }
-    for (i, &op) in ops.iter().enumerate() {
-        let last = i + 1 == ops.len();
-        let out = if last {
-            Y
-        } else {
-            TensorId::new(H.get() + i as u32)
-        };
-        let role = if last {
-            TensorRole::Output
-        } else {
-            TensorRole::Activation
-        };
-        g.tensor(out, role, op.output_elements()).unwrap();
-        g.push(op, out).unwrap();
-    }
-    g
-}
-
-/// `graph` on the GPU, fused and unfused, whole and in each of [`PARTS`],
-/// against the reference interpreter and against itself run whole.
+/// `graph` on the GPU against the reference, fused and unfused, whole and in
+/// each of [`PARTS`].
 fn assert_matches(what: &str, g: &Graph, inputs: &[(TensorId, &Vec<f32>)]) {
-    let (device, queue) = device();
-    let values: BTreeMap<TensorId, Vec<f32>> =
-        inputs.iter().map(|&(id, v)| (id, v.clone())).collect();
-    let mut want = values.clone();
-    reference::run(g, &mut want);
-    for fusion in [Fusion::On, Fusion::Off] {
-        let whole = run_on_gpu(&device, &queue, g, fusion, 1, &values);
-        for parts in PARTS {
-            let got = run_on_gpu(&device, &queue, g, fusion, parts, &values);
-            let case = format!("{what}, fusion {fusion:?}, {parts} parts");
-            assert_close(&got[&Y], &want[&Y], &case);
-            assert_close(&got[&Y], &whole[&Y], &format!("{case}, against whole"));
-        }
-    }
-}
-
-fn weights(seed: u64, count: u32, fan_in: u32) -> Vec<f32> {
-    let s = 1.0 / (fan_in as f32).sqrt();
-    uniform(seed, count as usize, -s, s)
+    assert_chain_matches(what, g, inputs, &PARTS);
 }
 
 #[test]

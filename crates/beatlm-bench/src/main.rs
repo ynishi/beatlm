@@ -468,6 +468,8 @@ mod args;
 mod calibrate;
 mod counters;
 mod device;
+#[cfg(test)]
+mod dpt;
 mod engine;
 #[cfg(test)]
 mod harness;

@@ -63,6 +63,11 @@ and this project adheres to
   a feature map; layer norm takes its own epsilon.
 - `beatlm::model`: graph building from weights by role, and the Depth Anything
   V2 Small encoder, checked against the transformers reference.
+- Kernel IR operations for a DPT decoder: strided 3x3 convolution, 1x1
+  convolution, transposed convolution with kernel equal to stride, bilinear
+  resize with `align_corners=True`, and a ReLU prologue on 3x3 convolutions.
+- The whole Depth Anything V2 Small model (`model::depth_anything_v2::model`),
+  whose depth matches the transformers reference on the real weights.
 
 ### Changed
 

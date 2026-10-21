@@ -79,7 +79,7 @@
 //! | The steady-state loop allocates nothing and reads nothing back except timestamps. | the plan |
 //! | A kernel stays within the adapter's workgroup memory and requests only features the adapter has; every kernel has a baseline variant that needs no optional feature, and the variant is selected from the device's profile. | [`kernel::KernelSpec::check`] (selection by [`kernel::KernelSpec::select_variant`]) |
 //! | A tensor's lifetime is derived from the kernels that use it, never stated separately, so the memory plan and the IR cannot disagree. | [`kernel::Program::tensors`] |
-//! | An element-wise operation is fused into the heavy kernel before it only when the tensor between them has no other consumer; fusion is deterministic and changes no result beyond floating-point contraction and reassociation. | [`kernel::Graph::lower`] (the [`kernel#rules`] list) |
+//! | An element-wise operation is fused into the heavy kernel before it only when the tensor between them has no other consumer; a ReLU that is not is fused into the 3x3 convolution right after it, as a prologue, only when that convolution alone reads its result; fusion is deterministic and changes no result beyond floating-point contraction and reassociation. | [`kernel::Graph::lower`] (the [`kernel#rules`] list) |
 //!
 //! ## What changes, and where
 //!

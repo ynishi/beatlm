@@ -11,8 +11,76 @@ use std::collections::BTreeMap;
 use beatlm::codegen::Kernels;
 use beatlm::gpu::Arenas;
 use beatlm_core::device::DeviceProfile;
-use beatlm_core::kernel::{Fusion, Graph, TensorRole};
+use beatlm_core::kernel::{Fusion, Graph, OpKind, TensorRole};
 use beatlm_core::memory::{MemoryPlan, TensorId};
+
+/// The tensor the first operation of a [`chain`] writes; each later one
+/// writes the next id.
+pub(crate) const CHAIN: TensorId = TensorId::new(10);
+/// The tensor the last operation of a [`chain`] writes: its output.
+pub(crate) const CHAIN_OUT: TensorId = TensorId::new(20);
+
+/// A graph of `ops` in order, the first reading `inputs` (declared as
+/// weights), each writing the next tensor from [`CHAIN`] and the last writing
+/// [`CHAIN_OUT`]. At most ten operations, so the ids stay apart.
+pub(crate) fn chain(inputs: &[(TensorId, &Vec<f32>)], ops: &[OpKind]) -> Graph {
+    let mut g = Graph::new();
+    for &(id, v) in inputs {
+        g.tensor(id, TensorRole::Weight, v.len() as u64).unwrap();
+    }
+    for (i, &op) in ops.iter().enumerate() {
+        let last = i + 1 == ops.len();
+        let out = if last {
+            CHAIN_OUT
+        } else {
+            TensorId::new(CHAIN.get() + i as u32)
+        };
+        let role = if last {
+            TensorRole::Output
+        } else {
+            TensorRole::Activation
+        };
+        g.tensor(out, role, op.output_elements()).unwrap();
+        g.push(op, out).unwrap();
+    }
+    g
+}
+
+/// `graph` on the GPU, fused and unfused, whole and split into each of
+/// `parts`, against the reference interpreter and against itself run whole;
+/// compares [`CHAIN_OUT`].
+pub(crate) fn assert_chain_matches(
+    what: &str,
+    graph: &Graph,
+    inputs: &[(TensorId, &Vec<f32>)],
+    parts: &[u32],
+) {
+    let (device, queue) = device();
+    let values: BTreeMap<TensorId, Vec<f32>> =
+        inputs.iter().map(|&(id, v)| (id, v.clone())).collect();
+    let mut want = values.clone();
+    crate::reference::run(graph, &mut want);
+    for fusion in [Fusion::On, Fusion::Off] {
+        let whole = run_on_gpu(&device, &queue, graph, fusion, 1, &values);
+        for &count in parts {
+            let got = run_on_gpu(&device, &queue, graph, fusion, count, &values);
+            let case = format!("{what}, fusion {fusion:?}, {count} parts");
+            assert_close(&got[&CHAIN_OUT], &want[&CHAIN_OUT], &case);
+            assert_close(
+                &got[&CHAIN_OUT],
+                &whole[&CHAIN_OUT],
+                &format!("{case}, against whole"),
+            );
+        }
+    }
+}
+
+/// `count` uniform random numbers scaled by `fan_in`, as a trained layer's
+/// weights are, so sums stay near one.
+pub(crate) fn weights(seed: u64, count: u32, fan_in: u32) -> Vec<f32> {
+    let s = 1.0 / (fan_in as f32).sqrt();
+    crate::net::uniform(seed, count as usize, -s, s)
+}
 
 /// The default adapter's device, with default limits and no optional feature.
 pub(crate) fn device() -> (wgpu::Device, wgpu::Queue) {
