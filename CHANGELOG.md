@@ -113,3 +113,6 @@ and this project adheres to
   measured from the display instead of a fixed 60 Hz grid. Latency promised in
   frames is shorter in time on a faster display. The report adds
   `display_period_us` and `callback_interval_us`.
+- A job projected to miss its deadline is abandoned at once only when another
+  job waits behind it; a lone one keeps running and is decided at its
+  deadline, so its slices are measured and estimates can come down.
