@@ -47,6 +47,11 @@ and this project adheres to
 - `beatlm-bench --max-dispatch-us` and `--split on|off`, a paced calibration
   before the loop, and the `longest_dispatch_us` and `kernel_parts` report
   lines.
+- `beatlm::codegen::Generator`, validating each distinct WGSL text once, and
+  `beatlm::gpu::MAX_SLICES`.
+- `beatlm-bench` calibrates split parts in a second pass so the loop starts
+  from their measurements, refuses splits beyond the timer's capacity before
+  building anything, and reports `startup_missed`.
 
 ### Changed
 
