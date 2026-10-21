@@ -16,7 +16,7 @@
 use beatlm_core::kernel::KernelSpec;
 use beatlm_core::memory::{MemoryPlan, TensorId};
 
-use super::{CodegenError, ENTRY_POINT, constants, generate};
+use super::{CodegenError, ENTRY_POINT, Generator, constants};
 use crate::gpu::{Arenas, profile};
 
 /// A tensor of a spec and the tensor bound in its place: `(original,
@@ -50,7 +50,8 @@ impl Kernels {
     /// Each spec's variant is the one
     /// [`KernelSpec::select_variant`] picks for the device's profile, and its
     /// text passes naga's validation ([`generate`](super::generate)) before
-    /// any shader module is created. `sets` lists the binding sets: each one
+    /// any shader module is created (each distinct text once, every part's
+    /// constants against it). `sets` lists the binding sets: each one
     /// rebinds some tensors to stand-ins. No sets means one set that binds
     /// every spec as it is.
     ///
@@ -70,8 +71,11 @@ impl Kernels {
         let identity = [Vec::new()];
         let sets = if sets.is_empty() { &identity[..] } else { sets };
         let placement = |id: TensorId| plan.placement(id).ok_or(CodegenError::MissingPlacement(id));
-        // Shader modules by text, so the parts of a kernel compile it once.
-        let mut modules: Vec<(String, wgpu::ShaderModule)> = Vec::new();
+        // The generator, so the parts of a kernel validate its text once, and
+        // shader modules by the generator's index of that text, so they compile
+        // it once.
+        let mut modules: Vec<Option<wgpu::ShaderModule>> = Vec::new();
+        let mut generator = Generator::new();
         let kernels = specs
             .iter()
             .map(|spec| {
@@ -88,18 +92,16 @@ impl Kernels {
                         source,
                     }
                 })?;
-                let text = generate(spec, variant)?;
-                let module = match modules.iter().position(|(t, _)| *t == text) {
-                    Some(index) => &modules[index].1,
-                    None => {
-                        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                            label: Some(&name),
-                            source: wgpu::ShaderSource::Wgsl(text.clone().into()),
-                        });
-                        modules.push((text, module));
-                        &modules[modules.len() - 1].1
-                    }
-                };
+                let text = generator.check(spec, variant)?;
+                if modules.len() <= text {
+                    modules.resize_with(text + 1, || None);
+                }
+                let module = &*modules[text].get_or_insert_with(|| {
+                    device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                        label: Some(&name),
+                        source: wgpu::ShaderSource::Wgsl(generator.text(text).into()),
+                    })
+                });
                 let values = constants(spec, variant);
                 let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some(&label),

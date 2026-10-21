@@ -67,6 +67,7 @@ fn write_report(
     writeln!(out, "frames_dropped: {}", outcome.dropped)?;
     writeln!(out, "delivered: {}", outcome.delivered)?;
     writeln!(out, "missed: {}", outcome.missed)?;
+    writeln!(out, "startup_missed: {}", outcome.startup_missed)?;
     match delivery_rate(outcome.delivered, outcome.missed) {
         Some(rate) => writeln!(out, "delivery_rate: {rate:.4}")?,
         None => writeln!(out, "delivery_rate: none")?,

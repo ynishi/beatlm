@@ -16,7 +16,7 @@ use std::task::{Context as TaskContext, Poll};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use beatlm::gpu::{FrameTiming, SliceTimer, TimerStats};
+use beatlm::gpu::{FrameTiming, MAX_SLICES, SliceTimer, TimerStats};
 use beatlm_core::budget::Budget;
 use beatlm_core::cost::{CostModel, Estimator, SliceId};
 use beatlm_core::schedule::{FramePlan, JobId, Scheduler};
@@ -24,7 +24,7 @@ use beatlm_core::sync::{MissPolicy, SyncPolicy};
 use beatlm_core::time::{FrameIndex, FrameInfo, Micros, TimePoint};
 
 use crate::args::{Args, EstimatorKind, WorkloadKind};
-use crate::calibrate::calibrate;
+use crate::calibrate::{Settings, calibrate};
 use crate::counters::{self, Watch};
 use crate::device::Gpu;
 use crate::net::{self, Net};
@@ -49,6 +49,21 @@ const COST_CAP: f64 = 0.5;
 /// How many times the final drain waits for the device before giving up on the
 /// timings still in flight.
 const DRAIN_ATTEMPTS: usize = 8;
+/// The first frames of the loop, counted from its first frame, whose jobs'
+/// misses are reported apart as `startup_missed`: twice the quantile
+/// estimator's window.
+pub const STARTUP_FRAMES: u64 = 2 * COST_WINDOW as u64;
+
+/// How many timed slices the loop's timer must hold for jobs of `slices`
+/// slices under a promised `latency`: a frame can run slices of every job
+/// still pending, not only its own, and a job lives `latency` frames past its
+/// submission, so `latency + 1` jobs can be pending at once. `None` when that
+/// is more than one query set can time ([`MAX_SLICES`]) or overflows.
+pub fn timer_capacity(slices: u32, latency: u32) -> Option<u32> {
+    slices
+        .checked_mul(latency.checked_add(1)?)
+        .filter(|&capacity| capacity <= MAX_SLICES)
+}
 
 /// The cost model's statistic for the `--estimator` choice, with this
 /// harness's parameters.
@@ -123,6 +138,10 @@ pub struct Outcome {
     pub delivered: u64,
     /// Deadlines that arrived without a complete result.
     pub missed: u64,
+    /// The part of `missed` that belongs to jobs submitted in the loop's first
+    /// [`STARTUP_FRAMES`] frames, so a cascade of misses while estimates are
+    /// new shows apart from misses in steady state.
+    pub startup_missed: u64,
     /// Deliveries whose latency was not the promised one.
     pub violations: u64,
     /// Jobs still awaiting their deadline when the loop ended.
@@ -171,8 +190,8 @@ pub struct KernelParts {
     pub name: String,
     /// The parts it runs as; one when it is not split.
     pub parts: u32,
-    /// What calibration estimated it takes run whole; `None` when splitting is
-    /// off and nothing was calibrated.
+    /// The median calibration measured for it run whole; `None` when
+    /// splitting is off and nothing was calibrated.
     pub calibrated: Option<Micros>,
 }
 
@@ -202,8 +221,9 @@ pub struct Engine<'g> {
 
 impl<'g> Engine<'g> {
     /// Builds the run's workload, timer, scheduler and cost model on `gpu`;
-    /// for the network with splitting on, first calibrates its kernels and
-    /// splits them (`calibrate.rs`); then runs every slice the workload has
+    /// for the network with splitting on, first calibrates its kernels, splits
+    /// them and measures the parts into the cost model the run then uses
+    /// (`calibrate.rs`); then runs every slice the workload has
     /// once and one render pass to completion so shader compilation and
     /// first-use costs are not charged to frame 0.
     ///
@@ -217,6 +237,9 @@ impl<'g> Engine<'g> {
             frames: args.latency,
         };
         let mut kernel_parts = Vec::new();
+        // The cost model calibration filled with the split program's parts, when
+        // there was a calibration.
+        let mut measured_cost = None;
         let net = match args.workload {
             WorkloadKind::Synthetic => None,
             WorkloadKind::Net => {
@@ -249,9 +272,12 @@ impl<'g> Engine<'g> {
                             &workload,
                             &shape,
                             &whole,
-                            estimator(args.estimator),
-                            SLICE_PRIOR,
-                            Micros::new(bound),
+                            &Settings {
+                                estimator: estimator(args.estimator),
+                                prior: SLICE_PRIOR,
+                                bound: Micros::new(bound),
+                                latency: args.latency,
+                            },
                         )?;
                         kernel_parts = names
                             .zip(&calibration.parts)
@@ -262,6 +288,7 @@ impl<'g> Engine<'g> {
                                 calibrated: Some(duration),
                             })
                             .collect();
+                        measured_cost = Some(calibration.cost);
                         calibration.program
                     }
                 };
@@ -279,10 +306,12 @@ impl<'g> Engine<'g> {
         // A job's slices are the network's kernels, each part of a split one
         // included.
         let slices = net.as_ref().map_or(args.slices, Net::kernel_count);
-        // A frame can run slices of every job still pending, not only its own: a
-        // job lives `latency` frames past its submission, so `latency + 1` jobs
-        // of `slices` slices each can be pending at once.
-        let capacity = slices.saturating_mul(args.latency.saturating_add(1));
+        let capacity = timer_capacity(slices, args.latency).with_context(|| {
+            format!(
+                "{slices} slices with --latency {} are more than the GPU timer can time ({MAX_SLICES})",
+                args.latency
+            )
+        })?;
         let timer: SliceTimer<Tag> = SliceTimer::new(&gpu.device, &gpu.queue, capacity)
             .with_context(|| {
                 format!(
@@ -292,8 +321,11 @@ impl<'g> Engine<'g> {
             })?;
         let scheduler = Scheduler::new(policy, MissPolicy::HoldPrevious, None)
             .context("cannot build the scheduler")?;
-        let cost = CostModel::new(SLICE_PRIOR, estimator(args.estimator))
-            .context("cannot build the cost model")?;
+        let cost = match measured_cost {
+            Some(cost) => cost,
+            None => CostModel::new(SLICE_PRIOR, estimator(args.estimator))
+                .context("cannot build the cost model")?,
+        };
         let mut engine = Self {
             gpu,
             workload,
@@ -459,6 +491,9 @@ impl<'g> Engine<'g> {
         }
         for missed in &plan.missed {
             self.job_dispatches.remove(&missed.job.get());
+            if missed.input.get() < STARTUP_FRAMES {
+                self.outcome.startup_missed += 1;
+            }
         }
         self.outcome.missed += plan.missed.len() as u64;
     }
@@ -602,6 +637,15 @@ mod tests {
     #[test]
     fn the_default_estimator_is_the_cores_default() {
         assert_eq!(estimator(Args::default().estimator), Estimator::default());
+    }
+
+    #[test]
+    fn the_timer_must_hold_the_slices_of_every_job_in_flight() {
+        assert_eq!(timer_capacity(6, 2), Some(18));
+        assert_eq!(timer_capacity(MAX_SLICES, 0), Some(MAX_SLICES));
+        assert_eq!(timer_capacity(MAX_SLICES, 1), None);
+        assert_eq!(timer_capacity(1, u32::MAX), None);
+        assert_eq!(timer_capacity(u32::MAX, 2), None);
     }
 
     #[test]

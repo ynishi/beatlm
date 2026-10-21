@@ -38,4 +38,6 @@ mod timer;
 
 pub use arenas::{ArenaError, Arenas};
 pub use profile::profile;
-pub use timer::{FrameTimestamps, FrameTiming, RING_DEPTH, SliceTimer, TimerError, TimerStats};
+pub use timer::{
+    FrameTimestamps, FrameTiming, MAX_SLICES, RING_DEPTH, SliceTimer, TimerError, TimerStats,
+};

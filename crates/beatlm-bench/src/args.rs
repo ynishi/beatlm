@@ -21,9 +21,10 @@ usage: beatlm-bench [options]
                     before them, on or off                  (default on)
   --dump-wgsl DIR   net only: write each generated kernel's WGSL into DIR
                     before the run
-  --max-dispatch-us N  net only: calibrate each kernel before the run and
-                    split those measured longer than N us into parts; 0
-                    turns splitting off                     (default 1000)
+  --max-dispatch-us N  net only: calibrate each kernel before the run, split
+                    those whose median is longer than N us into parts and
+                    measure the parts; 0 turns splitting off
+                                                           (default 1000)
   --split S         net only: on or off; off is --max-dispatch-us 0
                                                            (default on)
   --mode M          concurrency candidate: sync, thread or async (default sync)
