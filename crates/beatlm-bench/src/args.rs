@@ -13,6 +13,7 @@ usage: beatlm-bench [options]
   --slice-iters N   loop iterations per invocation of a slice kernel
   --render-iters N  loop iterations per pixel of the render pass
   --margin-us N     safety margin in the frame budget, us  (default 2000)
+  --workload W      synthetic or net                        (default synthetic)
   --mode M          concurrency candidate: sync, thread or async (default sync)
   --runs N          repeat the whole run N times on one device (default 1)
   --help            print this text";
@@ -49,6 +50,27 @@ impl Mode {
     }
 }
 
+/// Which load the slices of a job run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkloadKind {
+    /// The busy-loop kernel standing in for a slice (`workload.rs`).
+    Synthetic,
+    /// The planned network of hand-written kernels (`net.rs`): one slice per
+    /// operation, so the job has [`crate::net::OPS`] slices and `--slices` and
+    /// `--slice-iters` do not apply.
+    Net,
+}
+
+impl WorkloadKind {
+    /// The spelling `--workload` accepts and the report prints.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Synthetic => "synthetic",
+            Self::Net => "net",
+        }
+    }
+}
+
 /// What a run is configured with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Args {
@@ -64,6 +86,8 @@ pub struct Args {
     pub render_iters: u32,
     /// The margin subtracted from each frame's budget, in microseconds.
     pub margin_us: u64,
+    /// The load the slices run.
+    pub workload: WorkloadKind,
     /// The concurrency candidate that drives the frame.
     pub mode: Mode,
     /// How many times the whole run is repeated in one process.
@@ -79,6 +103,7 @@ impl Default for Args {
             slice_iters: DEFAULT_SLICE_ITERS,
             render_iters: DEFAULT_RENDER_ITERS,
             margin_us: 2_000,
+            workload: WorkloadKind::Synthetic,
             mode: Mode::Sync,
             runs: 1,
         }
@@ -107,6 +132,7 @@ where
     I: IntoIterator<Item = String>,
 {
     let mut out = Args::default();
+    let mut slices_given = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let (name, inline) = match arg.split_once('=') {
@@ -125,10 +151,14 @@ where
         match name.as_str() {
             "--frames" => out.frames = number(&name, &value()?)?,
             "--latency" => out.latency = number(&name, &value()?)?,
-            "--slices" => out.slices = number(&name, &value()?)?,
+            "--slices" => {
+                out.slices = number(&name, &value()?)?;
+                slices_given = true;
+            }
             "--slice-iters" => out.slice_iters = number(&name, &value()?)?,
             "--render-iters" => out.render_iters = number(&name, &value()?)?,
             "--margin-us" => out.margin_us = number(&name, &value()?)?,
+            "--workload" => out.workload = workload(&value()?)?,
             "--mode" => out.mode = mode(&value()?)?,
             "--runs" => out.runs = number(&name, &value()?)?,
             _ => bail!("unknown option {name}"),
@@ -143,7 +173,25 @@ where
     if out.runs == 0 {
         bail!("--runs must be at least 1");
     }
+    if out.workload == WorkloadKind::Net {
+        // The network's operations are its slices.
+        if slices_given && out.slices != crate::net::OPS {
+            bail!(
+                "--slices is {} for --workload net: one slice per operation",
+                crate::net::OPS
+            );
+        }
+        out.slices = crate::net::OPS;
+    }
     Ok(Command::Run(out))
+}
+
+/// Parses the value of `--workload`.
+fn workload(text: &str) -> Result<WorkloadKind> {
+    [WorkloadKind::Synthetic, WorkloadKind::Net]
+        .into_iter()
+        .find(|w| w.name() == text)
+        .with_context(|| format!("--workload: {text:?} is not one of synthetic, net"))
 }
 
 /// Parses the value of `--mode`.
@@ -216,6 +264,27 @@ mod tests {
             panic!("expected a run");
         };
         assert_eq!(a.mode, Mode::Async);
+    }
+
+    #[test]
+    fn the_default_workload_is_synthetic() {
+        assert_eq!(Args::default().workload, WorkloadKind::Synthetic);
+        let Command::Run(a) = parse_strs(&["--workload", "synthetic"]).unwrap() else {
+            panic!("expected a run");
+        };
+        assert_eq!((a.workload, a.slices), (WorkloadKind::Synthetic, 4));
+    }
+
+    #[test]
+    fn the_net_workload_has_one_slice_per_operation() {
+        let Command::Run(a) = parse_strs(&["--workload=net"]).unwrap() else {
+            panic!("expected a run");
+        };
+        assert_eq!((a.workload, a.slices), (WorkloadKind::Net, crate::net::OPS));
+        let ops = crate::net::OPS.to_string();
+        assert!(parse_strs(&["--workload", "net", "--slices", &ops]).is_ok());
+        assert!(parse_strs(&["--workload", "net", "--slices", "3"]).is_err());
+        assert!(parse_strs(&["--workload", "gpt"]).is_err());
     }
 
     #[test]

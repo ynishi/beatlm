@@ -15,7 +15,7 @@
 //!
 //! | Outside | Translated into | Why the translation is here |
 //! |---|---|---|
-//! | wgpu adapter limits and features | a device profile of plain values | the core plans memory and picks kernel variants from values, so it never depends on a wgpu version |
+//! | wgpu adapter limits and features | a [`DeviceProfile`](beatlm_core::device::DeviceProfile) of plain values ([`gpu::profile`]) | the core plans memory and picks kernel variants from values, so it never depends on a wgpu version |
 //! | GPU timestamp queries | measured durations ([`gpu`]) | the core's cost model is fed measurements, and only measurements |
 //! | model files (safetensors first) | a graph of tensors and operations | weight formats change and multiply; the graph does not |
 //! | kernel IR | WGSL text, validated by naga | browsers accept only WGSL, and generated text can be read, diffed and checked by naga's parser |
@@ -27,8 +27,10 @@
 //!
 //! Features are layered over a baseline every adapter has. Kernels always
 //! have a variant that needs no subgroups, because wgpu exposes subgroups on
-//! native backends only; buffers are split against the default WebGPU limits
-//! and grow only when the adapter reports more.
+//! native backends only; memory is planned against the default WebGPU limits
+//! ([`DeviceProfile::webgpu_baseline`](beatlm_core::device::DeviceProfile::webgpu_baseline))
+//! and grows only when the adapter reports more. A memory plan becomes buffers
+//! once, in [`gpu::Arenas`].
 //!
 //! # Design
 //!

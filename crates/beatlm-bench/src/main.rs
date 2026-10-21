@@ -57,6 +57,57 @@
 //! earlier work on the queue, so a very short slice following a heavy render
 //! pass measures longer than it ran.
 //!
+//! # The `net` workload
+//!
+//! `--workload net` replaces the busy-loop slices with a small network run
+//! through the memory plan: six operations (a 3x3 convolution, a layer norm over
+//! channels, a second convolution, a tiled matrix multiply, a second layer
+//! norm, a second matrix multiply) over a 128x128 image, each one slice of the
+//! frame loop, in hand-written WGSL kept in `net.wgsl` until generated kernels
+//! replace it. `net.rs` documents the network, its layouts and what it
+//! simplifies; `reference.rs` holds a CPU reference for each kernel, and
+//! `cargo test -p beatlm-bench -- --ignored` compares each kernel, and the whole
+//! network in planned memory, against it. The scheduler, the timer and the
+//! frame loop are the ones the synthetic workload uses, and the job has one
+//! slice per operation, so `--slices` is fixed at the operation count and
+//! `--slice-iters` does not apply. The render pass is the synthetic one.
+//!
+//! It measures the rule that the steady-state loop allocates nothing. The
+//! network's memory is planned against the baseline WebGPU limits, realised as
+//! one buffer per arena before the first frame, and the report prints the plan
+//! (`memory_plan_*`) next to wgpu's own object counters read before the first
+//! frame and after the last (`loop_*`, from `counters.rs`, which also says what
+//! a counter does and does not show). On an Apple M1 Pro (Metal), 600 frames at
+//! the defaults, on 2026-10-21:
+//!
+//! - the plan has 17 tensors in one arena of 12 334 464 bytes, equal to the
+//!   most bytes live at one operation (`memory_plan_peak_live_bytes`) and below
+//!   the 14 955 904 bytes the tensors need unshared; the 17 are the 11 weights
+//!   and activations and an input and an output for each of the 3 slots
+//!   (`memory_plan_io_slots`, `--latency` plus one: one slot per job that can
+//!   be in flight, so a job's output survives until its delivery frame);
+//! - the live buffer count was 10 before the first frame, 10 after the last, and
+//!   10 at every frame boundary in between; textures (1), bind groups (13) and
+//!   compute pipelines (9) did not change either, the per-slot bind groups
+//!   included, because all are created before the first frame;
+//! - the mean measured duration of the six slices in the loop was 0.9, 1.4, 1.1,
+//!   1.0, 0.8 and 0.8 ms. The shape was tuned by an earlier in-loop figure, not
+//!   by a dispatch timed alone: at 256x256 with the same channel counts each
+//!   operation took 0.85 to 1.35 ms repeated back to back on an idle queue,
+//!   while at 128x128, a quarter of the pixels, they measure 0.8 to 1.4 ms in the
+//!   loop, and a job whose summed estimates do not fit a frame's budget misses
+//!   its deadline (the run above delivered 384 jobs and missed 214; the
+//!   synthetic workload at its defaults, 300 frames, delivered 185 and missed
+//!   113 of 298). Jobs run in submission order and never interleave, so a job
+//!   the budget cannot finish is missed rather than overtaken.
+//!
+//! `loop_buffer_memory_bytes` and `loop_memory_allocations` read zero on this
+//! backend before and after: Metal does not set those two counters, so their
+//! zeros show nothing, and only the object counts are evidence. The control for
+//! the buffer count is a test that creates a buffer and sees the count move.
+//! Counts are live counts: a buffer created and dropped between two frame
+//! boundaries is not seen.
+//!
 //! # Running it
 //!
 //! ```text
@@ -97,6 +148,10 @@
 //! | `cpu_queue_submit_us` | per frame, the time inside `queue.submit` |
 //! | `gpu_frame_us` | per timed frame, render plus every slice, on the GPU: p50, p99, max |
 //! | `slice[i]` | the cost model's final estimate for slice `i` against the mean of its measured durations |
+//! | `workload` (in `config`) | present as `workload=net` only for the network; the synthetic report is unchanged |
+//! | `memory_plan_*` | `net` only: tensors, input/output slots, arenas and their bytes, the plan's total, the most bytes live at one operation, and the bytes with no sharing |
+//! | `wgpu_counters_populated` | `net` only: whether the backend sets wgpu's buffer counter; when false the loop's buffer creation is unmeasured and the report says so |
+//! | `loop_*` | `net` only: a counter's reading before the first frame and after the last, and the change; for buffers also the least and most seen at a frame boundary |
 //!
 //! The process exits non-zero when `latency_violations` is not zero in any run.
 //! A missed deadline is reported but does not fail the run: it is the documented
@@ -175,9 +230,13 @@
 //! crate reads no clock, which is why only the harness is affected.
 
 mod args;
+mod counters;
 mod device;
 mod engine;
+mod net;
 mod pace;
+#[cfg(test)]
+mod reference;
 mod report;
 mod run;
 mod stats;

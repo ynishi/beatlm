@@ -3,8 +3,8 @@
 
 use std::fmt::Write as _;
 
-use crate::args::Args;
-use crate::engine::Outcome;
+use crate::args::{Args, WorkloadKind};
+use crate::engine::{NetReport, Outcome};
 use crate::stats::{histogram, summarize};
 
 /// Where the run happened.
@@ -33,7 +33,7 @@ fn write_report(
     writeln!(out, "run: {run}/{}", args.runs)?;
     writeln!(out, "adapter: {}", env.adapter)?;
     writeln!(out, "backend: {}", env.backend)?;
-    writeln!(
+    write!(
         out,
         "config: mode={} runs={} frames={} latency={} slices={} slice_iters={} render_iters={} margin_us={}",
         args.mode.name(),
@@ -45,6 +45,12 @@ fn write_report(
         args.render_iters,
         args.margin_us
     )?;
+    // Only the network adds to the line, so the synthetic workload's report is
+    // the one it always was.
+    match args.workload {
+        WorkloadKind::Synthetic => writeln!(out)?,
+        WorkloadKind::Net => writeln!(out, " workload=net")?,
+    }
     writeln!(out, "frames: {}", outcome.cpu_us.len())?;
     writeln!(out, "frames_dropped: {}", outcome.dropped)?;
     writeln!(out, "delivered: {}", outcome.delivered)?;
@@ -78,6 +84,69 @@ fn write_report(
             Some(mean) => writeln!(out, " measured_mean_us={mean}")?,
             None => writeln!(out, " measured_mean_us=none")?,
         }
+    }
+    if let Some(net) = &outcome.net {
+        write_net(out, net)?;
+    }
+    Ok(())
+}
+
+/// The memory plan and the allocation readings of the `net` workload.
+fn write_net(out: &mut String, net: &NetReport) -> std::fmt::Result {
+    writeln!(out, "memory_plan_tensors: {}", net.tensors)?;
+    writeln!(out, "memory_plan_io_slots: {}", net.slots)?;
+    writeln!(out, "memory_plan_arenas: {}", net.arenas.len())?;
+    for (index, bytes) in net.arenas.iter().enumerate() {
+        writeln!(out, "memory_plan_arena[{index}]_bytes: {bytes}")?;
+    }
+    writeln!(out, "memory_plan_total_bytes: {}", net.total_bytes)?;
+    writeln!(out, "memory_plan_peak_live_bytes: {}", net.peak_live_bytes)?;
+    writeln!(out, "memory_plan_unshared_bytes: {}", net.unshared_bytes)?;
+    let c = &net.counters;
+    writeln!(out, "wgpu_counters_populated: {}", c.populated)?;
+    if c.populated {
+        let delta = |before: isize, after: isize| after - before;
+        writeln!(
+            out,
+            "loop_buffers_live: before={} after={} delta={} min={} max={}",
+            c.before.buffers,
+            c.after.buffers,
+            delta(c.before.buffers, c.after.buffers),
+            c.min_buffers,
+            c.max_buffers
+        )?;
+        let others = [
+            (
+                "buffer_memory_bytes",
+                c.before.buffer_memory,
+                c.after.buffer_memory,
+            ),
+            (
+                "memory_allocations",
+                c.before.memory_allocations,
+                c.after.memory_allocations,
+            ),
+            ("textures", c.before.textures, c.after.textures),
+            ("bind_groups", c.before.bind_groups, c.after.bind_groups),
+            (
+                "compute_pipelines",
+                c.before.compute_pipelines,
+                c.after.compute_pipelines,
+            ),
+        ];
+        for (name, before, after) in others {
+            writeln!(
+                out,
+                "loop_{name}: before={before} after={after} delta={}",
+                delta(before, after)
+            )?;
+        }
+    } else {
+        writeln!(
+            out,
+            "loop_buffers_created: unmeasured; this backend sets no wgpu counters. The loop \
+             code calls no buffer-creating function, but creations inside wgpu are not observed."
+        )?;
     }
     Ok(())
 }

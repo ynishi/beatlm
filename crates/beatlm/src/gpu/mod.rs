@@ -22,10 +22,20 @@
 //! - **Only timestamps are read back.** Timing data is eight bytes per query;
 //!   the steady-state loop reads nothing else from the GPU.
 //!
-//! [`SliceTimer`] is the entry point; the host's side of the frame it plugs into
+//! Memory is the other thing this module realises. [`profile`] is the one place
+//! wgpu's limits and features are read, and becomes the core's
+//! [`DeviceProfile`](beatlm_core::device::DeviceProfile); [`Arenas`] turns a
+//! [`MemoryPlan`](beatlm_core::memory::MemoryPlan) into buffers, once, so the
+//! steady-state loop creates none.
+//!
+//! [`SliceTimer`] is the entry point for timing; the host's side of the frame it plugs into
 //! is described in the [crate documentation](crate#the-hosts-side-of-a-frame).
 
+mod arenas;
+mod profile;
 mod ring;
 mod timer;
 
+pub use arenas::{ArenaError, Arenas};
+pub use profile::profile;
 pub use timer::{FrameTimestamps, FrameTiming, RING_DEPTH, SliceTimer, TimerError, TimerStats};

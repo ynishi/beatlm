@@ -23,8 +23,10 @@ use beatlm_core::schedule::{FramePlan, JobId, Scheduler};
 use beatlm_core::sync::{MissPolicy, SyncPolicy};
 use beatlm_core::time::{FrameIndex, FrameInfo, Micros, TimePoint};
 
-use crate::args::Args;
+use crate::args::{Args, WorkloadKind};
+use crate::counters::{self, Watch};
 use crate::device::Gpu;
+use crate::net::{self, Net};
 use crate::pace::{FRAME_PERIOD, Tick, micros_between};
 use crate::workload::Workload;
 
@@ -94,6 +96,27 @@ pub struct Outcome {
     pub estimates: BTreeMap<SliceId, Micros>,
     /// What the timer could not measure.
     pub timer: TimerStats,
+    /// The planned network's memory and allocation readings; `None` for the
+    /// synthetic workload.
+    pub net: Option<NetReport>,
+}
+
+/// What the `net` workload reports about memory.
+pub struct NetReport {
+    /// Bytes of each arena.
+    pub arenas: Vec<u64>,
+    /// Bytes of all arenas.
+    pub total_bytes: u64,
+    /// The most bytes live at one operation: the lower bound on `total_bytes`.
+    pub peak_live_bytes: u64,
+    /// The sum of every tensor's size: what the model needs with no reuse.
+    pub unshared_bytes: u64,
+    /// Tensors in the plan.
+    pub tensors: usize,
+    /// Input and output slots: the jobs the network keeps apart.
+    pub slots: u32,
+    /// wgpu's object counters across the loop.
+    pub counters: counters::Report,
 }
 
 /// Decides, encodes, submits and reads back the GPU work of frames.
@@ -104,6 +127,8 @@ pub struct Outcome {
 pub struct Engine<'g> {
     gpu: &'g Gpu,
     workload: Workload,
+    net: Option<Net>,
+    watch: Option<Watch>,
     timer: SliceTimer<Tag>,
     scheduler: Scheduler,
     cost: CostModel,
@@ -116,8 +141,8 @@ pub struct Engine<'g> {
 
 impl<'g> Engine<'g> {
     /// Builds the run's workload, timer, scheduler and cost model on `gpu`, and
-    /// runs one slice and one render pass to completion so shader compilation
-    /// and first-use costs are not charged to frame 0.
+    /// runs every slice the workload has once and one render pass to completion
+    /// so shader compilation and first-use costs are not charged to frame 0.
     ///
     /// # Errors
     ///
@@ -125,6 +150,23 @@ impl<'g> Engine<'g> {
     /// configuration, or a device that cannot be polled.
     pub fn new(gpu: &'g Gpu, args: &Args) -> Result<Self> {
         let workload = Workload::new(&gpu.device, args.slice_iters, args.render_iters);
+        let policy = SyncPolicy::FixedLatency {
+            frames: args.latency,
+        };
+        let net = match args.workload {
+            WorkloadKind::Synthetic => None,
+            WorkloadKind::Net => {
+                // One input and output slot per job that can be in flight: a
+                // job's output must survive until its delivery frame.
+                let slots = policy
+                    .max_in_flight()
+                    .context("the policy does not bound the jobs in flight")?;
+                Some(
+                    Net::new(&gpu.device, &gpu.queue, &net::DEFAULT_SHAPE, slots)
+                        .context("cannot build the planned network")?,
+                )
+            }
+        };
         // A frame can run slices of every job still pending, not only its own: a
         // job lives `latency` frames past its submission, so `latency + 1` jobs
         // of `slices` slices each can be pending at once.
@@ -136,19 +178,15 @@ impl<'g> Engine<'g> {
                     args.slices, args.latency
                 )
             })?;
-        let scheduler = Scheduler::new(
-            SyncPolicy::FixedLatency {
-                frames: args.latency,
-            },
-            MissPolicy::HoldPrevious,
-            None,
-        )
-        .context("cannot build the scheduler")?;
+        let scheduler = Scheduler::new(policy, MissPolicy::HoldPrevious, None)
+            .context("cannot build the scheduler")?;
         let cost = CostModel::new(SLICE_PRIOR, COST_ALPHA, COST_SIGMAS)
             .context("cannot build the cost model")?;
-        let engine = Self {
+        let mut engine = Self {
             gpu,
             workload,
+            net,
+            watch: None,
             timer,
             scheduler,
             cost,
@@ -159,6 +197,11 @@ impl<'g> Engine<'g> {
             outcome: Outcome::default(),
         };
         engine.warm_up()?;
+        // Everything the network allocates exists by now, so this reading is the
+        // state the loop starts from.
+        if engine.net.is_some() {
+            engine.watch = Some(Watch::start(&gpu.device));
+        }
         Ok(engine)
     }
 
@@ -206,6 +249,9 @@ impl<'g> Engine<'g> {
         self.outcome
             .tick_us
             .push(micros_between(tick.began, Instant::now()));
+        if let Some(watch) = &mut self.watch {
+            watch.sample(&self.gpu.device);
+        }
     }
 
     /// Starts the readback, polls the device with `poll`, and feeds what has
@@ -245,7 +291,12 @@ impl<'g> Engine<'g> {
         let mut timestamps = self.timer.begin_frame(frame.index);
         for run in &plan.runs {
             let writes = timestamps.compute_pass((run.job, run.slice))?;
-            self.workload.encode_slice(&mut encoder, writes);
+            match &self.net {
+                Some(net) => {
+                    net.encode(&mut encoder, net.slot_of(run.job.get()), run.slice, writes)?;
+                }
+                None => self.workload.encode_slice(&mut encoder, writes),
+            }
         }
         self.workload
             .encode_render(&mut encoder, timestamps.render_pass()?);
@@ -311,6 +362,9 @@ impl<'g> Engine<'g> {
     ///
     /// A device that cannot be polled.
     pub fn finish(mut self) -> Result<Outcome> {
+        // Read before the drain, so the reading is of the loop and not of the
+        // wait that follows it.
+        let counters = self.watch.take().map(|w| w.finish(&self.gpu.device));
         for _ in 0..DRAIN_ATTEMPTS {
             if self.timer.in_flight() == 0 {
                 break;
@@ -319,6 +373,18 @@ impl<'g> Engine<'g> {
         }
         self.outcome.pending_at_end = self.scheduler.pending();
         self.outcome.timer = self.timer.stats();
+        if let (Some(net), Some(counters)) = (&self.net, counters) {
+            let plan = net.plan();
+            self.outcome.net = Some(NetReport {
+                arenas: plan.arenas().to_vec(),
+                total_bytes: plan.total_bytes(),
+                peak_live_bytes: plan.peak_live_bytes(),
+                unshared_bytes: plan.placements().map(|(_, p)| p.size).sum(),
+                tensors: plan.placements().count(),
+                slots: net.slots(),
+                counters,
+            });
+        }
         for &slice in &self.slices {
             self.outcome
                 .estimates
@@ -327,7 +393,8 @@ impl<'g> Engine<'g> {
         Ok(self.outcome)
     }
 
-    /// Runs one slice and one render pass to completion.
+    /// Runs every slice the workload has once, and one render pass, to
+    /// completion, so first-use costs are not charged to frame 0.
     fn warm_up(&self) -> Result<()> {
         let mut encoder = self
             .gpu
@@ -335,13 +402,28 @@ impl<'g> Engine<'g> {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("beatlm-bench warm-up"),
             });
-        self.workload.encode_slice(&mut encoder, None);
+        match &self.net {
+            Some(net) => {
+                for slot in 0..net.slots() {
+                    for slice in 0..net::OPS {
+                        net.encode(&mut encoder, slot, SliceId::new(slice), None)?;
+                    }
+                }
+            }
+            None => self.workload.encode_slice(&mut encoder, None),
+        }
         self.workload.encode_render(&mut encoder, None);
         self.gpu.queue.submit([encoder.finish()]);
-        self.gpu
-            .device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .context("device poll failed")?;
+        // The network's uploads leave staging memory that wgpu releases on a
+        // poll after the work completes, and the allocation counters are read
+        // next, so it gets a second poll. The synthetic load has no uploads.
+        let polls = if self.net.is_some() { 2 } else { 1 };
+        for _ in 0..polls {
+            self.gpu
+                .device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .context("device poll failed")?;
+        }
         Ok(())
     }
 }
