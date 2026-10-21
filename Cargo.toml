@@ -27,6 +27,11 @@ beatlm      = { path = "crates/beatlm", version = "0.1.0" }
 thiserror   = "2"
 anyhow      = "1"
 pollster    = "1"
+# The safetensors header parser. `std` is left off on purpose: it adds file
+# writing through `tempfile`, which the reader never uses, and std-backed
+# serde and maps; without it the crate parses from bytes in its no_std mode
+# (`alloc` is the marker feature for it), which is also what a browser has.
+safetensors = { version = "0.8", default-features = false, features = ["alloc"] }
 # Native backends we target first, plus the browser. `wgsl` is the only
 # shader input: kernels are generated as WGSL text and validated by naga.
 wgpu = { version = "30", default-features = false, features = [

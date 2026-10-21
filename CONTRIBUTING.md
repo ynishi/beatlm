@@ -79,6 +79,33 @@ for or against a promise.
 Report what was actually run; "I did not verify X" is a usable report, a green
 claim resting on a recipe nobody ran is not.
 
+## Running the model
+
+Tests and benchmarks that run a real model need its weights, which are
+third-party material: they are fetched into the gitignored `models/` on request
+and never committed ([PUBLIC_DEVELOPMENT.md](PUBLIC_DEVELOPMENT.md#third-party-material)).
+For Depth Anything V2 Small, in this order:
+
+```bash
+just setup-depth-anything       # weights + config into models/depth-anything-v2-small/
+just reference-depth-anything   # optional: the original implementation's outputs
+cargo test -p beatlm --test depth_anything_v2 -- --ignored
+```
+
+`setup-depth-anything` fetches from a pinned commit, verifies the file's
+sha256, skips what is already there, and states in its header the source, the
+licence (Apache-2.0) and the notices. `reference-depth-anything` runs
+`transformers` through `uv` in an isolated environment with pinned versions and
+writes the input, the four encoder features the depth head reads and the
+predicted depth next to the weights; it is the thing a port of the graph is
+compared with. Neither recipe is part of `just check`, and no build or test in
+`check` needs them: the tests that read these files are `#[ignore]`d and, run by
+hand without the files, fail with a message naming the recipe to run.
+
+This note is here, and not in the README, because the recipes are a
+contributor's workflow in this checkout: the README is also the crate's page on
+crates.io, where a `just` recipe means nothing.
+
 ## Documentation
 
 API detail lives in the rustdoc. `cargo doc` is where a reader goes for what a

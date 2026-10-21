@@ -14,6 +14,7 @@ homepage.workspace     = true
 [dependencies]
 beatlm-core = { workspace = true }
 naga        = { workspace = true }
+safetensors = { workspace = true }
 thiserror   = { workspace = true }
 wgpu        = { workspace = true }
 
