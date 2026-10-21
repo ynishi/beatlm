@@ -82,11 +82,12 @@
 //!
 //! Before the measured loop the network is calibrated and split
 //! (`calibrate.rs`, and "Splitting" below): each kernel is timed whole, paced
-//! as the loop is, and a kernel whose estimate exceeds `--max-dispatch-us`
-//! (default 1000) is lowered again as several parts, each its own slice. The
-//! parts' pipelines and bind groups are built once, after calibration and
-//! before the loop. `--max-dispatch-us 0` or `--split off` skips calibration
-//! and runs every kernel whole.
+//! as the loop is, and a kernel whose median exceeds `--max-dispatch-us`
+//! (default 1000) is lowered again as several parts, each its own slice; then
+//! the split program is timed the same way, and the loop's cost model starts
+//! from those measurements. The parts' pipelines and bind groups are built
+//! once, after calibration and before the loop. `--max-dispatch-us 0` or
+//! `--split off` skips calibration and runs every kernel whole.
 //!
 //! It measures the rule that the steady-state loop allocates nothing. The
 //! network's memory is planned against the baseline WebGPU limits, realised as
@@ -167,7 +168,10 @@
 //! 2026-10-21, with `--max-dispatch-us 1000` (the default) and with `--split
 //! off`. Parts are per kernel in program order (`conv2d3x3+relu`,
 //! `layernorm`, `conv2d3x3`, `matmul+gelu`, `layernorm`, `matmul+add+scale`);
-//! times in microseconds; every run is one row and none was discarded.
+//! times in microseconds; every run is one row and none was discarded. These
+//! runs are from before calibration measured the parts ("Why calibration
+//! measures the parts" below), so their parts are the old decision's, and
+//! their deadlines were not reported apart for the loop's start.
 //!
 //! | `--split`, run | parts | `dispatches_per_job` | `longest_dispatch_us` p50 / p99 / max | `gpu_frame_us` p50 / p99 | `cpu_encode_us` p50 / p99 | delivered / missed | `delivery_rate` |
 //! |---|---|---|---|---|---|---|---|
@@ -212,31 +216,80 @@
 //!   because every part's pipeline and bind groups are created before the
 //!   first frame.
 //!
-//! The default bound was chosen from a sweep with `--frames 300 --runs 2` on
-//! the same machine and date (three runs at 1000). At 500 us the jobs had 23
-//! to 26 dispatches, `longest_dispatch_us` was 1007 to 1125 at the median and
-//! 1981 to 2181 at p99, and 0.9866 and 0.9933 of the deadlines were met; at
-//! 1000 us, 12 to 13 dispatches, 1156 to 1215 and 2393 to 2684, and all met;
-//! at 2000 us, 8 dispatches, 1440 and 1441 and 2803 to 3000, and all met.
-//! Halving the bound from 1000 to 500 doubled the dispatches for 31 to 208 us
-//! less at the median, and both 500 runs missed deadlines where no 1000 run
-//! did, which is why 1000 is the default; on another adapter the sweep is the
-//! thing to repeat.
+//! **Why calibration measures the parts.** The table above was measured when
+//! calibration measured only whole kernels, and the loop's cost model then met
+//! every part as a new slice at the same 2 ms prior. A job's estimated cost
+//! before its first measurements grew with its number of parts, not with its
+//! work, and early jobs of a finely split network could miss their deadline
+//! for that reason alone. One 300-frame run with the 1000 us default showed
+//! it: calibration measured the last matrix multiply at twice its usual time
+//! and split the network into 14 dispatches, and 0.13 of the deadlines were
+//! met, against 1.0 in the two runs that followed (Apple M1 Pro, Metal,
+//! 2026-10-21). Calibration now times the split program too and starts the
+//! loop's cost model from those measurements (`calibrate.rs` owns the two
+//! passes), and `startup_missed` reports the misses among the loop's first
+//! `2 * COST_WINDOW` frames apart, so a cascade shows. The bound sweep that
+//! chose 1000 us was made before that change and is replaced by the one below.
 //!
-//! The misses at 500 are confounded. The loop's cost model starts every part
-//! from the same prior, so a job's estimated cost before its first
-//! measurements grows with its number of parts, and early jobs of a finely
-//! split network can miss their deadline for that reason alone. One 300-frame
-//! run with the 1000 us default showed the same collapse when calibration
-//! measured the last matrix multiply at twice its usual time and split the
-//! network into 14 dispatches: 0.13 of the deadlines were met, against 1.0 in
-//! the two runs that followed (Apple M1 Pro, Metal, 2026-10-21). Until parts
-//! start from estimates that reflect their size, the sweep cannot separate the
-//! bound's effect from the prior's.
+//! **The bound sweep, with the parts measured.** Configuration of every run:
+//! `--workload net --frames 300 --runs 2`, `sync` mode, latency 2, the
+//! quantile estimator, fusion on, margin 2 ms, release build, on an Apple M1
+//! Pro, Metal, wgpu 30.0.1, on 2026-10-21. Parts are per kernel in program
+//! order, as above; times in microseconds; every run is one row and none was
+//! discarded. `delivered / missed` is out of 298 deadlines except where it
+//! sums to 297.
 //!
-//! Calibration is paced at the frame period, because unpaced it measured
-//! every kernel two to four times faster than the loop runs it (`calibrate.rs`
-//! has the figures).
+//! | `--max-dispatch-us`, run | parts | `dispatches_per_job` | `longest_dispatch_us` p50 / p99 | `cpu_encode_us` p50 / p99 | delivered / missed | `startup_missed` | `delivery_rate` |
+//! |---|---|---|---|---|---|---|---|
+//! | 500, 1 | 3 3 2 2 1 5 | 16 | 1121 / 2434 | 691 / 3063 | 296 / 1 | 0 | 0.9966 |
+//! | 500, 2 | 2 3 2 2 2 7 | 18 | 1229 / 2056 | 700 / 4624 | 298 / 0 | 0 | 1.0000 |
+//! | 1000, 1 | 2 1 1 1 1 4 | 10 | 1328 / 2507 | 737 / 2570 | 298 / 0 | 0 | 1.0000 |
+//! | 1000, 2 | 2 2 1 1 1 2 | 9 | 1288 / 2330 | 786 / 2019 | 298 / 0 | 0 | 1.0000 |
+//! | 2000, 1 | 1 1 1 1 1 1 | 6 | 2139 / 3451 | 731 / 2336 | 298 / 0 | 0 | 1.0000 |
+//! | 2000, 2 | 1 1 1 1 1 1 | 6 | 1975 / 3306 | 740 / 1545 | 298 / 0 | 0 | 1.0000 |
+//! | off, 1 | 1 1 1 1 1 1 | 6 | 1948 / 3275 | 867 / 2708 | 298 / 0 | 0 | 1.0000 |
+//! | off, 2 | 1 1 1 1 1 1 | 6 | 2087 / 3468 | 802 / 2522 | 298 / 0 | 0 | 1.0000 |
+//!
+//! What the numbers say, and what they do not:
+//!
+//! - **No run had a startup miss, at 16 and 18 dispatches per job included.**
+//!   The one miss in eight runs (500, run 1) came after the loop's first 64
+//!   frames, in a run that also gave up one frame period
+//!   (`frames_dropped: 1`); whether the dropped frame caused it was not
+//!   checked. Eight runs without a cascade are consistent with the parts now
+//!   starting from measurements and do not show a cascade cannot happen: the
+//!   0.13 run was one in a session, and the cause that run had, a calibration
+//!   that measured twice the usual time, is not something a run can be asked
+//!   to repeat.
+//! - **The bound moves the longest dispatch and the dispatch count, and the
+//!   deliveries did not tell the settings apart.** From unsplit to 1000 us the
+//!   median `longest_dispatch_us` fell from 1948 and 2087 to 1328 and 1288 for
+//!   3 or 4 more dispatches per job; to 500 us it fell by another 60 to 210
+//!   for about 1.8 times the dispatches of 1000 (16 and 18 against 9 and 10),
+//!   and p99 fell with it (2056 and 2434 against 2330 and 2507, which
+//!   overlap). At 1000 us the median longest dispatch still exceeded the
+//!   bound: the bound is a planning target, as the rule says.
+//! - **2000 us split nothing on this machine.** No kernel's median was above
+//!   2000 in either run (the largest was 1919 and 1810), so the jobs had six
+//!   dispatches and the numbers are those of `--split off`.
+//! - **Calibration differs between runs of one setting.** The last matrix
+//!   multiply's median was 3468 and 1792 us at 1000 (four and two parts) and
+//!   2084 and 3469 us at 500 (five and seven parts), and the first
+//!   convolution's 1772 and 1204 at 1000. The decision follows what was
+//!   measured in that process; the parts a setting gives are not fixed.
+//! - **Encode time did not follow the dispatch count in this sweep.** The
+//!   median `cpu_encode_us` was 691 to 867 across all four settings with no
+//!   order, while the 600-frame table above, on the same machine, had it
+//!   rise with the dispatches (745 and 820 against 407 and 492). The cost of
+//!   more dispatches on the CPU is therefore not settled by these figures.
+//!
+//! **The default stays 1000 us.** Nothing measured favours another value, and
+//! the cost side of 500 is plain: it nearly doubled the dispatches for a
+//! median longest dispatch 60 to 210 us lower, and it had the only miss. That
+//! is one miss in eight runs, which two runs per cell cannot rank against
+//! 1000. 2000 does not split at all here, and unsplit left the longest
+//! dispatch 0.6 to 0.8 ms longer at the median than 1000 did. On another
+//! adapter the sweep is the thing to repeat.
 //!
 //! # Running it
 //!
@@ -253,8 +306,8 @@
 //! Options are listed by `--help`. It needs an adapter with
 //! `Features::TIMESTAMP_QUERY` and is not part of `just check`; an adapter is
 //! not guaranteed where `check` runs. A run takes about `frames / 60` seconds;
-//! with splitting on, calibration first runs `2 * COST_WINDOW` paced frames
-//! plus one untimed frame.
+//! with splitting on, calibration first runs two passes of `2 * COST_WINDOW`
+//! paced frames, each plus one untimed frame.
 //! `--runs N` repeats the whole run `N` times in one process on one device, each
 //! with a fresh scheduler, cost model, timer and workload, and prints one report
 //! per run, so the variance between runs is visible without restarting.
@@ -273,6 +326,7 @@
 //! | `frames_dropped` | frame periods given up because a frame began a whole period late; the loop drops them as a display would, rather than running frames back to back to catch up |
 //! | `delivered`, `missed` | results delivered on their frame, and deadlines that arrived without a complete result |
 //! | `delivery_rate` | `delivered` over `delivered` plus `missed`: the share of deadlines that arrived with their result; `none` when no deadline arrived |
+//! | `startup_missed` | the part of `missed` that belongs to jobs submitted in the loop's first `2 * COST_WINDOW` frames, so a cascade of misses while estimates are new shows apart from misses in steady state |
 //! | `pending_at_end` | jobs submitted whose deadline was after the last frame |
 //! | `latency_violations` | deliveries whose latency was not `--latency`; the L1 promise broke when this is not zero |
 //! | `timings_collected`, `timings_skipped`, `timings_failed` | frames whose GPU timing was read, was not taken because the readback ring was full, and was lost to a failed map |
@@ -292,7 +346,7 @@
 //! | `background_dispatches` | dispatches the competing load submitted, from the one completed before the first frame to the last one queued when it was stopped; present only with `--background-load` |
 //! | `slice[i]` | the cost model's final estimate for slice `i` against the mean of its measured durations |
 //! | `workload`, `fusion`, `split` (in `config`) | present only for the network, as `workload=net fusion=on` or `fusion=off`, then `split=on max_dispatch_us=N` or `split=off`; the synthetic report has none. `slices` there is the kernel count before splitting |
-//! | `kernel_parts[i]` | `net` only: kernel `i` of the unsplit network, its parts, and calibration's estimate of it run whole (`calibrated_us`, `none` with splitting off) |
+//! | `kernel_parts[i]` | `net` only: kernel `i` of the unsplit network, its parts, and the median calibration measured for it run whole (`calibrated_us`, `none` with splitting off) |
 //! | `kernels` | `net` only: each kernel of a job, in dispatch order, named by its main operation and epilogue, a part as `name[i/n]`; one slice each |
 //! | `memory_plan_*` | `net` only: tensors, input/output slots, arenas and their bytes, the plan's total, the most bytes live at one kernel, and the bytes with no sharing |
 //! | `wgpu_counters_populated` | `net` only: whether the backend sets wgpu's buffer counter; when false the loop's buffer creation is unmeasured and the report says so |

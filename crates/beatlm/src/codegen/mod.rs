@@ -38,7 +38,9 @@
 //!   it walks as WGSL `override`s defaulting to the whole kernel, and
 //!   [`constants`] gives a part's values, which [`Kernels`] sets on that part's
 //!   pipeline. [`generate`] checks them against the overrides naga parsed from
-//!   the text, so every part is validated, not only the text.
+//!   the text, so every part is validated, not only the text; a [`Generator`]
+//!   does the same for many specs while parsing each distinct text once, which
+//!   is how [`Kernels`] builds a split kernel's parts.
 //!
 //! The part's range could have been a uniform instead. Overrides were chosen
 //! because the range of a part never changes after the plan is made, and an
@@ -172,44 +174,142 @@ pub fn constants(spec: &KernelSpec, variant: Variant) -> Vec<(&'static str, f64)
 /// [`constants`] checked against the overrides the parsed module declares:
 /// each names one `u32` override, and each override has a value.
 ///
-/// A part's values change no type or size in the text, so a text that
-/// validates with its defaults validates with any part's; naga's override
-/// substitution is not in this crate's naga features, and wgpu performs it,
-/// and validates the result again, when it creates the part's pipeline.
+/// One call checks one spec; a caller with several, such as the parts of a
+/// split kernel, uses a [`Generator`], which parses each distinct text once.
 ///
 /// # Errors
 ///
 /// [`CodegenError::Parse`] or [`CodegenError::Validation`], with the text, or
 /// [`CodegenError::PartConstant`].
 pub fn generate(spec: &KernelSpec, variant: Variant) -> Result<String, CodegenError> {
-    let kernel = spec.name();
-    let text = wgsl(spec, variant);
-    let module = parse_and_validate(&kernel, &text, spec.requirements(variant).features)?;
-    let constants = constants(spec, variant);
+    Generator::new().generate(spec, variant).map(str::to_owned)
+}
+
+/// A text naga has validated, and the overrides the validated module declares.
+#[derive(Debug)]
+struct Checked {
+    text: String,
+    features: DeviceFeatures,
+    /// Each declared override as `(name, is u32)`.
+    overrides: Vec<(String, bool)>,
+}
+
+/// Generates and checks kernel texts, remembering each distinct text it has
+/// validated.
+///
+/// The parts of a split kernel have the same text and differ only in their
+/// [`constants`], so the text is parsed and validated by naga once, when the
+/// first part asks for it, and every part's constants are still checked
+/// against the overrides that validation found. "Nothing reaches the device
+/// unvalidated" (the [module documentation](self)) then holds for every part
+/// without parsing the same text once per part. A part's values change no type
+/// or size in the text, so a text that validates with its defaults validates
+/// with any part's; naga's override substitution is not in this crate's naga
+/// features, and wgpu performs it, and validates the result again, when it
+/// creates the part's pipeline.
+#[derive(Debug, Default)]
+pub struct Generator {
+    checked: Vec<Checked>,
+}
+
+impl Generator {
+    /// A generator that has validated nothing.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// How many distinct texts this generator has parsed and validated; a
+    /// caller or a test reads it to see that parts sharing a text did not each
+    /// parse it.
+    #[must_use]
+    pub fn validated(&self) -> usize {
+        self.checked.len()
+    }
+
+    /// The text of `variant` of `spec`, validated (once per distinct text and
+    /// feature set) and with `spec`'s [`constants`] checked against its
+    /// overrides, as [`generate`] does for one spec.
+    ///
+    /// # Errors
+    ///
+    /// [`CodegenError::Parse`] or [`CodegenError::Validation`], with the text,
+    /// or [`CodegenError::PartConstant`].
+    pub fn generate(&mut self, spec: &KernelSpec, variant: Variant) -> Result<&str, CodegenError> {
+        let index = self.check(spec, variant)?;
+        Ok(self.text(index))
+    }
+
+    /// As [`generate`](Self::generate), returning the index of the distinct
+    /// text instead of the text: specs that share a text and feature set share
+    /// an index, so a caller can key what it builds from the text (a shader
+    /// module) by it instead of comparing texts again.
+    pub(crate) fn check(
+        &mut self,
+        spec: &KernelSpec,
+        variant: Variant,
+    ) -> Result<usize, CodegenError> {
+        let kernel = spec.name();
+        let text = wgsl(spec, variant);
+        let features = spec.requirements(variant).features;
+        let index = if let Some(index) = self
+            .checked
+            .iter()
+            .position(|c| c.features == features && c.text == text)
+        {
+            index
+        } else {
+            let module = parse_and_validate(&kernel, &text, features)?;
+            let overrides = module
+                .overrides
+                .iter()
+                .map(|(_, o)| {
+                    let is_u32 =
+                        module.types[o.ty].inner == naga::TypeInner::Scalar(naga::Scalar::U32);
+                    (o.name.clone().unwrap_or_default(), is_u32)
+                })
+                .collect();
+            self.checked.push(Checked {
+                text,
+                features,
+                overrides,
+            });
+            self.checked.len() - 1
+        };
+        check_constants(&kernel, &self.checked[index], &constants(spec, variant))?;
+        Ok(index)
+    }
+
+    /// The validated text at `index`, as [`check`](Self::check) returned it.
+    pub(crate) fn text(&self, index: usize) -> &str {
+        &self.checked[index].text
+    }
+}
+
+/// Checks that every override `checked` declares is a `u32` the part gives one
+/// value, and that every value the part gives names one of them.
+fn check_constants(
+    kernel: &str,
+    checked: &Checked,
+    constants: &[(&'static str, f64)],
+) -> Result<(), CodegenError> {
     let error = |name: &str| CodegenError::PartConstant {
-        kernel: kernel.clone(),
+        kernel: kernel.to_owned(),
         name: name.to_owned(),
-        wgsl: text.clone(),
+        wgsl: checked.text.clone(),
     };
-    // Every override the text declares is a u32 the part gives one value...
-    for (_, o) in module.overrides.iter() {
-        let name = o.name.as_deref().unwrap_or_default();
-        let is_u32 = module.types[o.ty].inner == naga::TypeInner::Scalar(naga::Scalar::U32);
-        if !is_u32 || constants.iter().filter(|(c, _)| *c == name).count() != 1 {
+    for (name, is_u32) in &checked.overrides {
+        if !is_u32 || constants.iter().filter(|(c, _)| c == name).count() != 1 {
             return Err(error(name));
         }
     }
-    // ...and every value the part gives names one of them.
-    let declared = |name: &str| {
-        module
-            .overrides
-            .iter()
-            .any(|(_, o)| o.name.as_deref() == Some(name))
-    };
-    if let Some((name, _)) = constants.iter().find(|(c, _)| !declared(c)) {
+    if let Some((name, _)) = constants
+        .iter()
+        .find(|(c, _)| !checked.overrides.iter().any(|(o, _)| o == c))
+    {
         return Err(error(name));
     }
-    Ok(text)
+    Ok(())
 }
 
 /// Parses `wgsl` with naga and validates it with every check on and only the
@@ -477,6 +577,35 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_parts_of_a_kernel_validate_their_text_once_and_each_check_their_constants() {
+        let (inputs, heavy, out) = heavies().remove(2);
+        let whole = program(&inputs, heavy, out, &[], Fusion::On);
+        let split = whole.split(&[3]).unwrap();
+        assert_eq!(split.kernels().len(), 3);
+        let mut generator = Generator::new();
+        for part in split.kernels() {
+            let text = generator
+                .generate(part, Variant::Baseline)
+                .unwrap()
+                .to_owned();
+            assert_eq!(text, wgsl(&part.whole(), Variant::Baseline));
+        }
+        assert_eq!(generator.validated(), 1);
+        // A kernel with another text is validated on its own.
+        let other = program(
+            &inputs,
+            heavy,
+            out,
+            &epilogues(u32::try_from(out).unwrap())[1],
+            Fusion::On,
+        );
+        generator
+            .generate(&other.kernels()[0], Variant::Baseline)
+            .unwrap();
+        assert_eq!(generator.validated(), 2);
     }
 
     #[test]

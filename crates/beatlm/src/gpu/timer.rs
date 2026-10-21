@@ -28,6 +28,13 @@ use super::ring::{Phase, Ring};
 /// finds its slot busy while the GPU keeps up.
 pub const RING_DEPTH: usize = 3;
 
+/// The most timed compute passes one frame can have: one query set holds
+/// [`wgpu::QUERY_SET_MAX_QUERIES`] queries, two per pass, and the frame's
+/// render pass takes one pair. A host reads it to refuse a plan whose slices
+/// cannot all be timed before it builds anything, instead of failing in
+/// [`SliceTimer::new`].
+pub const MAX_SLICES: u32 = (wgpu::QUERY_SET_MAX_QUERIES / 2).saturating_sub(1);
+
 const MAP_PENDING: u8 = 0;
 const MAP_OK: u8 = 1;
 const MAP_FAILED: u8 = 2;
@@ -169,11 +176,10 @@ impl<T> SliceTimer<T> {
         if !(period_ns.is_finite() && period_ns > 0.0) {
             return Err(TimerError::InvalidPeriod { period_ns });
         }
-        let max_capacity = (wgpu::QUERY_SET_MAX_QUERIES / 2).saturating_sub(1);
-        if max_slices == 0 || max_slices > max_capacity {
+        if max_slices == 0 || max_slices > MAX_SLICES {
             return Err(TimerError::InvalidCapacity {
                 requested: max_slices,
-                max: max_capacity,
+                max: MAX_SLICES,
             });
         }
         // One pair per slice and one for the render pass.
