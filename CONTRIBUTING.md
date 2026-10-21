@@ -87,8 +87,9 @@ and never committed ([PUBLIC_DEVELOPMENT.md](PUBLIC_DEVELOPMENT.md#third-party-m
 For Depth Anything V2 Small, in this order:
 
 ```bash
-just setup-depth-anything       # weights + config into models/depth-anything-v2-small/
-just reference-depth-anything   # optional: the original implementation's outputs
+just setup-depth-anything           # weights + config into models/depth-anything-v2-small/
+just reference-depth-anything       # optional: the original implementation's outputs at 518 pixels
+just reference-depth-anything 266   # optional: the same at 266 pixels, into reference/266/
 cargo test -p beatlm --test depth_anything_v2 -- --ignored
 ```
 
@@ -102,7 +103,9 @@ licence (Apache-2.0) and the notices. `reference-depth-anything` runs
 `transformers` through `uv` in an isolated environment with pinned versions and
 writes the input, the four encoder features the depth head reads and the
 predicted depth next to the weights; it is the thing a port of the graph is
-compared with. Neither recipe is part of `just check`, and no build or test in
+compared with. It takes the input's side as an argument, 518 by default, and
+writes each side other than 518 to a directory of its own; the tests compare
+the port at 518 and at 266, and each names the recipe it needs. Neither recipe is part of `just check`, and no build or test in
 `check` needs them: the tests that read these files are `#[ignore]`d and, run by
 hand without the files, fail with a message naming the recipe to run.
 

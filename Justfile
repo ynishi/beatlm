@@ -42,9 +42,13 @@ setup-depth-anything:
 # Runs the original implementation on a fixed input and writes the encoder
 # features and the depth it predicts next to the weights, for the port to be
 # compared with. Needs `uv`; builds an isolated Python environment with torch.
-# Run `just setup-depth-anything` first.
-reference-depth-anything:
-    uv run --isolated --no-project scripts/reference/depth_anything_v2.py
+# Run `just setup-depth-anything` first. `size` is the input's side in pixels,
+# a multiple of 14: 518, the side the position embedding is stored for, writes
+# reference/, any other reference/<size>/. `just reference-depth-anything 266`
+# and `just reference-depth-anything size=266` both work: just passes the
+# second to the parameter as the text `size=266`, and the prefix is dropped.
+reference-depth-anything size="518":
+    uv run --isolated --no-project scripts/reference/depth_anything_v2.py --size {{trim_start_match(size, "size=")}}
 
 # One worktree per issue, cut from a freshly fetched origin/main.
 worktree-new type slug:

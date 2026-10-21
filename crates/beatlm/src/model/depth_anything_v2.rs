@@ -13,14 +13,22 @@
 //!
 //! # The encoder
 //!
-//! With `G = image_size / patch_size` and `T = G * G + 1` tokens:
+//! Every function here builds the graph for a square image of `side` pixels a
+//! side, a positive multiple of `patch_size`; `config.image_size` is the side
+//! the checkpoint's position embedding is stored for (518 for Small), and any
+//! other side is the same weights at another resolution. With
+//! `G = side / patch_size` and `T = G * G + 1` tokens:
 //!
-//! 1. the image, NHWC `[image_size][image_size][num_channels]`, becomes `G * G`
-//!    patch tokens by a [`PatchEmbed`] with bias;
+//! 1. the image, NHWC `[side][side][num_channels]`, becomes `G * G` patch
+//!    tokens by a [`PatchEmbed`] with bias;
 //! 2. the class token is put in front ([`PrependToken`]) and the position
 //!    embedding added ([`OpKind::Add`] of a weight, which fuses into the
-//!    previous kernel). The embedding is stored for `T` tokens and used as it
-//!    is: at the size it was stored for, DINOv2 does not interpolate it;
+//!    previous kernel). At `config.image_size` the embedding is used as
+//!    stored, as `transformers`' DINOv2 does at the size it was stored for; at
+//!    any other side its grid is resampled bicubically to `G x G` on the host
+//!    when the weight is read ([`Convert::InterpolatePositions`]), as
+//!    `Dinov2Embeddings.interpolate_pos_encoding` of `transformers` 5.18.0
+//!    does, so the graph holds a weight of `T` rows either way;
 //! 3. each layer up to the deepest of `out_indices` is a [`block`];
 //! 4. after each layer of `out_indices`, the tokens go through the final layer
 //!    norm and leave as a `[G][G][hidden_size]` map without the class token
@@ -40,7 +48,10 @@
 //!    the stage's [`Resample`]: `Up(f)` a [`ConvTranspose2d`] of kernel and
 //!    stride `f` with bias (`G * f` pixels), `Keep` nothing, `Down(f)` a 3x3
 //!    convolution of stride `f` with bias (`(G - 1) / f + 1` pixels). For the
-//!    Small checkpoint at 518 pixels: 148, 74, 37 and 19 pixels a side.
+//!    Small checkpoint at 518 pixels: 148, 74, 37 and 19 pixels a side; at
+//!    266 (`G = 19`), 76, 38, 19 and 10. Every size of the decoder follows the
+//!    patch grid, as `transformers` computes them from `patch_height` and
+//!    `patch_width`, never from the configuration's `image_size`.
 //! 2. Per stage, a 3x3 convolution **without bias** to `F` channels.
 //! 3. **Fusion**, deepest stage first: fusion layer `l` reads stage
 //!    `n - 1 - l` ([`fusion_layer`]). Layer 0 runs only its second residual
@@ -53,10 +64,10 @@
 //!    size, or to twice its own after the last stage, and projected by a 1x1
 //!    convolution with bias.
 //! 4. **The head**: a 3x3 convolution with bias to `F / 2`, bilinear
-//!    resampling with aligned corners to `G * patch_size` pixels a side, a 3x3
-//!    convolution with bias to `head_hidden_size`, a ReLU, a 1x1 convolution
-//!    with bias to one channel and a ReLU: `[G * patch][G * patch][1]`, the
-//!    relative depth.
+//!    resampling with aligned corners to `G * patch_size` pixels a side (the
+//!    input's side), a 3x3 convolution with bias to `head_hidden_size`, a
+//!    ReLU, a 1x1 convolution with bias to one channel and a ReLU:
+//!    `[G * patch][G * patch][1]`, the relative depth.
 //!
 //! Three things in the `transformers` code have no operation here, because
 //! they compute nothing for this model:
@@ -71,6 +82,19 @@
 //!   checkpoint's `config.json` leaves unset and `DepthAnythingConfig` then
 //!   sets to one; its `depth_estimation_type` is likewise the default,
 //!   `"relative"`, whose final activation is the ReLU above.
+//!
+//! # Which input size
+//!
+//! The side is the host's choice, and it trades the depth's resolution for
+//! latency under the fixed-latency promise. Measured on an Apple M1 Pro,
+//! Metal, on 2026-10-22, the whole model fused took about 202 ms of GPU time
+//! per run at 518 pixels, 138 at 434, 86 at 350, 53 at 266 and 35 at 182;
+//! spread over 60 Hz frames behind a synthetic render, a result costs a
+//! latency of more than 20 frames at 518 and 5 at 266. The recommendation
+//! for that adapter is **266 pixels at a latency of 5 frames** (83 ms, 12
+//! results a second), with 182 pixels at 2 frames (33 ms) where latency
+//! matters more than detail. The `beatlm-bench` crate documentation, under
+//! "The `depth` workload", has the sweep, the criterion and why.
 
 use beatlm_core::kernel::{
     AttentionScores, AttentionValues, Conv2d1x1, Conv2d3x3, ConvTranspose2d, LayerNorm, MatMul,
@@ -92,7 +116,7 @@ pub const DINOV2_LAYER_NORM_EPSILON: f32 = 1e-6;
 /// The tensors of the encoder a caller binds or reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Encoder {
-    /// The input image, NHWC, `[image_size][image_size][num_channels]`.
+    /// The input image, NHWC, `[side][side][num_channels]`.
     pub image: TensorId,
     /// One feature map per entry of `out_indices`, shallowest first, each
     /// `[G][G][hidden_size]`.
@@ -113,21 +137,35 @@ struct Dims {
 }
 
 impl Dims {
-    fn of(config: &Config) -> Result<Self, ModelError> {
+    /// The dimensions of the model `config` describes, built for an image of
+    /// `side` pixels a side.
+    fn at(config: &Config, side: usize) -> Result<Self, ModelError> {
         config
             .validate()
             .map_err(|e| ModelError::Config(Box::new(e)))?;
+        if side == 0 || !side.is_multiple_of(config.patch_size) {
+            return Err(ModelError::InputSize {
+                side,
+                patch_size: config.patch_size,
+            });
+        }
+        let grid = side / config.patch_size;
         let hidden = dimension("hidden_size", config.hidden_size)?;
         let heads = dimension("num_heads", config.num_heads)?;
         Ok(Self {
-            grid: dimension("image_size / patch_size", config.grid())?,
+            grid: dimension("side / patch_size", grid)?,
             patch: dimension("patch_size", config.patch_size)?,
             channels: dimension("num_channels", config.num_channels)?,
             hidden,
             heads,
             head_dim: hidden / heads,
             mlp: dimension("mlp_ratio * hidden_size", config.mlp_size())?,
-            tokens: dimension("tokens", config.tokens())?,
+            tokens: dimension(
+                "tokens",
+                grid.checked_mul(grid)
+                    .and_then(|g| g.checked_add(1))
+                    .unwrap_or(usize::MAX),
+            )?,
         })
     }
 }
@@ -191,8 +229,8 @@ fn linear(
 }
 
 /// Transformer layer `layer` (from zero) of the encoder `config` describes,
-/// reading the tokens `x` (`[T][hidden_size]`) and returning its output, a
-/// tensor of `role`:
+/// built for an image of `side` pixels a side, reading the tokens `x`
+/// (`[T][hidden_size]`) and returning its output, a tensor of `role`:
 ///
 /// ```text
 /// x1  = x  + ls1 * proj(attention(norm1(x)))
@@ -209,15 +247,17 @@ fn linear(
 /// # Errors
 ///
 /// A configuration that does not validate or does not fit the IR's
-/// dimensions, or a shape the graph refuses.
+/// dimensions, a `side` that is not whole patches, or a shape the graph
+/// refuses.
 pub fn block(
     b: &mut Builder<Role>,
     config: &Config,
+    side: usize,
     layer: usize,
     x: TensorId,
     role: TensorRole,
 ) -> Result<TensorId, ModelError> {
-    layer_of(b, &Dims::of(config)?, layer, x, role)
+    layer_of(b, &Dims::at(config, side)?, layer, x, role)
 }
 
 /// [`block`] with the configuration already validated into `d`.
@@ -383,20 +423,23 @@ fn layer_of(
     )?)
 }
 
-/// The encoder `config` describes, from the image to its feature maps, which
-/// are tensors of `features` (outputs, or activations a later stage reads).
+/// The encoder `config` describes, built for an image of `side` pixels a side,
+/// from the image to its feature maps, which are tensors of `features`
+/// (outputs, or activations a later stage reads).
 ///
 /// # Errors
 ///
 /// A configuration that does not validate or does not fit the IR's
-/// dimensions, or a shape the graph refuses.
+/// dimensions, a `side` that is not whole patches, or a shape the graph
+/// refuses.
 pub fn encoder(
     b: &mut Builder<Role>,
     config: &Config,
+    side: usize,
     features: TensorRole,
 ) -> Result<Encoder, ModelError> {
     use TensorRole::Activation as Act;
-    let d = Dims::of(config)?;
+    let d = Dims::at(config, side)?;
     let image = b.input(size(&[d.grid, d.patch, d.grid, d.patch, d.channels]))?;
     let patch_weights = weight(
         b,
@@ -411,10 +454,20 @@ pub fn encoder(
         d.hidden.into(),
     )?;
     let class_token = weight(b, Role::ClassToken, Convert::AsStored, d.hidden.into())?;
+    // `transformers` returns the stored embedding when the image is the
+    // square it was stored for, and resamples it otherwise.
+    let positions_convert = if usize::try_from(d.grid).ok() == Some(config.grid()) {
+        Convert::AsStored
+    } else {
+        Convert::InterpolatePositions {
+            height: d.grid,
+            width: d.grid,
+        }
+    };
     let positions = weight(
         b,
         Role::PositionEmbedding,
-        Convert::AsStored,
+        positions_convert,
         size(&[d.tokens, d.hidden]),
     )?;
 
@@ -497,7 +550,7 @@ pub type Size = (u32, u32);
 /// The tensors of the whole model a caller binds or reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DepthModel {
-    /// The input image, NHWC, `[image_size][image_size][num_channels]`.
+    /// The input image, NHWC, `[side][side][num_channels]`.
     pub image: TensorId,
     /// The encoder's feature maps, activations the decoder reads, shallowest
     /// first.
@@ -815,25 +868,26 @@ pub fn fusion_layer(
     )
 }
 
-/// The DPT head `config` describes, from the encoder's `features` (one per
-/// entry of `out_indices`, shallowest first, each `[G][G][hidden_size]`) to the
-/// relative depth, a tensor of `depth` (`[G * patch_size][G * patch_size]`,
-/// one channel). The [module documentation](self#the-decoder) lists the
-/// operations.
+/// The DPT head `config` describes, built for an image of `side` pixels a
+/// side, from the encoder's `features` (one per entry of `out_indices`,
+/// shallowest first, each `[G][G][hidden_size]`) to the relative depth, a
+/// tensor of `depth` (`[G * patch_size][G * patch_size]`, one channel). The
+/// [module documentation](self#the-decoder) lists the operations.
 ///
 /// # Errors
 ///
 /// A configuration that does not validate or does not fit the IR's
-/// dimensions, a feature count other than the stage count, or a shape the
-/// graph refuses.
+/// dimensions, a `side` that is not whole patches, a feature count other than
+/// the stage count, or a shape the graph refuses.
 pub fn decoder(
     b: &mut Builder<Role>,
     config: &Config,
+    side: usize,
     features: &[TensorId],
     depth: TensorRole,
 ) -> Result<TensorId, ModelError> {
     use TensorRole::Activation as Act;
-    let d = Dims::of(config)?;
+    let d = Dims::at(config, side)?;
     if features.len() != config.out_indices.len() {
         return Err(ModelError::FeatureCount {
             expected: config.out_indices.len(),
@@ -920,15 +974,20 @@ pub fn decoder(
     relu(b, third, (side, side), 1, depth)
 }
 
-/// The whole model `config` describes: the [`encoder`], its features as
-/// activations, and the [`decoder`] reading them, the depth an output.
+/// The whole model `config` describes, built for an image of `side` pixels a
+/// side: the [`encoder`], its features as activations, and the [`decoder`]
+/// reading them, the depth an output.
 ///
 /// # Errors
 ///
 /// As [`encoder`] and [`decoder`].
-pub fn model(b: &mut Builder<Role>, config: &Config) -> Result<DepthModel, ModelError> {
-    let enc = encoder(b, config, TensorRole::Activation)?;
-    let depth = decoder(b, config, &enc.features, TensorRole::Output)?;
+pub fn model(
+    b: &mut Builder<Role>,
+    config: &Config,
+    side: usize,
+) -> Result<DepthModel, ModelError> {
+    let enc = encoder(b, config, side, TensorRole::Activation)?;
+    let depth = decoder(b, config, side, &enc.features, TensorRole::Output)?;
     Ok(DepthModel {
         image: enc.image,
         features: enc.features,
@@ -945,9 +1004,12 @@ mod tests {
     use beatlm_core::kernel::{Fusion, KernelSpec, MainOp, Program, Variant};
     use beatlm_core::memory::MemoryPlan;
 
+    /// The side the Small checkpoint's position embedding is stored for.
+    const NATIVE: usize = 518;
+
     fn small_encoder() -> (Builder<Role>, Encoder) {
         let mut b = Builder::new();
-        let e = encoder(&mut b, &Config::small(), TensorRole::Output).unwrap();
+        let e = encoder(&mut b, &Config::small(), NATIVE, TensorRole::Output).unwrap();
         (b, e)
     }
 
@@ -1024,7 +1086,7 @@ mod tests {
 
     fn small_model() -> (Builder<Role>, DepthModel) {
         let mut b = Builder::new();
-        let m = model(&mut b, &Config::small()).unwrap();
+        let m = model(&mut b, &Config::small(), NATIVE).unwrap();
         (b, m)
     }
 
@@ -1250,11 +1312,12 @@ mod tests {
     #[test]
     fn a_decoder_given_the_wrong_number_of_features_is_refused() {
         let mut b = Builder::new();
-        let e = encoder(&mut b, &Config::small(), TensorRole::Activation).unwrap();
+        let e = encoder(&mut b, &Config::small(), NATIVE, TensorRole::Activation).unwrap();
         assert!(matches!(
             decoder(
                 &mut b,
                 &Config::small(),
+                NATIVE,
                 &e.features[..3],
                 TensorRole::Output
             ),
@@ -1265,12 +1328,112 @@ mod tests {
         ));
     }
 
+    /// The position embedding's weight of a builder's graph.
+    fn positions(b: &Builder<Role>) -> &crate::model::Weight<Role> {
+        let mut found = b
+            .weights()
+            .iter()
+            .filter(|w| w.source.parts == [Role::PositionEmbedding]);
+        let first = found.next().unwrap();
+        assert!(found.next().is_none());
+        first
+    }
+
+    #[test]
+    fn at_another_side_the_grid_the_positions_and_the_decoder_follow_the_input() {
+        let config = Config::small();
+        let mut b = Builder::new();
+        let m = model(&mut b, &config, 266).unwrap();
+        let graph = b.graph();
+        assert_eq!(graph.elements(m.image), Some(266 * 266 * 3));
+        for &f in &m.features {
+            assert_eq!(graph.elements(f), Some(19 * 19 * 384));
+        }
+        assert_eq!(graph.elements(m.depth), Some(266 * 266));
+
+        // The embedding is resampled to the 19 x 19 grid when it is read; at
+        // the stored side it is read as stored.
+        let resampled = positions(&b);
+        assert_eq!(
+            resampled.source.convert,
+            Convert::InterpolatePositions {
+                height: 19,
+                width: 19
+            }
+        );
+        assert_eq!(resampled.elements, (19 * 19 + 1) * 384);
+        let (native, _) = small_model();
+        assert_eq!(positions(&native).source.convert, Convert::AsStored);
+        // Every other weight is read as the stored side reads it.
+        let others = |b: &Builder<Role>| -> Vec<(Source<Role>, u64)> {
+            b.weights()
+                .iter()
+                .filter(|w| w.source.parts != [Role::PositionEmbedding])
+                .map(|w| (w.source.clone(), w.elements))
+                .collect()
+        };
+        assert_eq!(others(&b), others(&native));
+
+        // Stages of 76, 38, 19 and 10 pixels; fusion resamples each stage's
+        // result to the next, the last doubles 76 to 152, and the head
+        // resamples to the input's side.
+        let program = graph.lower(Fusion::On).unwrap();
+        let resizes: Vec<(u32, u32)> = program
+            .kernels()
+            .iter()
+            .filter_map(|k| match k.main() {
+                MainOp::ResizeBilinear(r) => Some((r.in_height, r.out_height)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            resizes,
+            [(10, 19), (19, 38), (38, 76), (76, 152), (152, 266)]
+        );
+        let transposed: Vec<u32> = program
+            .kernels()
+            .iter()
+            .filter_map(|k| match k.main() {
+                MainOp::ConvTranspose2d(c) => Some(c.height * c.factor),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(transposed, [76, 38]);
+
+        let baseline = DeviceProfile::webgpu_baseline();
+        let plan = MemoryPlan::new(program.tensors(), &baseline).unwrap();
+        assert!(plan.valid_on(&baseline));
+        assert_disjoint(&program, &plan);
+        assert_live_at_their_kernels(&program);
+        let mut generator = crate::codegen::Generator::new();
+        for spec in program.kernels() {
+            generator
+                .generate(spec, Variant::Baseline)
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+    }
+
+    #[test]
+    fn an_image_that_is_not_whole_patches_is_refused() {
+        for side in [0, 7, 520] {
+            let mut b = Builder::new();
+            let refused = model(&mut b, &Config::small(), side);
+            assert!(
+                matches!(
+                    refused,
+                    Err(ModelError::InputSize { side: s, patch_size: 14 }) if s == side
+                ),
+                "{side}: {refused:?}"
+            );
+        }
+    }
+
     #[test]
     fn layers_past_the_deepest_feature_are_not_built() {
         let mut config = Config::small();
         config.out_indices = vec![1, 2, 3, 4];
         let mut b = Builder::new();
-        encoder(&mut b, &config, TensorRole::Output).unwrap();
+        encoder(&mut b, &config, NATIVE, TensorRole::Output).unwrap();
         let p = b.graph().lower(Fusion::On).unwrap();
         assert_eq!(p.kernels().len(), 2 + 4 * 9 + 4 * 2);
         assert!(

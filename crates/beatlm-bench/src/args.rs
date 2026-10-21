@@ -11,21 +11,28 @@ pub const USAGE: &str = "\
 usage: beatlm-bench [options]
 
   --frames N        frames to run                          (default 600)
-  --latency K       promised delivery latency, in frames   (default 2)
-  --slices S        slices per job, one job per frame      (default 4)
+  --latency K       promised delivery latency, in frames   (default 2;
+                    depth: 5)
+  --slices S        slices per job                         (default 4)
   --slice-iters N   loop iterations per invocation of a slice kernel
   --render-iters N  loop iterations per pixel of the render pass
   --margin-us N     safety margin in the frame budget, us  (default 2000)
-  --workload W      synthetic or net                        (default synthetic)
-  --fusion F        net only: fuse element-wise operations into the kernel
-                    before them, on or off                  (default on)
+  --workload W      synthetic, net or depth                (default synthetic)
+  --submit S        when a frame submits its input as a job: every frame,
+                    or free, only once the last job's slices are all handed
+                    out                                    (default every;
+                    depth: free)
+  --size N          depth only: input side in pixels, a multiple of 14
+                                                           (default 266)
+  --fusion F        net and depth: fuse element-wise operations into the
+                    kernel before them, on or off          (default on)
   --dump-wgsl DIR   net only: write each generated kernel's WGSL into DIR
                     before the run
-  --max-dispatch-us N  net only: calibrate each kernel before the run, split
-                    those whose median is longer than N us into parts and
-                    measure the parts; 0 turns splitting off
+  --max-dispatch-us N  net and depth: calibrate each kernel before the run,
+                    split those whose median is longer than N us into parts
+                    and measure the parts; 0 turns splitting off
                                                            (default 1000)
-  --split S         net only: on or off; off is --max-dispatch-us 0
+  --split S         net and depth: on or off; off is --max-dispatch-us 0
                                                            (default on)
   --mode M          concurrency candidate: sync, thread or async (default sync)
   --runs N          repeat the whole run N times on one device (default 1)
@@ -53,6 +60,39 @@ pub const DEFAULT_BACKGROUND_ITERS: u32 = 4_000;
 /// its kernel, in microseconds; the crate documentation, under "Splitting",
 /// has the sweep that chose it.
 pub const DEFAULT_MAX_DISPATCH_US: u64 = 1_000;
+
+/// The depth model's input side, in pixels, when `--size` is not given: the
+/// resolution the sweep in the crate documentation ("The `depth` workload")
+/// recommends for an Apple M1 Pro.
+pub const DEFAULT_DEPTH_SIZE: u32 = 266;
+
+/// The promised latency of the depth workload, in frames, when `--latency` is
+/// not given: the one the same sweep recommends at [`DEFAULT_DEPTH_SIZE`], a
+/// frame of slack above the smallest that met its criterion there.
+pub const DEFAULT_DEPTH_LATENCY: u32 = 5;
+
+/// When a frame submits its input as a job; the crate documentation, under
+/// "The `depth` workload", says why the model needs `Free`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Submit {
+    /// Every frame submits one job.
+    Every,
+    /// A frame submits a job only when the job submitted last has had all its
+    /// slices handed out, or has left the scheduler; otherwise its input is
+    /// not run, as a host feeding a model slower than its frame rate skips
+    /// frames of the source.
+    Free,
+}
+
+impl Submit {
+    /// The spelling `--submit` accepts and the report prints.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Every => "every",
+            Self::Free => "free",
+        }
+    }
+}
 
 /// Which statistic the cost model reads a slice's measurements with; the
 /// parameters of each are constants in `engine.rs`. The default is the one the
@@ -111,6 +151,10 @@ pub enum WorkloadKind {
     /// kernel, so the job has [`crate::net::kernel_count`] slices for the
     /// `--fusion` setting and `--slices` and `--slice-iters` do not apply.
     Net,
+    /// Depth Anything V2 Small from its weights file (`depth.rs`), one slice
+    /// per kernel like the network: [`crate::depth::kernel_count`] slices for
+    /// `--size` and `--fusion`.
+    Depth,
 }
 
 /// The spelling `--fusion` accepts and the report prints.
@@ -127,7 +171,14 @@ impl WorkloadKind {
         match self {
             Self::Synthetic => "synthetic",
             Self::Net => "net",
+            Self::Depth => "depth",
         }
+    }
+
+    /// Whether the slices are the kernels of a planned program, which is
+    /// calibrated, split and given input and output slots.
+    pub const fn is_planned(self) -> bool {
+        matches!(self, Self::Net | Self::Depth)
     }
 }
 
@@ -148,13 +199,18 @@ pub struct Args {
     pub margin_us: u64,
     /// The load the slices run.
     pub workload: WorkloadKind,
-    /// Whether the network's element-wise operations are fused; `net` only.
+    /// When a frame submits its input as a job.
+    pub submit: Submit,
+    /// The depth model's input side in pixels; `depth` only.
+    pub size: u32,
+    /// Whether the program's element-wise operations are fused; `net` and
+    /// `depth` only.
     pub fusion: Fusion,
     /// Where to write the network's generated WGSL before the run; `net` only.
     pub dump_wgsl: Option<PathBuf>,
     /// The bound a calibrated kernel's dispatch is split to fit, in
-    /// microseconds, or `None` when the network runs unsplit and is not
-    /// calibrated; `net` only.
+    /// microseconds, or `None` when the program runs unsplit and is not
+    /// calibrated; `net` and `depth` only.
     pub max_dispatch_us: Option<u64>,
     /// The concurrency candidate that drives the frame.
     pub mode: Mode,
@@ -179,6 +235,8 @@ impl Default for Args {
             render_iters: DEFAULT_RENDER_ITERS,
             margin_us: 2_000,
             workload: WorkloadKind::Synthetic,
+            submit: Submit::Every,
+            size: DEFAULT_DEPTH_SIZE,
             fusion: Fusion::On,
             dump_wgsl: None,
             max_dispatch_us: Some(DEFAULT_MAX_DISPATCH_US),
@@ -207,8 +265,8 @@ pub enum Command {
 /// # Errors
 ///
 /// An unknown option, a missing or malformed value, a value out of range
-/// (zero frames, zero slices or zero runs), or a `net` option without
-/// `--workload net`.
+/// (zero frames, zero slices or zero runs, a depth size that is not whole
+/// patches), or an option of the `net` or `depth` workload without it.
 pub fn parse<I>(args: I) -> Result<Command>
 where
     I: IntoIterator<Item = String>,
@@ -217,6 +275,9 @@ where
     let mut slices_given = false;
     let mut background_iters_given = false;
     let mut fusion_given = false;
+    let mut latency_given = false;
+    let mut size_given = false;
+    let mut submit_given = false;
     let mut bound_given: Option<u64> = None;
     let mut split_given: Option<bool> = None;
     let mut args = args.into_iter();
@@ -236,7 +297,18 @@ where
         };
         match name.as_str() {
             "--frames" => out.frames = number(&name, &value()?)?,
-            "--latency" => out.latency = number(&name, &value()?)?,
+            "--latency" => {
+                out.latency = number(&name, &value()?)?;
+                latency_given = true;
+            }
+            "--size" => {
+                out.size = number(&name, &value()?)?;
+                size_given = true;
+            }
+            "--submit" => {
+                out.submit = submit(&value()?)?;
+                submit_given = true;
+            }
             "--slices" => {
                 out.slices = number(&name, &value()?)?;
                 slices_given = true;
@@ -278,12 +350,29 @@ where
     if background_iters_given && !out.background_load {
         bail!("--background-iters has no effect without --background-load");
     }
-    if out.workload == WorkloadKind::Net {
-        // The network's kernels are its slices.
-        let kernels = crate::net::kernel_count(out.fusion)?;
+    if size_given && out.workload != WorkloadKind::Depth {
+        bail!("--size has no effect without --workload depth");
+    }
+    if out.workload == WorkloadKind::Depth {
+        // A model more than a frame long cannot take an input every frame;
+        // the crate documentation says what happens when it is made to.
+        if !submit_given {
+            out.submit = Submit::Free;
+        }
+        if !latency_given {
+            out.latency = DEFAULT_DEPTH_LATENCY;
+        }
+    }
+    if out.workload.is_planned() {
+        // The program's kernels are its slices.
+        let kernels = match out.workload {
+            WorkloadKind::Depth => crate::depth::kernel_count(out.size, out.fusion)?,
+            _ => crate::net::kernel_count(out.fusion)?,
+        };
         if slices_given && out.slices != kernels {
             bail!(
-                "--slices is {kernels} for --workload net with --fusion {}: one slice per kernel",
+                "--slices is {kernels} for --workload {} with --fusion {}: one slice per kernel",
+                out.workload.name(),
                 fusion_name(out.fusion)
             );
         }
@@ -299,16 +388,24 @@ where
         };
     } else {
         if fusion_given {
-            bail!("--fusion has no effect without --workload net");
-        }
-        if out.dump_wgsl.is_some() {
-            bail!("--dump-wgsl has no effect without --workload net");
+            bail!("--fusion has no effect without --workload net or depth");
         }
         if bound_given.is_some() || split_given.is_some() {
-            bail!("--max-dispatch-us and --split have no effect without --workload net");
+            bail!("--max-dispatch-us and --split have no effect without --workload net or depth");
         }
     }
+    if out.dump_wgsl.is_some() && out.workload != WorkloadKind::Net {
+        bail!("--dump-wgsl has no effect without --workload net");
+    }
     Ok(Command::Run(out))
+}
+
+/// Parses the value of `--submit`.
+fn submit(text: &str) -> Result<Submit> {
+    [Submit::Every, Submit::Free]
+        .into_iter()
+        .find(|s| s.name() == text)
+        .with_context(|| format!("--submit: {text:?} is not one of every, free"))
 }
 
 /// Parses an `on` or `off` value.
@@ -330,10 +427,14 @@ fn fusion(text: &str) -> Result<Fusion> {
 
 /// Parses the value of `--workload`.
 fn workload(text: &str) -> Result<WorkloadKind> {
-    [WorkloadKind::Synthetic, WorkloadKind::Net]
-        .into_iter()
-        .find(|w| w.name() == text)
-        .with_context(|| format!("--workload: {text:?} is not one of synthetic, net"))
+    [
+        WorkloadKind::Synthetic,
+        WorkloadKind::Net,
+        WorkloadKind::Depth,
+    ]
+    .into_iter()
+    .find(|w| w.name() == text)
+    .with_context(|| format!("--workload: {text:?} is not one of synthetic, net, depth"))
 }
 
 /// Parses the value of `--estimator`.
@@ -525,6 +626,51 @@ mod tests {
         assert_eq!(a.slices, crate::net::kernel_count(Fusion::On).unwrap());
         assert!(parse_strs(&["--split", "off"]).is_err());
         assert!(parse_strs(&["--max-dispatch-us", "500"]).is_err());
+    }
+
+    #[test]
+    fn the_depth_workload_has_its_own_size_latency_and_submission_defaults() {
+        let Command::Run(a) = parse_strs(&["--workload", "depth"]).unwrap() else {
+            panic!("expected a run");
+        };
+        assert_eq!(
+            (a.size, a.latency, a.submit),
+            (DEFAULT_DEPTH_SIZE, DEFAULT_DEPTH_LATENCY, Submit::Free)
+        );
+        assert_eq!(
+            a.slices,
+            crate::depth::kernel_count(DEFAULT_DEPTH_SIZE, Fusion::On).unwrap()
+        );
+        assert_eq!(a.max_dispatch_us, Some(DEFAULT_MAX_DISPATCH_US));
+        let Command::Run(a) = parse_strs(&[
+            "--workload=depth",
+            "--size",
+            "182",
+            "--latency",
+            "3",
+            "--submit",
+            "every",
+            "--split",
+            "off",
+        ])
+        .unwrap() else {
+            panic!("expected a run");
+        };
+        assert_eq!(
+            (a.size, a.latency, a.submit, a.max_dispatch_us),
+            (182, 3, Submit::Every, None)
+        );
+        assert!(parse_strs(&["--workload", "depth", "--size", "100"]).is_err());
+        assert!(parse_strs(&["--workload", "depth", "--slices", "3"]).is_err());
+        assert!(parse_strs(&["--size", "266"]).is_err());
+        assert!(parse_strs(&["--workload", "depth", "--dump-wgsl", "kernels"]).is_err());
+        assert!(parse_strs(&["--submit", "sometimes"]).is_err());
+        // The other workloads submit every frame unless told otherwise.
+        assert_eq!(Args::default().submit, Submit::Every);
+        let Command::Run(a) = parse_strs(&["--submit", "free"]).unwrap() else {
+            panic!("expected a run");
+        };
+        assert_eq!((a.submit, a.latency), (Submit::Free, 2));
     }
 
     #[test]

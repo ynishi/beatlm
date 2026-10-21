@@ -244,7 +244,7 @@ fn one_encoder_block_with_random_weights_matches_the_reference_block() {
     let mut b: Builder<Role> = Builder::new();
     let tokens = config.tokens() as u64 * config.hidden_size as u64;
     let x = b.input(tokens).unwrap();
-    let y = block(&mut b, &config, 0, x, TensorRole::Output).unwrap();
+    let y = block(&mut b, &config, config.image_size, 0, x, TensorRole::Output).unwrap();
     let (g, weights) = b.finish();
 
     let mut values = BTreeMap::from([(x, uniform(20, tokens as usize, -2.0, 2.0))]);

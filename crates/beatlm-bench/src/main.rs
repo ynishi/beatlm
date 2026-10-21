@@ -291,6 +291,182 @@
 //! dispatch 0.6 to 0.8 ms longer at the median than 1000 did. On another
 //! adapter the sweep is the thing to repeat.
 //!
+//! # The `depth` workload
+//!
+//! `--workload depth` runs Depth Anything V2 Small as the job: the graph
+//! `beatlm::model::depth_anything_v2::model` builds at `--size` pixels a side
+//! (a multiple of 14; default 266), lowered with `--fusion`, with every
+//! weight read from the real weights file (`depth.rs`; `just
+//! setup-depth-anything` fetches it, and `BEATLM_MODELS_DIR` points at a
+//! models directory elsewhere, as for the `beatlm` tests). Everything after
+//! the graph is the `net` workload's: the program is calibrated and split
+//! (`--max-dispatch-us`, `--split`, "Splitting" above), realised through the
+//! same `Net` with one input and one output slot per job that can be in
+//! flight (`SyncPolicy::max_in_flight`, `--latency` plus one), run before the
+//! synthetic render pass under `--latency k`, and watched by the same
+//! counters. Every slot holds the same fixed image, uploaded before the loop;
+//! the depth is not read back (`depth.rs` says what that leaves out). The
+//! report adds `size` to `config` and prints the `net` lines: the kernels and
+//! their parts, the memory plan, and the loop's counters.
+//!
+//! **One input at a time.** A job of this model takes several frames' budget,
+//! and jobs run in submission order and never interleave (the core's
+//! scheduler owns the rule). Submitting every frame's input then starves every
+//! job after the first: each reaches the queue only when the one before it
+//! has held the budget up to its own deadline, gets its deadline frame and
+//! misses. The engine's test
+//! `a_job_longer_than_a_frame_starves_when_every_frame_submits_and_not_when_free`
+//! shows it on the scheduler alone, with a job of five frames' estimates under
+//! latency 5: every frame's input delivers 1 result in 120 frames and misses
+//! 114, where submitting only when the engine is free delivers 23 and misses
+//! none. So `--submit` (default `every`, and `free` for `depth`) has a second
+//! mode: a frame submits its input only when the job submitted last has had
+//! all its slices handed out, or has left the scheduler; otherwise that
+//! frame's input is not run, as a host skips frames of its source for a model
+//! slower than its frame rate. The promise is unchanged for every input that
+//! is run: its result is delivered exactly `k` frames after it. At most one
+//! job has slices left at a time, so the loop's timer holds one job's slices
+//! (`engine::jobs_with_slices`), and the unsplit model's 155 kernels times
+//! `k + 1` jobs, which the timer could not hold for `k` past 12, never has to
+//! be timed. `submitted` in the report counts the inputs run; `delivered` per
+//! second is the rate depth results arrive at.
+//!
+//! **The warm-up runs one slot per submission.** It used to encode every slot
+//! into one command buffer; at 434 pixels and `--latency 13` that was 14 runs
+//! of the model, about two seconds of GPU work in one submission, and the
+//! device was lost before the first frame: every timing of that run failed,
+//! and the second run panicked creating a buffer on the lost device. Those
+//! runs, and the `--latency 14` runs made in the same session, are not in
+//! the tables below.
+//!
+//! ## What a size costs
+//!
+//! GPU time of the whole model, fused, real weights, per run: by `beatlm`'s
+//! test `the_whole_model_runs_on_the_gpu_at_every_timed_side`, five runs back
+//! to back after one untimed run, each the sum of its 155 kernels' timestamp
+//! pairs; and `calibrated_job_us`, the sum of the kernels' medians that
+//! calibration measured paced behind the render pass, from the two runs of
+//! each sweep cell below. The memory plan is the model's with one slot, from
+//! the test. Apple M1 Pro, Metal, wgpu 30.0.1, release build, on 2026-10-22.
+//!
+//! | side (pixels) | patch grid | tokens | GPU time per run, 5 runs (ms) | `calibrated_job_us` (ms) | memory plan, 1 slot (bytes) |
+//! |---|---|---|---|---|---|
+//! | 518 | 37 | 1370 | 202.3 to 202.7 | 203.2 to 203.8 | 207 959 172 |
+//! | 434 | 31 | 962 | 137.8 to 138.7 | 138.7 to 138.9 | 156 838 788 |
+//! | 350 | 25 | 626 | 85.6 to 86.0 | 86.3 to 86.7 | 131 021 828 |
+//! | 266 | 19 | 362 | 53.2 to 53.6 | 54.0 to 54.1 | 116 541 700 |
+//! | 182 | 13 | 170 | 35.0 to 35.3 | 35.8 to 35.9 | 106 010 884 |
+//!
+//! The budget a frame gives the model is the period less the render estimate
+//! (about 2 ms) and the 2 ms margin, about 12.6 ms, and the slices that fit it
+//! are estimated at their 0.9 quantile: in the runs below a job used 3 frames
+//! at 182 pixels, 5 at 266, 8 to 9 at 350, 13 to 14 at 434 and about 20 at
+//! 518, which is what `submitted` counts with `--submit free`. A job submitted
+//! at frame `f` with latency `k` has frames `f` to `f + k` (the deadline
+//! frame's slices run before its render pass), `k + 1` frames, so `k` at
+//! least one less than the frames a job uses can deliver every result.
+//!
+//! ## The sweep
+//!
+//! Configuration of every run: `--workload depth --frames 600 --runs 2`, the
+//! size and `--latency` in the table, `--submit free`, `sync` mode, the
+//! quantile estimator, fusion on, `--max-dispatch-us 1000`, margin 2 ms,
+//! release build, Apple M1 Pro, Metal, wgpu 30.0.1, 2026-10-22. Latency is
+//! `k` times the 16.667 ms period (`promised_latency_ms`). Times in
+//! microseconds; each run is one row, and only the lost-device runs named
+//! above were left out. Every run had `latency_violations` 0, every delivery
+//! at exactly `k` frames, and every `loop_*` counter's delta 0: buffers stayed
+//! at 10 to 12 at every frame boundary, and bind groups and compute pipelines
+//! did not change.
+//!
+//! | size, `k` (latency ms), run | `submitted` | delivered / missed | `delivery_rate` | `gpu_frame_us` p50 / p99 / max | `gpu_frames_over_period` | `longest_dispatch_us` p50 / p99 / max | `dispatches_per_job` | `startup_missed` | `frames_dropped` | `memory_plan_total_bytes` (slots) |
+//! |---|---|---|---|---|---|---|---|---|---|---|
+//! | 182, 2 (33.3), 1 | 200 | 200 / 0 | 1.0000 | 13533 / 14436 / 15245 | 0 of 600 | 1010 / 1515 / 1623 | 156 | 0 | 0 | 107 071 236 (3) |
+//! | 182, 2 (33.3), 2 | 200 | 200 / 0 | 1.0000 | 13540 / 14789 / 15302 | 0 of 600 | 1010 / 1534 / 1759 | 156 | 0 | 0 | 107 071 236 (3) |
+//! | 182, 3 (50.0), 1 | 200 | 198 / 1 | 0.9950 | 13651 / 14635 / 15021 | 0 of 599 | 1013 / 1539 / 1794 | 156 | 0 | 1 | 107 601 412 (4) |
+//! | 182, 3 (50.0), 2 | 200 | 199 / 0 | 1.0000 | 13560 / 14898 / 15511 | 0 of 599 | 1012 / 1535 / 1753 | 156 | 0 | 0 | 107 601 412 (4) |
+//! | 266, 4 (66.7), 1 | 120 | 120 / 0 | 1.0000 | 13160 / 14799 / 15285 | 0 of 599 | 901 / 1870 / 1995 | 160 | 0 | 0 | 121 070 852 (5) |
+//! | 266, 4 (66.7), 2 | 120 | 118 / 2 | 0.9833 | 13134 / 14979 / 15472 | 0 of 597 | 911 / 1733 / 1866 | 160 | 0 | 2 | 121 070 852 (5) |
+//! | 266, 5 (83.3), 1 | 120 | 118 / 1 | 0.9916 | 13210 / 14615 / 16272 | 0 of 592 | 892 / 1818 / 1971 | 160 | 0 | 5 | 122 203 140 (6) |
+//! | 266, 5 (83.3), 2 | 120 | 119 / 0 | 1.0000 | 13151 / 14834 / 15082 | 0 of 599 | 896 / 1885 / 1953 | 160 | 0 | 0 | 122 203 140 (6) |
+//! | 350, 7 (116.7), 1 | 75 | 48 / 27 | 0.6400 | 13422 / 14889 / 20267 | 1 of 592 | 1175 / 1745 / 2039 | 191 | 0 | 6 | 144 744 964 (8) |
+//! | 350, 7 (116.7), 2 | 75 | 47 / 28 | 0.6267 | 13439 / 14950 / 16129 | 0 of 599 | 1178 / 1767 / 2077 | 191 | 3 | 1 | 144 744 964 (8) |
+//! | 350, 8 (133.3), 1 | 68 | 66 / 1 | 0.9851 | 13234 / 14929 / 18147 | 1 of 594 | 1176 / 1730 / 1914 | 191 | 0 | 3 | 146 705 412 (9) |
+//! | 350, 8 (133.3), 2 | 67 | 61 / 5 | 0.9242 | 12748 / 14512 / 20345 | 1 of 593 | 1101 / 1773 / 1922 | 192 | 2 | 5 | 146 705 412 (9) |
+//! | 434, 13 (216.7), 1 | 45 | 41 / 3 | 0.9318 | 12872 / 14393 / 15269 | 0 of 596 | 1228 / 1811 / 2178 | 232 | 1 | 4 | 196 022 788 (14) |
+//! | 434, 13 (216.7), 2 | 43 | 6 / 36 | 0.1429 | 12321 / 15590 / 18799 | 1 of 600 | 1395 / 2172 / 2765 | 232 | 2 | 0 | 196 022 788 (14) |
+//! | 434, 15 (250.0), 1 | 45 | 44 / 0 | 1.0000 | 12918 / 15156 / 15794 | 0 of 600 | 1304 / 1916 / 2162 | 232 | 0 | 0 | 202 051 076 (16) |
+//! | 434, 15 (250.0), 2 | 47 | 45 / 0 | 1.0000 | 13214 / 15001 / 15757 | 0 of 598 | 1272 / 1842 / 2161 | 232 | 0 | 0 | 202 051 076 (16) |
+//! | 518, 20 (333.3), 1 | 30 | 27 / 2 | 0.9310 | 12859 / 15269 / 17059 | 1 of 600 | 1410 / 1922 / 2076 | 292 | 0 | 0 | 293 826 820 (21) |
+//! | 518, 20 (333.3), 2 | 30 | 28 / 1 | 0.9655 | 13105 / 14474 / 15182 | 0 of 600 | 1379 / 1893 / 1951 | 292 | 0 | 0 | 293 826 820 (21) |
+//!
+//! What the numbers say, and what they do not:
+//!
+//! - **The issue's criterion held in every run.** GPU time per frame, render
+//!   and slices, was within the 16 667 us period at p99 (14 393 to 15 590),
+//!   and no delivery was at the wrong latency. It held at sizes and latencies
+//!   that missed most deadlines (350 at `k` 7, 434 at 13 in run 2): the
+//!   budget bounds each frame whatever the latency, so the criterion does not
+//!   choose `k` alone; the delivery rate does.
+//! - **Frames over the period happen, rarely.** Five of the 18 runs had one
+//!   frame over the period, at 17 059 to 20 345 us, none at 182 or 266
+//!   pixels. Which slices ran long in those frames was not recorded.
+//! - **Delivery stops collapsing at `k` one less than the frames a job
+//!   uses**: 2 at 182 pixels, 4 at 266, 8 at 350 (0.9851 and 0.9242, its
+//!   misses in runs that dropped frames), 15 at 434 (13 was not enough, and 14
+//!   was not measured), and more than 20 at 518, where `k` 20 missed 2 and 1
+//!   deadlines without dropping a frame. Near that edge a run can fall far:
+//!   434 at `k` 13 delivered 0.93 in one run and 0.14 in the other, which
+//!   dropped no frame and whose dispatches ran longer (longest p99 2172
+//!   against 1811). With `--submit free` each job starts fresh once the one
+//!   before has left, so those are jobs that each ran out of frames, not one
+//!   job's lateness carried into the next.
+//! - **Away from that edge, every miss was in a run that dropped frames.** At
+//!   182, 266 and 350 pixels, leaving out 350 at `k` 7, every run with a miss
+//!   had `frames_dropped` above zero, and every run without a dropped frame
+//!   missed nothing. That is consistent with a dropped period being a
+//!   deadline frame, which the scheduler then cannot keep; that the dropped
+//!   frame was the deadline frame was not recorded. The drops came with CPU
+//!   encode spikes (`cpu_encode_us` max up to 83 ms), not with GPU overruns.
+//! - **The longest dispatch grows with the size**, from 0.9 to 1.0 ms at the
+//!   median at 182 and 266 pixels to 1.4 ms at 518, over the 1000 us bound at
+//!   the median as in "Splitting": the bound is a planning target.
+//! - **Memory** is the model's plan plus one input and one output per slot:
+//!   from 107 MB at 182 pixels with 3 slots to 294 MB at 518 with 21.
+//!
+//! ## The decision
+//!
+//! **266 pixels at `k` 5 is the default for this adapter**: `--size 266
+//! --latency 5`, a latency of 83.3 ms, a result every 5 frames (12 a second),
+//! from a 19 x 19 patch grid. Both its runs met the criterion (p99 14 615 and
+//! 14 834 us, nothing over the period) and delivered 0.9916 and 1.0, the one
+//! miss in a run that dropped five frames. `k` 4 met the criterion too and
+//! delivered 1.0 and 0.9833, but at `k` 4 a job uses all five of the frames
+//! it is given, a margin like the one at which 434 pixels at `k` 13 fell to
+//! 0.14 in one run of two: the frame `k` 5 adds is slack against a GPU
+//! running slower than calibration measured, bought for 16.7 ms of latency.
+//!
+//! The trade-off, latency against resolution, from the table:
+//!
+//! | size | patch grid | `k` | latency (ms) | results per second | delivered in its runs |
+//! |---|---|---|---|---|---|
+//! | 182 | 13 x 13 | 2 | 33.3 | 20 | 1.0, 1.0 |
+//! | 266 | 19 x 19 | 5 (default) | 83.3 | 12 | 0.9916, 1.0 |
+//! | 350 | 25 x 25 | 8 | 133.3 | 6.7 | 0.9851, 0.9242 |
+//! | 434 | 31 x 31 | 15 | 250.0 | 4.5 | 1.0, 1.0 |
+//! | 518 | 37 x 37 | more than 20 | more than 333 | about 3 | 0.9310, 0.9655 at 20 |
+//!
+//! Why not the others: 182 pixels has the lowest latency and delivered every
+//! result, and is the choice where latency matters most, but its depth comes
+//! from 169 patches, under half of 266's 361. 350 pixels and up cost 133 ms of
+//! latency or more for under 7 results a second, and 350 at `k` 8 still
+//! missed 5 deadlines in one run; 518, the size the position embedding is
+//! stored for, needs more than a third of a second. On another adapter the
+//! costs above move, and the sweep is the thing to repeat. Where to start:
+//! the frames a job uses are its `calibrated_job_us` over what a frame's
+//! budget held of it, 10 to 12 ms here, rounded up; `k` one less than that is
+//! the edge, and one more frame is the slack the default keeps.
+//!
 //! # Running it
 //!
 //! ```text
@@ -301,13 +477,21 @@
 //! cargo run --release -p beatlm-bench -- --workload net --frames 600 --runs 2 --split off
 //! cargo run --release -p beatlm-bench -- --workload net --frames 300 --runs 2 --max-dispatch-us 500
 //! cargo run --release -p beatlm-bench -- --workload net --frames 1 --dump-wgsl target/wgsl
+//! cargo run --release -p beatlm-bench -- --workload depth --frames 600 --runs 2
+//! cargo run --release -p beatlm-bench -- --workload depth --size 182 --latency 2 --frames 600 --runs 2
 //! ```
+//!
+//! The `depth` workload reads the weights `just setup-depth-anything` fetches;
+//! from a worktree, set `BEATLM_MODELS_DIR` to the main checkout's `models/`.
 //!
 //! Options are listed by `--help`. It needs an adapter with
 //! `Features::TIMESTAMP_QUERY` and is not part of `just check`; an adapter is
 //! not guaranteed where `check` runs. A run takes about `frames / 60` seconds;
 //! with splitting on, calibration first runs two passes of `2 * COST_WINDOW`
-//! paced frames, each plus one untimed frame.
+//! paced frames, each plus one untimed frame. A calibration frame waits for a
+//! whole job, so for the depth model a pass takes about 65 times its GPU time
+//! per run: about 13 seconds at 518 pixels from the 202 ms per run measured
+//! on an Apple M1 Pro, Metal ("What a size costs" above).
 //! `--runs N` repeats the whole run `N` times in one process on one device, each
 //! with a fresh scheduler, cost model, timer and workload, and prints one report
 //! per run, so the variance between runs is visible without restarting.
@@ -321,9 +505,11 @@
 //! |---|---|
 //! | `run` | which run of `--runs` this is |
 //! | `adapter`, `backend` | what the numbers were measured on; quote them with any number |
-//! | `config` | the options the run used, `mode`, `estimator` and `background_load` included (and `background_iters` when the load is on) |
+//! | `config` | the options the run used, `mode`, `estimator`, `submit` and `background_load` included (and `background_iters` when the load is on) |
+//! | `promised_latency_ms` | `--latency` times the frame period: what the host delays its source by |
 //! | `frames` | frames run |
 //! | `frames_dropped` | frame periods given up because a frame began a whole period late; the loop drops them as a display would, rather than running frames back to back to catch up |
+//! | `submitted` | inputs run as jobs: one per frame with `--submit every`, fewer with `--submit free` |
 //! | `delivered`, `missed` | results delivered on their frame, and deadlines that arrived without a complete result |
 //! | `delivery_rate` | `delivered` over `delivered` plus `missed`: the share of deadlines that arrived with their result; `none` when no deadline arrived |
 //! | `startup_missed` | the part of `missed` that belongs to jobs submitted in the loop's first `2 * COST_WINDOW` frames, so a cascade of misses while estimates are new shows apart from misses in steady state |
@@ -345,12 +531,13 @@
 //! | `gpu_frames_over_period` | timed frames whose render plus slices took longer than the frame period, of the timed frames: a real overrun that the estimates were supposed to prevent |
 //! | `background_dispatches` | dispatches the competing load submitted, from the one completed before the first frame to the last one queued when it was stopped; present only with `--background-load` |
 //! | `slice[i]` | the cost model's final estimate for slice `i` against the mean of its measured durations |
-//! | `workload`, `fusion`, `split` (in `config`) | present only for the network, as `workload=net fusion=on` or `fusion=off`, then `split=on max_dispatch_us=N` or `split=off`; the synthetic report has none. `slices` there is the kernel count before splitting |
-//! | `kernel_parts[i]` | `net` only: kernel `i` of the unsplit network, its parts, and the median calibration measured for it run whole (`calibrated_us`, `none` with splitting off) |
-//! | `kernels` | `net` only: each kernel of a job, in dispatch order, named by its main operation and epilogue, a part as `name[i/n]`; one slice each |
-//! | `memory_plan_*` | `net` only: tensors, input/output slots, arenas and their bytes, the plan's total, the most bytes live at one kernel, and the bytes with no sharing |
-//! | `wgpu_counters_populated` | `net` only: whether the backend sets wgpu's buffer counter; when false the loop's buffer creation is unmeasured and the report says so |
-//! | `loop_*` | `net` only: a counter's reading before the first frame and after the last, and the change; for buffers also the least and most seen at a frame boundary |
+//! | `workload`, `size`, `fusion`, `split` (in `config`) | present only for a planned program, as `workload=net` or `workload=depth size=N`, then `fusion=on` or `fusion=off`, then `split=on max_dispatch_us=N` or `split=off`; the synthetic report has none. `slices` there is the kernel count before splitting |
+//! | `kernel_parts[i]` | `net` and `depth` only: kernel `i` of the unsplit program, its parts, and the median calibration measured for it run whole (`calibrated_us`, `none` with splitting off) |
+//! | `calibrated_job_us` | `net` and `depth` only: the sum of the `calibrated_us` medians, what one job took paced behind the render pass before it was split; `none` with splitting off |
+//! | `kernels` | `net` and `depth` only: each kernel of a job, in dispatch order, named by its main operation and epilogue, a part as `name[i/n]`; one slice each |
+//! | `memory_plan_*` | `net` and `depth` only: tensors, input/output slots, arenas and their bytes, the plan's total, the most bytes live at one kernel, and the bytes with no sharing |
+//! | `wgpu_counters_populated` | `net` and `depth` only: whether the backend sets wgpu's buffer counter; when false the loop's buffer creation is unmeasured and the report says so |
+//! | `loop_*` | `net` and `depth` only: a counter's reading before the first frame and after the last, and the change; for buffers also the least and most seen at a frame boundary |
 //!
 //! The process exits non-zero when `latency_violations` is not zero in any run.
 //! A missed deadline is reported but does not fail the run: it is the documented
@@ -467,6 +654,7 @@
 mod args;
 mod calibrate;
 mod counters;
+mod depth;
 mod device;
 #[cfg(test)]
 mod dpt;
@@ -520,20 +708,28 @@ fn real_main() -> Result<ExitCode> {
     let gpu = device::Gpu::open()?;
     let workload = match args.workload {
         args::WorkloadKind::Synthetic => String::from("synthetic"),
-        args::WorkloadKind::Net => {
+        args::WorkloadKind::Net | args::WorkloadKind::Depth => {
             let split = args
                 .max_dispatch_us
                 .map_or_else(|| String::from("off"), |us| format!("at {us} us"));
+            let size = if args.workload == args::WorkloadKind::Depth {
+                format!(" at {} pixels", args.size)
+            } else {
+                String::new()
+            };
             format!(
-                "net with fusion {}, splitting {split}",
+                "{}{size} with fusion {}, splitting {split}",
+                args.workload.name(),
                 args::fusion_name(args.fusion)
             )
         }
     };
     eprintln!(
-        "running {} frames x {} runs, workload {workload}, mode {}, estimator {}, background load {}, on {} ({})",
+        "running {} frames x {} runs, workload {workload}, latency {}, submit {}, mode {}, estimator {}, background load {}, on {} ({})",
         args.frames,
         args.runs,
+        args.latency,
+        args.submit.name(),
         args.mode.name(),
         args.estimator.name(),
         if args.background_load { "on" } else { "off" },

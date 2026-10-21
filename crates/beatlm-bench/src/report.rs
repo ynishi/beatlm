@@ -36,7 +36,7 @@ fn write_report(
     writeln!(out, "backend: {}", env.backend)?;
     write!(
         out,
-        "config: mode={} runs={} frames={} latency={} slices={} slice_iters={} render_iters={} margin_us={} estimator={} background_load={}",
+        "config: mode={} runs={} frames={} latency={} slices={} slice_iters={} render_iters={} margin_us={} estimator={} submit={} background_load={}",
         args.mode.name(),
         args.runs,
         args.frames,
@@ -46,25 +46,35 @@ fn write_report(
         args.render_iters,
         args.margin_us,
         args.estimator.name(),
+        args.submit.name(),
         if args.background_load { "on" } else { "off" }
     )?;
     if args.background_load {
         write!(out, " background_iters={}", args.background_iters)?;
     }
-    // Only the network adds a workload key to the line; the synthetic workload
-    // is the one without it.
-    match args.workload {
-        WorkloadKind::Synthetic => writeln!(out)?,
-        WorkloadKind::Net => {
-            write!(out, " workload=net fusion={}", fusion_name(args.fusion))?;
-            match args.max_dispatch_us {
-                Some(us) => writeln!(out, " split=on max_dispatch_us={us}")?,
-                None => writeln!(out, " split=off")?,
-            }
+    // Only a planned program adds a workload key to the line; the synthetic
+    // workload is the one without it.
+    if args.workload.is_planned() {
+        write!(out, " workload={}", args.workload.name())?;
+        if args.workload == WorkloadKind::Depth {
+            write!(out, " size={}", args.size)?;
         }
+        write!(out, " fusion={}", fusion_name(args.fusion))?;
+        match args.max_dispatch_us {
+            Some(us) => writeln!(out, " split=on max_dispatch_us={us}")?,
+            None => writeln!(out, " split=off")?,
+        }
+    } else {
+        writeln!(out)?;
     }
+    writeln!(
+        out,
+        "promised_latency_ms: {:.1}",
+        promised_latency_ms(args.latency)
+    )?;
     writeln!(out, "frames: {}", outcome.cpu_us.len())?;
     writeln!(out, "frames_dropped: {}", outcome.dropped)?;
+    writeln!(out, "submitted: {}", outcome.submitted)?;
     writeln!(out, "delivered: {}", outcome.delivered)?;
     writeln!(out, "missed: {}", outcome.missed)?;
     writeln!(out, "startup_missed: {}", outcome.startup_missed)?;
@@ -128,6 +138,13 @@ fn delivery_rate(delivered: u64, missed: u64) -> Option<f64> {
     (total > 0).then(|| delivered as f64 / total as f64)
 }
 
+/// The promised latency of `frames` frames at the loop's period, in
+/// milliseconds: what the host delays its source by.
+#[allow(clippy::cast_precision_loss)]
+fn promised_latency_ms(frames: u32) -> f64 {
+    f64::from(frames) * FRAME_PERIOD.get() as f64 / 1_000.0
+}
+
 /// Timed frames whose render plus slices took longer than the frame period: an
 /// overrun the estimates were supposed to prevent.
 fn gpu_frames_over_period(gpu_frame_us: &[u64]) -> usize {
@@ -137,7 +154,8 @@ fn gpu_frames_over_period(gpu_frame_us: &[u64]) -> usize {
         .count()
 }
 
-/// The memory plan and the allocation readings of the `net` workload.
+/// The memory plan and the allocation readings of the `net` and `depth`
+/// workloads.
 fn write_net(out: &mut String, net: &NetReport) -> std::fmt::Result {
     for (index, kernel) in net.kernel_parts.iter().enumerate() {
         write!(
@@ -149,6 +167,15 @@ fn write_net(out: &mut String, net: &NetReport) -> std::fmt::Result {
             Some(us) => writeln!(out, " calibrated_us={}", us.get())?,
             None => writeln!(out, " calibrated_us=none")?,
         }
+    }
+    let calibrated: Option<u64> = net
+        .kernel_parts
+        .iter()
+        .map(|k| k.calibrated.map(|us| us.get()))
+        .sum();
+    match calibrated {
+        Some(us) => writeln!(out, "calibrated_job_us: {us}")?,
+        None => writeln!(out, "calibrated_job_us: none")?,
     }
     writeln!(out, "kernels: {}", net.kernels.join(" "))?;
     writeln!(out, "memory_plan_tensors: {}", net.tensors)?;
@@ -227,6 +254,12 @@ mod tests {
         assert_eq!(delivery_rate(3, 1), Some(0.75));
         assert_eq!(delivery_rate(0, 5), Some(0.0));
         assert_eq!(delivery_rate(5, 0), Some(1.0));
+    }
+
+    #[test]
+    fn the_promised_latency_is_the_frames_at_the_period() {
+        assert_eq!(promised_latency_ms(0), 0.0);
+        assert!((promised_latency_ms(5) - 83.335).abs() < 1e-9);
     }
 
     #[test]

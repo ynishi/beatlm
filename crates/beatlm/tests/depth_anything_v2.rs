@@ -13,6 +13,12 @@
 //! the recipes write them. A second worktree has no `models/` of its own, so a
 //! run there points the variable at the main checkout's:
 //! `BEATLM_MODELS_DIR=<main checkout>/models cargo test ...`.
+//!
+//! The reference is made at one input side per run of the recipe:
+//! `just reference-depth-anything` at [`NATIVE`], the side the position
+//! embedding is stored for, into `reference/`, and
+//! `just reference-depth-anything <side>` at any other multiple of 14 into
+//! `reference/<side>/`. The comparison at [`OTHER`] needs the second.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::BTreeMap;
@@ -32,9 +38,25 @@ use beatlm::model::depth_anything_v2::{encoder, model};
 /// The parameter count the model is published with.
 const PUBLISHED_PARAMETERS: u64 = 24_785_089;
 
-/// Side of the reference input, in pixels: the size the position embeddings
-/// are stored for.
-const SIDE: usize = 518;
+/// Side of the reference input, in pixels, that the position embeddings are
+/// stored for; the graph uses them as stored.
+const NATIVE: usize = 518;
+
+/// The other side the port is compared at, where the graph resamples the
+/// position embedding: the input side `beatlm-bench` recommends for an Apple
+/// M1 Pro (its crate documentation, "The depth workload", has the
+/// measurements).
+const OTHER: usize = 266;
+
+/// The sides the GPU timing test runs the whole model at, multiples of 14
+/// from the stored side down.
+const TIMED_SIDES: [usize; 5] = [518, 434, 350, 266, 182];
+
+/// The model's patch side, in pixels.
+const PATCH: usize = 14;
+
+/// The channels of a feature.
+const HIDDEN: usize = 384;
 
 /// The channel means and standard deviations of the checkpoint's image
 /// processor (`preprocessor_config.json`), used to put the reference input in
@@ -53,6 +75,26 @@ fn model_dir() -> PathBuf {
         .join("depth-anything-v2-small")
 }
 
+/// Where the reference at `side` is: `reference/` at the stored side,
+/// `reference/<side>/` at any other.
+fn reference_dir(side: usize) -> PathBuf {
+    let dir = model_dir().join("reference");
+    if side == NATIVE {
+        dir
+    } else {
+        dir.join(side.to_string())
+    }
+}
+
+/// The recipe that writes the reference at `side`.
+fn reference_recipe(side: usize) -> String {
+    if side == NATIVE {
+        "reference-depth-anything".to_owned()
+    } else {
+        format!("reference-depth-anything {side}")
+    }
+}
+
 /// Reads a file under `models/`, or fails naming the recipe that creates it.
 fn read_or_explain(path: &Path, recipe: &str) -> Vec<u8> {
     read_file(path).unwrap_or_else(|err| {
@@ -63,21 +105,23 @@ fn read_or_explain(path: &Path, recipe: &str) -> Vec<u8> {
     })
 }
 
-/// The 8-bit level of one pixel of the reference image, before normalisation.
+/// The 8-bit level of one pixel of the reference image of `side` pixels,
+/// before normalisation.
 ///
 /// Channel 0 is a horizontal ramp, channel 1 a vertical ramp, channel 2 a
-/// checkerboard of 37-pixel cells (14 of them across), so the image has
-/// structure at every scale of the patch grid. Integer arithmetic only: a
-/// level is the same in any language.
-fn level(channel: usize, y: usize, x: usize) -> u32 {
+/// checkerboard of 37-pixel cells (14 of them across at 518 pixels), so the
+/// image has structure at every scale of the patch grid. Integer arithmetic
+/// only: a level is the same in any language.
+fn level(side: usize, channel: usize, y: usize, x: usize) -> u32 {
     match channel {
-        0 => (x * 255 / (SIDE - 1)) as u32,
-        1 => (y * 255 / (SIDE - 1)) as u32,
+        0 => (x * 255 / (side - 1)) as u32,
+        1 => (y * 255 / (side - 1)) as u32,
         _ => (((x / 37 + y / 37) % 2) * 255) as u32,
     }
 }
 
-/// The reference input, channel-first (`[1, 3, 518, 518]`, row-major).
+/// The reference input of `side` pixels, channel-first (`[1, 3, side, side]`,
+/// row-major).
 ///
 /// Each value is `(level / 255 - mean) / std`, computed in single precision,
 /// one rounded operation after another in that order. Division, subtraction
@@ -85,12 +129,12 @@ fn level(channel: usize, y: usize, x: usize) -> u32 {
 /// so the same sequence gives the same bits in NumPy float32, which is what
 /// `scripts/reference/depth_anything_v2.py` does. No random numbers, no
 /// transcendental functions, no image file.
-fn reference_input() -> Vec<f32> {
-    let mut values = Vec::with_capacity(3 * SIDE * SIDE);
+fn reference_input(side: usize) -> Vec<f32> {
+    let mut values = Vec::with_capacity(3 * side * side);
     for channel in 0..3 {
-        for y in 0..SIDE {
-            for x in 0..SIDE {
-                let unit = level(channel, y, x) as f32 / 255.0f32;
+        for y in 0..side {
+            for x in 0..side {
+                let unit = level(side, channel, y, x) as f32 / 255.0f32;
                 values.push((unit - MEAN[channel]) / STD[channel]);
             }
         }
@@ -98,22 +142,42 @@ fn reference_input() -> Vec<f32> {
     values
 }
 
+/// A channel-first image of `side` pixels as the graph's NHWC image.
+fn to_nhwc(nchw: &[f32], side: usize) -> Vec<f32> {
+    assert_eq!(nchw.len(), 3 * side * side);
+    let mut image = vec![0.0; nchw.len()];
+    for c in 0..3 {
+        for p in 0..side * side {
+            image[p * 3 + c] = nchw[c * side * side + p];
+        }
+    }
+    image
+}
+
 #[test]
 fn the_reference_input_formula_is_pinned() {
-    assert_eq!(level(0, 5, 0), 0);
-    assert_eq!(level(0, 5, 36), 17);
-    assert_eq!(level(0, 5, 517), 255);
-    assert_eq!(level(1, 517, 5), 255);
-    assert_eq!(level(1, 36, 5), 17);
-    assert_eq!((level(2, 0, 36), level(2, 0, 37)), (0, 255));
-    assert_eq!((level(2, 37, 37), level(2, 37, 36)), (0, 255));
+    assert_eq!(level(NATIVE, 0, 5, 0), 0);
+    assert_eq!(level(NATIVE, 0, 5, 36), 17);
+    assert_eq!(level(NATIVE, 0, 5, 517), 255);
+    assert_eq!(level(NATIVE, 1, 517, 5), 255);
+    assert_eq!(level(NATIVE, 1, 36, 5), 17);
+    assert_eq!((level(NATIVE, 2, 0, 36), level(NATIVE, 2, 0, 37)), (0, 255));
+    assert_eq!(
+        (level(NATIVE, 2, 37, 37), level(NATIVE, 2, 37, 36)),
+        (0, 255)
+    );
+    // At another side the ramps span that side, and the cells stay 37 pixels.
+    assert_eq!(level(OTHER, 0, 5, OTHER - 1), 255);
+    assert_eq!(level(OTHER, 1, OTHER / 2, 5), 127);
+    assert_eq!((level(OTHER, 2, 0, 36), level(OTHER, 2, 0, 37)), (0, 255));
 
-    let input = reference_input();
-    assert_eq!(input.len(), 3 * SIDE * SIDE);
+    let input = reference_input(NATIVE);
+    assert_eq!(input.len(), 3 * NATIVE * NATIVE);
     assert_eq!(input[0], (0.0f32 - 0.485f32) / 0.229f32);
-    assert_eq!(input[SIDE - 1], (1.0f32 - 0.485f32) / 0.229f32);
-    let green_start = SIDE * SIDE;
+    assert_eq!(input[NATIVE - 1], (1.0f32 - 0.485f32) / 0.229f32);
+    let green_start = NATIVE * NATIVE;
     assert_eq!(input[green_start], (0.0f32 - 0.456f32) / 0.224f32);
+    assert_eq!(reference_input(OTHER).len(), 3 * OTHER * OTHER);
 }
 
 #[test]
@@ -133,14 +197,14 @@ fn the_inventory_matches_the_real_file_exactly() {
     assert_eq!(report.expected_parameters, PUBLISHED_PARAMETERS, "{report}");
 }
 
-#[test]
-#[ignore = "needs `just reference-depth-anything`"]
-fn the_rust_input_is_bit_identical_to_the_one_python_wrote() {
+/// Checks that the input the reference script wrote at `side` is the formula's,
+/// bit for bit.
+fn assert_input_matches_the_formula(side: usize) {
     let bytes = read_or_explain(
-        &model_dir().join("reference/input.f32"),
-        "reference-depth-anything",
+        &reference_dir(side).join("input.f32"),
+        &reference_recipe(side),
     );
-    let expected: Vec<u8> = reference_input()
+    let expected: Vec<u8> = reference_input(side)
         .iter()
         .flat_map(|v| v.to_le_bytes())
         .collect();
@@ -153,9 +217,11 @@ fn the_rust_input_is_bit_identical_to_the_one_python_wrote() {
     );
 }
 
-/// Side of the patch grid, and the channels of a feature.
-const GRID: usize = 37;
-const HIDDEN: usize = 384;
+#[test]
+#[ignore = "needs `just reference-depth-anything`"]
+fn the_rust_input_is_bit_identical_to_the_one_python_wrote() {
+    assert_input_matches_the_formula(NATIVE);
+}
 
 /// The tolerance of the comparison with the reference features: the largest
 /// absolute difference of any element. The reference ran in PyTorch on the
@@ -163,11 +229,14 @@ const HIDDEN: usize = 384;
 /// the inverse square root its own way, and the differences grow through
 /// twelve residual layers.
 ///
-/// Set against what the test measured on an Apple M1 Pro, Metal, on
-/// 2026-10-21, in two runs: a largest difference of 5.9e-4 and 6.3e-4 (stage
-/// 6; the reference's largest magnitude there is 73) and a mean of at most
-/// 1.2e-5, over stages 3, 6, 9 and 12. The GPU's result is not bit-identical
-/// from run to run. The test prints the figures of every run.
+/// Set against what the test measured at 518 pixels on an Apple M1 Pro,
+/// Metal, on 2026-10-21, in two runs: a largest difference of 5.9e-4 and
+/// 6.3e-4 (stage 6; the reference's largest magnitude there is 73) and a mean
+/// of at most 1.2e-5, over stages 3, 6, 9 and 12. The GPU's result is not
+/// bit-identical from run to run. The test prints the figures of every run.
+/// The comparison at [`OTHER`] applies the same tolerances; it adds the
+/// host's resampling of the position embedding, which rounds differently from
+/// PyTorch's by single-precision rounding only.
 const FEATURE_MAX_ERROR: f32 = 2e-3;
 
 /// The tolerance on the mean absolute difference over a feature; see
@@ -182,8 +251,8 @@ fn floats(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// The checked weights file, its inventory, and the reference input as the
-/// graph's NHWC image. The input is stored NCHW.
+/// The checked weights file, its inventory, and an input as the graph's NHWC
+/// image.
 struct Files {
     weights: Vec<u8>,
     inventory: Inventory<Role>,
@@ -191,23 +260,30 @@ struct Files {
 }
 
 impl Files {
-    fn read(config: &Config) -> Self {
-        let dir = model_dir();
-        let weights = read_or_explain(&dir.join("model.safetensors"), "setup-depth-anything");
+    /// The weights, and the input the reference script wrote at `side`, which
+    /// is stored NCHW.
+    fn read(config: &Config, side: usize) -> Self {
+        let nchw = floats(&read_or_explain(
+            &reference_dir(side).join("input.f32"),
+            &reference_recipe(side),
+        ));
+        Self::with_image(config, to_nhwc(&nchw, side))
+    }
+
+    /// The weights, and the reference input's formula at `side`: for a run
+    /// that needs no reference.
+    fn formula(config: &Config, side: usize) -> Self {
+        Self::with_image(config, to_nhwc(&reference_input(side), side))
+    }
+
+    fn with_image(config: &Config, image: Vec<f32>) -> Self {
+        let weights = read_or_explain(
+            &model_dir().join("model.safetensors"),
+            "setup-depth-anything",
+        );
         let inventory = inventory(config).expect("the small configuration is valid");
         let report = inventory.check(&Archive::parse(&weights).expect("a safetensors file"));
         assert!(report.is_exact(), "{report}");
-        let nchw = floats(&read_or_explain(
-            &dir.join("reference/input.f32"),
-            "reference-depth-anything",
-        ));
-        assert_eq!(nchw.len(), 3 * SIDE * SIDE);
-        let mut image = vec![0.0; nchw.len()];
-        for c in 0..3 {
-            for p in 0..SIDE * SIDE {
-                image[p * 3 + c] = nchw[c * SIDE * SIDE + p];
-            }
-        }
         Self {
             weights,
             inventory,
@@ -216,7 +292,7 @@ impl Files {
     }
 
     /// Every weight of a builder's graph with its numbers, and `image` with
-    /// the reference input.
+    /// the input.
     fn uploads(&self, b: Builder<Role>, image: TensorId) -> (Graph, Vec<(TensorId, Vec<f32>)>) {
         let archive = Archive::parse(&self.weights).expect("a safetensors file");
         let (graph, weights) = b.finish();
@@ -415,46 +491,44 @@ impl<'g> Loaded<'g> {
     }
 }
 
-/// The encoder of Depth Anything V2 Small, built from the real weights by
-/// `beatlm::model`, run on the GPU on the reference input, against the four
-/// features the original implementation computed.
+/// The encoder of Depth Anything V2 Small at `side` pixels, built from the
+/// real weights by `beatlm::model`, run on the GPU on the reference input of
+/// that side, against the four features the original implementation computed
+/// at that side; panics naming the stages beyond the tolerances.
 ///
-/// The reference features are `[1][1369][384]`: the patch tokens of one image
-/// in row-major patch order, which is the `[37][37][384]` NHWC map the graph
+/// The reference features are `[1][G * G][384]`: the patch tokens of one image
+/// in row-major patch order, which is the `[G][G][384]` NHWC map the graph
 /// writes, so the comparison is element by element. The input is stored NCHW
 /// and is transposed to NHWC for the graph.
 ///
 /// With timestamp queries on the device, the GPU time of each kernel is
 /// measured over a few runs after the one that is compared, and the sum per run
 /// is printed with the adapter and backend.
-#[test]
-#[ignore = "needs `just setup-depth-anything` and `just reference-depth-anything`"]
-fn the_encoder_on_the_gpu_matches_the_reference_features() {
-    let dir = model_dir();
+fn encoder_matches_the_reference_features(side: usize) {
+    let dir = reference_dir(side);
+    let recipe = reference_recipe(side);
+    let grid = side / PATCH;
     let config = Config::small();
-    let files = Files::read(&config);
+    let files = Files::read(&config, side);
     let mut builder = Builder::new();
-    let enc = encoder(&mut builder, &config, TensorRole::Output).expect("the encoder builds");
+    let enc = encoder(&mut builder, &config, side, TensorRole::Output).expect("the encoder builds");
     let (graph, uploads) = files.uploads(builder, enc.image);
 
     let gpu = Gpu::new();
     let loaded = Loaded::new(&gpu, &graph, Fusion::On, &uploads);
     loaded.run(None, 0);
-    println!("{}", loaded.describe());
+    println!("{side} pixels: {}", loaded.describe());
 
-    // The reference recorded `reference/encoder_stage_{n}.f32` for each layer
-    // `n` of the checkpoint's `out_indices`, which are the encoder's features.
+    // The reference recorded `encoder_stage_{n}.f32` for each layer `n` of the
+    // checkpoint's `out_indices`, which are the encoder's features.
     assert_eq!(enc.features.len(), config.out_indices.len());
     let mut failures = Vec::new();
     for (&stage, &feature) in config.out_indices.iter().zip(&enc.features) {
         let got = loaded.read(feature);
-        assert_eq!(got.len(), GRID * GRID * HIDDEN);
-        let name = format!("reference/encoder_stage_{stage}.f32");
-        let want = floats(&read_or_explain(
-            &dir.join(&name),
-            "reference-depth-anything",
-        ));
-        assert_eq!(want.len(), GRID * GRID * HIDDEN, "{name}");
+        assert_eq!(got.len(), grid * grid * HIDDEN);
+        let name = format!("encoder_stage_{stage}.f32");
+        let want = floats(&read_or_explain(&dir.join(&name), &recipe));
+        assert_eq!(want.len(), grid * grid * HIDDEN, "{name}");
         let diffs: Vec<f64> = got
             .iter()
             .zip(&want)
@@ -464,7 +538,7 @@ fn the_encoder_on_the_gpu_matches_the_reference_features() {
         let mean = diffs.iter().sum::<f64>() / diffs.len() as f64;
         let scale = want.iter().map(|w| f64::from(w.abs())).fold(0.0, f64::max);
         println!(
-            "stage {stage:2}: max abs error {max:.3e}, mean abs error {mean:.3e} \
+            "{side} pixels, stage {stage:2}: max abs error {max:.3e}, mean abs error {mean:.3e} \
              (largest reference magnitude {scale:.3})"
         );
         if !(max <= f64::from(FEATURE_MAX_ERROR) && mean <= f64::from(FEATURE_MEAN_ERROR)) {
@@ -474,8 +548,8 @@ fn the_encoder_on_the_gpu_matches_the_reference_features() {
 
     if let Some((totals, medians)) = loaded.timings() {
         println!(
-            "GPU time of the encoder, summed over its {} kernels' timestamp pairs, per run \
-             (sorted, microseconds): {totals:?}",
+            "{side} pixels: GPU time of the encoder, summed over its {} kernels' timestamp pairs, \
+             per run (sorted, microseconds): {totals:?}",
             loaded.kernels.len()
         );
         let mut by_name: BTreeMap<String, u64> = BTreeMap::new();
@@ -491,8 +565,15 @@ fn the_encoder_on_the_gpu_matches_the_reference_features() {
     }
     assert!(
         failures.is_empty(),
-        "stages {failures:?} exceed max {FEATURE_MAX_ERROR} or mean {FEATURE_MEAN_ERROR}"
+        "{side} pixels: stages {failures:?} exceed max {FEATURE_MAX_ERROR} or mean \
+         {FEATURE_MEAN_ERROR}"
     );
+}
+
+#[test]
+#[ignore = "needs `just setup-depth-anything` and `just reference-depth-anything`"]
+fn the_encoder_on_the_gpu_matches_the_reference_features() {
+    encoder_matches_the_reference_features(NATIVE);
 }
 
 /// The shape the reference's manifest records for tensor `name`.
@@ -520,13 +601,14 @@ fn manifest_shape(manifest: &str, name: &str) -> Vec<usize> {
 ///
 /// The depth inherits the encoder's differences from the reference (see
 /// [`FEATURE_MAX_ERROR`]) and adds the head's own, of convolutions summing in
-/// another order than PyTorch's. Set against what the test measured on an
-/// Apple M1 Pro, Metal, on 2026-10-21, in two invocations, identical in both:
-/// a largest difference of 5.96e-6 fused and 6.68e-6 unfused, a mean of
-/// 1.02e-6 and 1.01e-6, and a largest relative difference of 2.05e-6 and
-/// 2.12e-6, on a reference depth from 1.48 to 3.64. The tolerances leave room
-/// for an encoder at the edge of its own, three times what it measured, and
-/// as much again for the head on another adapter.
+/// another order than PyTorch's. Set against what the test measured at 518
+/// pixels on an Apple M1 Pro, Metal, on 2026-10-21, in two invocations,
+/// identical in both: a largest difference of 5.96e-6 fused and 6.68e-6
+/// unfused, a mean of 1.02e-6 and 1.01e-6, and a largest relative difference
+/// of 2.05e-6 and 2.12e-6, on a reference depth from 1.48 to 3.64. The
+/// tolerances leave room for an encoder at the edge of its own, three times
+/// what it measured, and as much again for the head on another adapter. The
+/// comparison at [`OTHER`] applies them unchanged.
 const DEPTH_MAX_ERROR: f32 = 5e-5;
 
 /// The tolerance on the mean absolute difference of the depth; see
@@ -582,35 +664,30 @@ impl DepthError {
     }
 }
 
-/// The whole of Depth Anything V2 Small, the encoder and the DPT head built
-/// from the real weights by `beatlm::model::depth_anything_v2::model`, run on
-/// the GPU on the reference input, fused and unfused, against the depth the
-/// original implementation predicted.
+/// The whole of Depth Anything V2 Small at `side` pixels, the encoder and the
+/// DPT head built from the real weights by
+/// `beatlm::model::depth_anything_v2::model`, run on the GPU on the reference
+/// input of that side, fused and unfused, against the depth the original
+/// implementation predicted at that side; panics naming the fusion settings
+/// beyond the tolerances.
 ///
-/// The reference depth is `[1][518][518]`, the shape the manifest records;
-/// the graph's is `[518][518][1]`, the same numbers in the same order.
+/// The reference depth is `[1][side][side]`, the shape the manifest records;
+/// the graph's is `[side][side][1]`, the same numbers in the same order.
 ///
 /// With timestamp queries on the device, it reports the GPU time of the whole
 /// model per run, by kind of kernel for the encoder and the decoder apart, and
 /// for the unfused program what the standalone ReLUs that the fused program
 /// takes as prologues took.
-#[test]
-#[ignore = "needs `just setup-depth-anything` and `just reference-depth-anything`"]
-fn the_whole_model_on_the_gpu_matches_the_reference_depth() {
-    let dir = model_dir();
+fn whole_model_matches_the_reference_depth(side: usize) {
+    let dir = reference_dir(side);
+    let recipe = reference_recipe(side);
     let config = Config::small();
-    let files = Files::read(&config);
-    let manifest = String::from_utf8(read_or_explain(
-        &dir.join("reference/manifest.json"),
-        "reference-depth-anything",
-    ))
-    .expect("the manifest is text");
+    let files = Files::read(&config, side);
+    let manifest = String::from_utf8(read_or_explain(&dir.join("manifest.json"), &recipe))
+        .expect("the manifest is text");
     let shape = manifest_shape(&manifest, "predicted_depth");
-    assert_eq!(shape, [1, SIDE, SIDE]);
-    let want = floats(&read_or_explain(
-        &dir.join("reference/predicted_depth.f32"),
-        "reference-depth-anything",
-    ));
+    assert_eq!(shape, [1, side, side]);
+    let want = floats(&read_or_explain(&dir.join("predicted_depth.f32"), &recipe));
     assert_eq!(want.len(), shape.iter().product::<usize>());
     let (low, high) = want
         .iter()
@@ -618,17 +695,17 @@ fn the_whole_model_on_the_gpu_matches_the_reference_depth() {
             (l.min(v), h.max(v))
         });
     let mean = want.iter().map(|&v| f64::from(v)).sum::<f64>() / want.len() as f64;
-    println!("reference depth: from {low:.4} to {high:.4}, mean {mean:.4}");
+    println!("{side} pixels: reference depth from {low:.4} to {high:.4}, mean {mean:.4}");
 
     // The encoder's operations come first in the model's graph, so a kernel
     // whose operations start past them is the decoder's.
     let encoder_ops = {
         let mut b = Builder::new();
-        encoder(&mut b, &config, TensorRole::Activation).expect("the encoder builds");
+        encoder(&mut b, &config, side, TensorRole::Activation).expect("the encoder builds");
         b.graph().ops().len()
     };
     let mut builder = Builder::new();
-    let m = model(&mut builder, &config).expect("the model builds");
+    let m = model(&mut builder, &config, side).expect("the model builds");
     let (graph, uploads) = files.uploads(builder, m.image);
 
     let gpu = Gpu::new();
@@ -640,11 +717,12 @@ fn the_whole_model_on_the_gpu_matches_the_reference_depth() {
     for fusion in [Fusion::On, Fusion::Off] {
         let loaded = Loaded::new(&gpu, &graph, fusion, &uploads);
         loaded.run(None, 0);
-        println!("{fusion:?}: {}", loaded.describe());
+        println!("{side} pixels, {fusion:?}: {}", loaded.describe());
         let error = DepthError::of(&loaded.read(m.depth), &want);
         println!(
-            "{fusion:?}: depth max abs error {:.3e}, mean abs error {:.3e}, max relative error \
-             {:.3e} (over pixels at least {RELATIVE_FLOOR} of the largest reference depth, {:.4})",
+            "{side} pixels, {fusion:?}: depth max abs error {:.3e}, mean abs error {:.3e}, max \
+             relative error {:.3e} (over pixels at least {RELATIVE_FLOOR} of the largest \
+             reference depth, {:.4})",
             error.max, error.mean, error.max_relative, error.scale
         );
         if !error.within_tolerance() {
@@ -663,8 +741,8 @@ fn the_whole_model_on_the_gpu_matches_the_reference_depth() {
             continue;
         };
         println!(
-            "{fusion:?}: GPU time of the model, summed over its {} kernels' timestamp pairs, per \
-             run (sorted, microseconds): {totals:?}",
+            "{side} pixels, {fusion:?}: GPU time of the model, summed over its {} kernels' \
+             timestamp pairs, per run (sorted, microseconds): {totals:?}",
             kernels.len()
         );
         // Kind of kernel, by encoder or decoder: count and summed medians.
@@ -698,7 +776,74 @@ fn the_whole_model_on_the_gpu_matches_the_reference_depth() {
     }
     assert!(
         failures.is_empty(),
-        "{failures:?} exceed max {DEPTH_MAX_ERROR}, mean {DEPTH_MEAN_ERROR} or relative \
-         {DEPTH_MAX_RELATIVE_ERROR}"
+        "{side} pixels: {failures:?} exceed max {DEPTH_MAX_ERROR}, mean {DEPTH_MEAN_ERROR} or \
+         relative {DEPTH_MAX_RELATIVE_ERROR}"
     );
+}
+
+#[test]
+#[ignore = "needs `just setup-depth-anything` and `just reference-depth-anything`"]
+fn the_whole_model_on_the_gpu_matches_the_reference_depth() {
+    whole_model_matches_the_reference_depth(NATIVE);
+}
+
+/// The model at [`OTHER`] pixels, where the graph resamples the position
+/// embedding on the host and every size of the decoder follows the smaller
+/// patch grid, against the reference made at that side: the input bit for
+/// bit, the four features and the depth, within the tolerances of the stored
+/// side.
+#[test]
+#[ignore = "needs `just setup-depth-anything` and `just reference-depth-anything 266`"]
+fn the_model_at_another_side_matches_the_reference_made_at_that_side() {
+    assert_input_matches_the_formula(OTHER);
+    encoder_matches_the_reference_features(OTHER);
+    whole_model_matches_the_reference_depth(OTHER);
+}
+
+/// The whole model, fused, from the real weights at each of [`TIMED_SIDES`],
+/// on the reference input's formula at that side: every side builds, plans on
+/// the baseline and runs, and gives a depth of `side * side` finite,
+/// non-negative numbers. With timestamp queries it prints the GPU time of five
+/// runs back to back after one untimed run, which is what a side costs per
+/// result before the frame loop spreads it; `beatlm-bench --workload depth`
+/// measures it paced. For the times, run it alone (name it after
+/// `--ignored`): run with this file's other GPU tests, which the test harness
+/// runs on other threads at the same time, it shares the GPU with them.
+#[test]
+#[ignore = "needs `just setup-depth-anything` and a GPU adapter"]
+fn the_whole_model_runs_on_the_gpu_at_every_timed_side() {
+    let config = Config::small();
+    let gpu = Gpu::new();
+    // The weights are read and checked once; only the image changes with the
+    // side.
+    let mut files = Files::formula(&config, TIMED_SIDES[0]);
+    for side in TIMED_SIDES {
+        files.image = to_nhwc(&reference_input(side), side);
+        let mut builder = Builder::new();
+        let m = model(&mut builder, &config, side).expect("the model builds");
+        let (graph, uploads) = files.uploads(builder, m.image);
+        let loaded = Loaded::new(&gpu, &graph, Fusion::On, &uploads);
+        loaded.run(None, 0);
+        let depth = loaded.read(m.depth);
+        assert_eq!(depth.len(), side * side, "{side} pixels");
+        assert!(
+            depth.iter().all(|v| v.is_finite() && *v >= 0.0),
+            "{side} pixels: a depth that is not a finite, non-negative number"
+        );
+        let (low, high) = depth
+            .iter()
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(l, h), &v| {
+                (l.min(v), h.max(v))
+            });
+        println!(
+            "{side} pixels: {}; depth from {low:.4} to {high:.4}",
+            loaded.describe()
+        );
+        if let Some((totals, _)) = loaded.timings() {
+            println!(
+                "{side} pixels: GPU time of the model per run, summed over its kernels' \
+                 timestamp pairs (sorted, microseconds): {totals:?}"
+            );
+        }
+    }
 }

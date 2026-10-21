@@ -1,6 +1,7 @@
-//! Calibration: what each kernel of the network takes run whole on this
-//! device, the parts that keep each dispatch within `--max-dispatch-us`, and
-//! what each part takes, all measured before the loop.
+//! Calibration: what each kernel of the network, or of the depth model, takes
+//! run whole on this device, the parts that keep each dispatch within
+//! `--max-dispatch-us`, and what each part takes, all measured before the loop.
+//! "The network" below is either; both are realised through `Net`.
 //!
 //! Two paced passes, each [`CALIBRATION_FRAMES`] timed frames after one untimed
 //! frame that pays for first use:
@@ -49,7 +50,7 @@ use beatlm_core::time::{FrameIndex, Micros};
 
 use crate::device::Gpu;
 use crate::engine::{COST_WINDOW, timer_capacity};
-use crate::net::{Net, Shape};
+use crate::net::{Net, Numbers};
 use crate::pace::Pacer;
 use crate::workload::Workload;
 
@@ -69,9 +70,10 @@ pub struct Settings {
     pub prior: Micros,
     /// The longest a dispatch should take.
     pub bound: Micros,
-    /// The run's promised latency in frames: `latency + 1` jobs can be in
-    /// flight, and the loop's timer must time the slices of all of them.
-    pub latency: u32,
+    /// How many jobs can have slices left at once in the loop, whose timer
+    /// must time the slices of all of them in one frame
+    /// (`engine::jobs_with_slices` says how many for each `--submit`).
+    pub jobs: u32,
 }
 
 /// What calibration measured, and what it decided.
@@ -98,9 +100,9 @@ pub fn median(samples: &mut [u64]) -> Option<Micros> {
     samples.get(samples.len() / 2).copied().map(Micros::new)
 }
 
-/// Measures each kernel of `whole`, the network at `shape` lowered and not
-/// split, splits it so each part is expected within `settings.bound`, and
-/// measures the parts.
+/// Measures each kernel of `whole`, the network or model lowered and not
+/// split, realised with `numbers`, splits it so each part is expected within
+/// `settings.bound`, and measures the parts.
 ///
 /// # Errors
 ///
@@ -111,25 +113,32 @@ pub fn median(samples: &mut [u64]) -> Option<Micros> {
 pub fn calibrate(
     gpu: &Gpu,
     workload: &Workload,
-    shape: &Shape,
+    numbers: &Numbers,
     whole: &Program,
     settings: &Settings,
 ) -> Result<Calibration> {
     // Refused before pass 1 when the unsplit job alone is more than the loop's
-    // timer can time: no bound fixes that, only a lower latency.
+    // timer can time: no bound fixes that, only fewer jobs with slices left.
     let kernels = u32::try_from(whole.kernels().len()).unwrap_or(u32::MAX);
-    if timer_capacity(kernels, settings.latency).is_none() {
+    if timer_capacity(kernels, settings.jobs).is_none() {
+        // With one job, `--submit free` is already in effect and no latency
+        // lowers the count; only a smaller program would fit.
+        let remedy = if settings.jobs > 1 {
+            "Lower --latency, or pass --submit free"
+        } else {
+            "No --latency or --submit setting makes it fit"
+        };
         bail!(
-            "{kernels} kernels with --latency {} are more than the GPU timer can time \
-             ({MAX_SLICES} slices per frame) before any split. Lower --latency",
-            settings.latency,
+            "{kernels} kernels for each of {} jobs with slices left are more than the GPU \
+             timer can time ({MAX_SLICES} slices per frame) before any split. {remedy}",
+            settings.jobs,
         );
     }
 
     // Pass 1: whole kernels, to decide.
     let mut samples: Vec<Vec<u64>> = vec![Vec::new(); whole.kernels().len()];
     {
-        let net = Net::new(&gpu.device, &gpu.queue, shape, 1, whole.clone())
+        let net = Net::new(&gpu.device, &gpu.queue, numbers, 1, whole.clone())
             .context("cannot build the network to calibrate")?;
         measure(gpu, workload, &net, |frame, slice, duration| {
             let list = usize::try_from(slice.get())
@@ -157,14 +166,13 @@ pub fn calibrate(
     // every job that can be in flight, and the unsplit job fit, so the split
     // made it too many.
     let slices = u32::try_from(program.kernels().len()).unwrap_or(u32::MAX);
-    if timer_capacity(slices, settings.latency).is_none() {
+    if timer_capacity(slices, settings.jobs).is_none() {
         bail!(
-            "--max-dispatch-us {} splits a job into {slices} slices; with --latency {} up to {} \
-             jobs are in flight and the timer can time {MAX_SLICES} slices per frame. \
+            "--max-dispatch-us {} splits a job into {slices} slices; up to {} jobs can have \
+             slices left at once and the timer can time {MAX_SLICES} slices per frame. \
              Raise --max-dispatch-us",
             settings.bound.get(),
-            settings.latency,
-            u64::from(settings.latency) + 1,
+            settings.jobs,
         );
     }
 
@@ -172,7 +180,7 @@ pub fn calibrate(
     let mut cost = CostModel::new(settings.prior, settings.estimator)
         .context("cannot build the cost model")?;
     {
-        let net = Net::new(&gpu.device, &gpu.queue, shape, 1, program.clone())
+        let net = Net::new(&gpu.device, &gpu.queue, numbers, 1, program.clone())
             .context("cannot build the split network to calibrate")?;
         // The same second half as pass 1: the first half is the GPU settling
         // into the paced load, and an estimator that keeps every sample would
