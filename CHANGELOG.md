@@ -28,6 +28,10 @@ and this project adheres to
 - `SyncPolicy::max_in_flight`: how many output slots a host keeps.
 - `beatlm-bench --workload net`: a small planned network with GPU-checked
   kernels and wgpu counters around the frame loop.
+- `beatlm-core::cost::Estimator`: mean plus sigmas, windowed quantile and
+  capped deviation.
+- `beatlm-bench --estimator`, `--background-load`, and the `delivery_rate`
+  and `gpu_frames_over_period` report lines.
 
 ### Changed
 
@@ -36,3 +40,5 @@ and this project adheres to
   measurement and recorded in the `beatlm` crate docs.
 - The scheduler runs jobs strictly in submission order; leftover budget is no
   longer given to a later job's slice, because jobs share one memory plan.
+- `CostModel::new` takes an `Estimator`; the default is the 0.9 quantile of
+  the last 32 measurements, chosen by measurement (breaking).
