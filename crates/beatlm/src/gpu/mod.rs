@@ -43,5 +43,6 @@ pub use arenas::{ArenaError, Arenas};
 pub use limits::{LimitsError, required_limits};
 pub use profile::profile;
 pub use timer::{
-    FrameTimestamps, FrameTiming, MAX_SLICES, RING_DEPTH, SliceTimer, TimerError, TimerStats,
+    FrameTimestamps, FrameTiming, MAX_SLICES, PassSpan, RING_DEPTH, SliceTimer, TimerError,
+    TimerStats,
 };

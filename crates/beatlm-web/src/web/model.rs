@@ -130,6 +130,9 @@ pub struct Calibration {
     /// The split program's parts measured into the cost model the loop
     /// starts from: slice `i` is part `i`.
     pub cost: CostModel,
+    /// The measurements the cost model was given, part by part, in
+    /// microseconds, for the report to compare the loop with.
+    pub parts_us: Vec<Vec<u64>>,
 }
 
 /// Measures each kernel of `whole` realised with `numbers`, splits it so each
@@ -144,6 +147,12 @@ pub struct Calibration {
 /// GPU runs one job at a time with the display's idle between them, as in the
 /// loop.
 ///
+/// The cost model the parts are measured into, which the loop then plans with,
+/// reads with `estimator`, the page's `estimator` parameter, as the bench's
+/// does with `--estimator`. The split is decided before it from the medians of
+/// the whole kernels ([`WholeRuns::durations`]), which no estimator touches, so
+/// the parts are the same whichever is chosen.
+///
 /// # Errors
 ///
 /// A device without timestamp queries, a network or timer that cannot be
@@ -154,6 +163,7 @@ pub async fn calibrate(
     workload: &Workload,
     whole: &Program,
     numbers: &Numbers,
+    estimator: Estimator,
 ) -> Result<Calibration> {
     ensure!(
         gpu.timestamp_query,
@@ -180,8 +190,8 @@ pub async fn calibrate(
         .split(&parts)
         .context("cannot split the depth model")?;
 
-    let mut cost =
-        CostModel::new(SLICE_PRIOR, Estimator::default()).context("cannot build the cost model")?;
+    let mut cost = CostModel::new(SLICE_PRIOR, estimator).context("cannot build the cost model")?;
+    let mut parts_us = vec![Vec::new(); program.kernels().len()];
     {
         let net = device::accepted(&gpu.device, "the split network to calibrate", || {
             Net::new(&gpu.device, &gpu.queue, numbers, 1, program.clone())
@@ -191,6 +201,12 @@ pub async fn calibrate(
             if depth::counted(frame) {
                 for &(slice, duration) in compute {
                     cost.record(slice, duration);
+                    let part = usize::try_from(slice.get())
+                        .ok()
+                        .and_then(|i| parts_us.get_mut(i));
+                    if let Some(part) = part {
+                        part.push(duration.get());
+                    }
                 }
             }
         })
@@ -207,6 +223,7 @@ pub async fn calibrate(
         runs_us: first.runs().to_vec(),
         program,
         cost,
+        parts_us,
     })
 }
 

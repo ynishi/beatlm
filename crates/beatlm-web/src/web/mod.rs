@@ -12,6 +12,7 @@ mod page;
 mod wait;
 
 use anyhow::{Context, Result};
+use beatlm_core::cost::Estimator;
 use beatlm_core::sync::SyncPolicy;
 use beatlm_core::time::Micros;
 use wasm_bindgen::prelude::wasm_bindgen;
@@ -64,7 +65,11 @@ fn describe(config: &Config) -> String {
         Latency::Frames(frames) => format!("latency={frames}"),
         Latency::Time(us) => format!("latency_ms={}", crate::report::milliseconds(us.get())),
     };
-    format!("{model} frames={} {latency}", config.frames)
+    format!(
+        "{model} frames={} {latency} estimator={}",
+        config.frames,
+        crate::config::estimator_name(config.estimator)
+    )
 }
 
 /// The page's query string, `?` included.
@@ -152,7 +157,7 @@ async fn setup(config: Config) -> Result<()> {
             let gpu = device::open(page::canvas()?, Need::Plan(plan)).await?;
             let workload = Workload::new(&gpu.device, DEFAULT_SLICE_ITERS, DEFAULT_RENDER_ITERS);
             warm_up(&gpu, &workload).await?;
-            let load = depth_load(&gpu, &workload, loaded, slots, url).await?;
+            let load = depth_load(&gpu, &workload, loaded, slots, url, config.estimator).await?;
             (gpu, workload, load)
         }
     };
@@ -180,6 +185,7 @@ async fn setup(config: Config) -> Result<()> {
         asked,
         period,
         load,
+        estimator: config.estimator,
     };
     let host = frame::Host::new(gpu, workload, run).context("cannot start the frame loop")?;
     frame::run(host, env, config)
@@ -217,6 +223,7 @@ async fn depth_load(
     mut loaded: model::Loaded,
     slots: u32,
     weights_url: String,
+    estimator: Estimator,
 ) -> Result<Load> {
     page::show(&format!(
         "status: calibrating {} kernels at {} pixels over {} frames, twice",
@@ -224,7 +231,8 @@ async fn depth_load(
         loaded.side,
         depth::CALIBRATION_FRAMES + 1
     ));
-    let calibration = model::calibrate(gpu, workload, &loaded.program, &loaded.numbers).await?;
+    let calibration =
+        model::calibrate(gpu, workload, &loaded.program, &loaded.numbers, estimator).await?;
     let net = device::accepted(&gpu.device, "the depth model's network", || {
         Net::new(
             &gpu.device,
@@ -259,6 +267,7 @@ async fn depth_load(
         slices: net.kernel_count(),
         calibrated: calibration.durations,
         runs_us: calibration.runs_us,
+        parts_us: calibration.parts_us,
         arenas: plan.arenas().to_vec(),
         total_bytes: plan.total_bytes(),
         peak_live_bytes: plan.peak_live_bytes(),

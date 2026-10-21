@@ -70,6 +70,94 @@
 //! `a_job_estimated_past_its_frames_runs_alone_and_its_estimates_come_down`
 //! shows the recovery on the scheduler alone. Why the slices measure slower
 //! in the loop stays open.
+//!
+//! # Where the slow measurements come from
+//!
+//! After #41, in the same configuration, the slices' 0.9-quantile estimates
+//! ran 2 to 4 times their means in the loop (issue #43), and a frame's first
+//! pass measured a longer tail (p99 4.5 ms against 2.9 ms for later passes)
+//! with means within 5 % of each other. Four explanations are open, and the
+//! `tail_*` lines, written for depth runs only, are there to tell them apart;
+//! none of them changes what is scheduled or estimated. [`tail`] computes
+//! them and defines their terms: an *outlier* is a measurement above
+//! [`tail::OUTLIER_FACTOR`] times its slice's median in the loop, and every
+//! per-slice figure is over the slices measured [`tail::MIN_SAMPLES`] times or
+//! more. The explanations:
+//!
+//! - **H1, the first pass waits.** A frame's first compute pass's begin and
+//!   end can enclose time it spent queued behind earlier GPU work, the
+//!   previous frame's render or the compositor's.
+//! - **H2, the clock.** The GPU runs slower in the loop, mostly idle, than in
+//!   calibration's back-to-back runs, and slower after idle frames than after
+//!   busy ones.
+//! - **H3, a tail of its own.** Slow measurements come wherever the pass is in
+//!   its frame, alone or together in frames where everything was slow.
+//! - **H4, quantised timestamps.** Chrome's timestamps came in steps of
+//!   65.5 µs, which is large against a slice of a few hundred.
+//!
+//! The lines, and what each tests:
+//!
+//! - `tail_timestamp_step_ns`: the largest step every timestamp of the run is
+//!   a whole number of, from the earliest ([`tail::step_ns`]), over how many.
+//!   65 536 is Chrome's quantisation; an exact clock shows a few nanoseconds.
+//!   H4.
+//! - `tail_quantization`: how many slices have their 90th percentile within
+//!   one step of their median, so that their whole spread up to it could be
+//!   the step's; the median over slices of one step over the 90th percentile,
+//!   the most the step can add to it; and of one step over the excess of the
+//!   final estimate above the mean, capped at 1, the share of that excess the
+//!   step can account for. A duration is a difference of two timestamps cut
+//!   to the step, so it is off by less than one step. H4.
+//! - `tail_slice_spread`: over the slices, the median and the 90th percentile
+//!   of each one's p90 / p50, and the median of its max / p50: how heavy the
+//!   tail is that a 0.9 quantile reads. H3.
+//! - `tail_loop_over_calibration`: over the slices, the median of the loop's
+//!   mean over calibration's mean of the same part (its second pass, the
+//!   measurements the loop's estimates started from), and the same for the
+//!   medians. A ratio of medians near 1 with a ratio of means above it puts
+//!   the difference in the tail; both above 1, the whole distribution moved.
+//!   H2 against H3.
+//! - `tail_outliers`: how many measurements were outliers, and how many of
+//!   them were their frame's first pass, beside how many of all measurements
+//!   were; first passes over-represented among the outliers favour H1.
+//! - `tail_outlier_frames`: frames with two or more measurements where half or
+//!   more were outliers, against how many there would be if each measurement
+//!   were an outlier on its own at the run's share ([`tail::binomial_at_least`]).
+//!   Many more than expected: slow frames, not slow passes. H3, and H2 when the
+//!   clock drops for a whole frame.
+//! - `tail_gap_before_first_us`: for each frame with slices whose previous
+//!   frame was timed, from the latest end of the previous frame's passes to
+//!   this frame's first compute pass's begin, with how many were negative.
+//!   Every timestamp comes from the timer's one query set, resolved by each
+//!   frame's own submission on the one queue; that two submissions' timestamps
+//!   share a clock is taken, not checked, and a negative gap is either a pass
+//!   that began before the previous frame's work ended or a clock that does
+//!   not compare across submissions. The compositor's work is in no query and
+//!   shows only as gap. H1.
+//! - `tail_gap_between_passes_us`: the same within a frame, before every pass
+//!   after the first, on timestamps one submission resolved. The baseline for
+//!   the line before it.
+//! - `tail_first_over_later`: each frame's first pass over the median of the
+//!   same slice's measurements as a later pass (median and 90th percentile),
+//!   beside the later passes over the same median (`later_p90`). H1: a first
+//!   pass that carries waiting measures above its slice's later passes.
+//! - `tail_first_over_later_by_gap[...]`: the same, by the gap before the
+//!   pass: `overlap` (negative), `near` (within [`tail::NEAR_GAP_NS`]),
+//!   `idle`, and `no_previous` (the previous frame was not timed). H1 predicts
+//!   long first passes when the pass began right behind other work, and none
+//!   after idle.
+//! - `tail_busy_previous` and `tail_by_busy_previous[...]`: measurements by how
+//!   busy the GPU was over the [`tail::BUSY_WINDOW`] frames before theirs, the
+//!   sum of those frames' pass times over their time at the display's period,
+//!   in buckets of [`tail::BUSY_BOUNDS`]: how many, how many outliers, and the
+//!   median of each over its slice's median. Slower after idle windows is H2;
+//!   the same everywhere is not.
+//!
+//! What is not measured: the GPU's clock itself, which no browser API reads,
+//! so H2 is tested only through what it would do to the times; and the
+//! compositor's GPU work, which is in no query.
+
+pub mod tail;
 
 use std::collections::BTreeMap;
 
@@ -176,6 +264,10 @@ pub struct Diagnosis {
     /// The sum of every slice's estimate when the loop began, and when it
     /// ended, in microseconds: the job as the projection saw it.
     pub job_estimate_us: (u64, u64),
+    /// Every timed frame's passes with their timestamps, for the `tail_*`
+    /// lines ([`tail`]); recorded for a depth run only, the one that writes
+    /// them.
+    pub frames: Vec<tail::TimedFrame>,
 }
 
 impl Diagnosis {

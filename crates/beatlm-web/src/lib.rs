@@ -41,8 +41,15 @@
 //! `latency` in frames or `latency_ms` in time, and `arena_bytes`, which plans
 //! one arena of that many bytes against the adapter's limits, creates the
 //! device with the limits it needs, and realises the arena on it before the
-//! run, to check the limit path in a browser. Anything else in the query is
-//! refused.
+//! run, to check the limit path in a browser. `estimator` chooses the
+//! statistic the cost model plans with, for either job: the bench's
+//! `--estimator` names `quantile`, `mean-sigmas` and `capped`, or `quantile:<q>`
+//! and `quantile:<q>:<window>` (window 32 by default), `mean-sigmas:<alpha>:<sigmas>`
+//! and `capped:<alpha>:<sigmas>:<cap>`; the default is the core's (`quantile`),
+//! and [`config`] has every form, the ranges and what
+//! the choice reaches, and the four estimators measured in a browser at
+//! 120 Hz ("Which estimator, measured in a browser"). Anything else in the
+//! query is refused.
 //!
 //! **Serving.** `just serve-web` runs `scripts/serve_web.py`, which serves the
 //! built page at `/` and the models directory at `/models/`
@@ -102,7 +109,9 @@
 //!    render pass, each kernel's median over the second half decides how it is
 //!    split for [`depth::MAX_DISPATCH_US`] (the core's
 //!    `Program::parts_within`), and the split program is run the same way into
-//!    the cost model the loop starts from. Without it every slice would start
+//!    the cost model the loop starts from, built with the page's `estimator`;
+//!    the split is decided from medians before that model exists, so the
+//!    estimator does not change it. Without it every slice would start
 //!    at the 2 ms prior, every job would be projected past its deadline, and
 //!    only the slices the loop's jobs ran could bring the estimates down.
 //!    Each calibration frame starts at an animation
@@ -153,6 +162,15 @@
 //! is compared by are the shared lines (`gpu_frame_us`, `delivery_rate`,
 //! `promised_latency_ms`) and calibration's GPU time per run of the whole
 //! model (`gpu_run_us`, and `calibrated_job_us`, the bench's line).
+//!
+//! **Whether the promise can be kept at all.** `capacity_frames_needed`
+//! compares what one whole job costs in the loop (the sum of its slices' mean
+//! measured durations) with the frames the promise gives it (`k + 1`, the
+//! deadline frame included) at the median expected budget: the frames a job
+//! needs even if every estimate were exact. `verdict=infeasible` means no
+//! estimator can deliver the promise on this display with this model;
+//! [`depth::Capacity`] defines the inputs, why the count is a lower bound and
+//! what `not_ruled_out` does not say.
 //!
 //! ## What a browser run measured
 //!

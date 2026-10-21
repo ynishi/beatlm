@@ -33,11 +33,9 @@ pub fn summarize(samples: &[u64]) -> Option<Summary> {
     })
 }
 
-/// The `percent`th percentile of an ascending slice, by nearest rank.
-fn nearest_rank(sorted: &[u64], percent: usize) -> Option<u64> {
-    if sorted.is_empty() {
-        return None;
-    }
+/// The `percent`th percentile of an ascending slice, by nearest rank; `None`
+/// when it is empty.
+pub fn nearest_rank<T: Copy>(sorted: &[T], percent: usize) -> Option<T> {
     let rank = (sorted.len() * percent).div_ceil(100).max(1);
     sorted.get(rank - 1).copied()
 }
