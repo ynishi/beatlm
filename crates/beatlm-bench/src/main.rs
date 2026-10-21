@@ -7,8 +7,18 @@
 //! and runs the umbrella crate's side of a frame against a fake workload, to
 //! answer the question the concurrency model in the `beatlm` crate documentation
 //! leaves open: how long from frame start to submission, and how much that
-//! varies. This binary is **candidate 1**, a synchronous `tick` on the calling
-//! thread.
+//! varies. `--mode` picks which of the three candidates drives the frame:
+//!
+//! | `--mode` | Candidate | Who decides, encodes and submits | How the frame loop calls it |
+//! |---|---|---|---|
+//! | `sync` (default) | 1 | the frame-loop thread | a plain call to `Engine::tick_sync` |
+//! | `thread` | 2 | a dedicated GPU thread: it builds and uses the workload, timer, scheduler and cost model, and is the only thread that touches the device during a run | the loop sends a frame event `(index, start)` over a bounded `std::sync::mpsc` channel |
+//! | `async` | 3 | the frame-loop thread | `pollster::block_on(engine.tick_async(..))`, once per frame |
+//!
+//! Everything else is the same code in all three: the pacing (`pace.rs`), the
+//! frame's work (`engine.rs`), the scheduler use, the latency check and the
+//! report. The only difference is where and how the frame's GPU work is decided,
+//! encoded and submitted.
 //!
 //! Each frame it submits one job of `--slices` slices with an L1 promise of
 //! `--latency` frames, plans the frame against a budget of the period minus the
@@ -16,6 +26,23 @@
 //! per slice the plan hands out and one timed render pass, submits, and starts
 //! the timestamp readback without waiting for it. Measurements that have arrived
 //! by a later frame feed the cost model.
+//!
+//! In `thread` mode the clock for "frame start to submit" starts on the
+//! frame-loop thread when the pacer begins the frame and stops on the GPU thread
+//! when `queue.submit` returns; both read `std::time::Instant`, which is one
+//! monotonic clock for the process. The time from frame start to the GPU thread
+//! receiving the event is reported separately as `channel_handoff_us`. The
+//! channel holds two events; a GPU thread further behind than that blocks the
+//! sender, which shows as `frame_start_lateness_us`.
+//!
+//! In `async` mode the await sits where the readback is checked, after the
+//! submit. The timer exposes completion as a flag its map callback sets, not as
+//! a future, so the awaited step polls the device and collects what has
+//! completed; on native `Device::poll` runs the finished callbacks before it
+//! returns, so that future is ready on its first poll and the mode measures the
+//! cost of an `async fn`, a hand-written future and `block_on` around work that
+//! never waits. A tick that really waits for a map callback needs the timer to
+//! hand out a future or register a waker, which is a change to `beatlm`.
 //!
 //! The load is two kernels in `shaders.wgsl`. A slice is a compute dispatch of
 //! 65 536 invocations, each running `--slice-iters` rounds of an integer hash.
@@ -34,20 +61,26 @@
 //!
 //! ```text
 //! cargo run --release -p beatlm-bench -- --frames 300
+//! cargo run --release -p beatlm-bench -- --frames 600 --runs 3 --mode thread
 //! ```
 //!
 //! Options are listed by `--help`. It needs an adapter with
 //! `Features::TIMESTAMP_QUERY` and is not part of `just check`; an adapter is
 //! not guaranteed where `check` runs. A run takes about `frames / 60` seconds.
+//! `--runs N` repeats the whole run `N` times in one process on one device, each
+//! with a fresh scheduler, cost model, timer and workload, and prints one report
+//! per run, so the variance between runs is visible without restarting.
 //!
 //! # Reading the output
 //!
-//! The report is plain text, one fact per line, on standard output.
+//! The report is plain text, one fact per line, on standard output; with
+//! `--runs` the reports follow one another, each starting with its `run` line.
 //!
 //! | Line | Meaning |
 //! |---|---|
+//! | `run` | which run of `--runs` this is |
 //! | `adapter`, `backend` | what the numbers were measured on; quote them with any number |
-//! | `config` | the options the run used |
+//! | `config` | the options the run used, `mode` included |
 //! | `frames` | frames run |
 //! | `frames_dropped` | frame periods given up because a frame began a whole period late; the loop drops them as a display would, rather than running frames back to back to catch up |
 //! | `delivered`, `missed` | results delivered on their frame, and deadlines that arrived without a complete result |
@@ -57,21 +90,94 @@
 //! | `latency_frames[n]` | how many deliveries had a latency of `n` frames |
 //! | `frame_start_lateness_us` | per frame, how long after its scheduled start the loop began it: p50, p99, max |
 //! | `cpu_start_to_submit_us` | per frame, from the loop beginning the frame to the return of `queue.submit`: p50, p99, max |
+//! | `cpu_start_to_tick_end_us` | per frame, from the loop beginning the frame to the return of the driver's call for it, readback poll, deliveries and in `async` mode `block_on` included |
+//! | `channel_handoff_us` | per frame, from the loop beginning the frame to the GPU thread receiving its event; `none` unless `--mode thread` |
+//! | `cpu_plan_us` | per frame, `Scheduler::submit` plus `plan_frame` |
+//! | `cpu_encode_us` | per frame, from creating the command encoder to finishing it, timestamp writes and the resolve included |
+//! | `cpu_queue_submit_us` | per frame, the time inside `queue.submit` |
 //! | `gpu_frame_us` | per timed frame, render plus every slice, on the GPU: p50, p99, max |
 //! | `slice[i]` | the cost model's final estimate for slice `i` against the mean of its measured durations |
 //!
-//! The process exits non-zero when `latency_violations` is not zero. A missed
-//! deadline is reported but does not fail the run: it is the documented outcome
-//! of a budget that is too small, not a broken promise.
+//! The process exits non-zero when `latency_violations` is not zero in any run.
+//! A missed deadline is reported but does not fail the run: it is the documented
+//! outcome of a budget that is too small, not a broken promise.
 //!
 //! `cpu_start_to_submit_us` starts when the loop begins the frame, so it is the
-//! engine's own cost; a frame that begins late, because the one before it
-//! overran or the sleep overshot, shows that in `frame_start_lateness_us`
-//! instead. A slice's estimate is what the scheduler budgets with, so it sits
-//! above the measured mean by the cost model's safety factor.
+//! engine's own cost plus, in `thread` mode, the hand-off; a frame that begins
+//! late, because the one before it overran or the sleep overshot, shows that in
+//! `frame_start_lateness_us` instead. The three `cpu_` breakdown lines are
+//! measured with one `Instant` read at each boundary, in every mode, and answer
+//! whether the 99th-percentile variance of `cpu_start_to_submit_us` comes from
+//! this code (`cpu_plan_us`, `cpu_encode_us`) or from the driver and the OS
+//! (`cpu_queue_submit_us`, and `channel_handoff_us` in `thread` mode). A slice's
+//! estimate is what the scheduler budgets with, so it sits above the measured
+//! mean by the cost model's safety factor.
+//!
+//! # Which candidates can run in a browser
+//!
+//! The question is whether the same code path can run in a browser's event loop,
+//! where the main thread can never block. Statements below cite the source they
+//! come from; a statement not confirmed from source says so.
+//!
+//! **Compile check.** `cargo check -p beatlm-bench --target
+//! wasm32-unknown-unknown` with this workspace's wgpu features (`webgpu`, not
+//! `fragile-send-sync-non-atomic-wasm`) fails with exactly one error, and it is
+//! the `thread` candidate's: `scope.spawn` requires `&Gpu: Send`, and
+//! `wgpu::Device` is not `Sync` there because the WebGPU backend's
+//! `WebDevice` holds an `Rc<Cell<u32>>`. The `sync` and `async` paths produce no
+//! error on that target. That is a type check only; it shows neither candidate
+//! runs, and the harness itself does not (below).
+//!
+//! - **`sync`: yes.** Nothing in the per-frame path blocks. `Device::poll` is
+//!   documented in wgpu 30.0.1 (`src/api/device.rs`) as "a no-op" on WebGPU,
+//!   where "`Device`s are automatically polled", and `PollType::Wait` "has no
+//!   effect" there (`wgpu-types` `PollType`), so the `PollType::Poll` call
+//!   degrades to nothing and the map callbacks run from the event loop. The
+//!   blocking `wait_indefinitely` poll is used only by the warm-up and the final
+//!   drain, which a browser host would not call. Whether it then behaves in a
+//!   running browser as the native runs here do is unconfirmed: nothing was run
+//!   in one.
+//! - **`async`: the tick, yes; the driver, no.** `tick_async` contains no
+//!   blocking call, so a browser can run it as a future. `pollster::block_on`
+//!   cannot drive it there: pollster 1.0.1 (`src/lib.rs`) waits for a pending
+//!   future with `thread::park`, and on `wasm32-unknown-unknown` without
+//!   atomics std's `Parker::park` is empty (`unsupported.rs` under
+//!   `std/src/sys/sync/thread_parking`), so a future that is truly pending would be polled again
+//!   in a loop that never returns control to the event loop. The awaited step
+//!   here never pends, so it would not hang, but the browser driver has to be
+//!   a task spawned on the event loop; that `wasm-bindgen-futures::spawn_local`
+//!   is the right one for this workspace is unconfirmed, as it is not a
+//!   dependency and was not built. With `target_feature = "atomics"` std parks
+//!   with a futex (`thread_parking/mod.rs`), and whether a browser allows that
+//!   wait on its main thread is unconfirmed from source: the rule is in the
+//!   JavaScript specification, which is not in the tree.
+//! - **`thread`: no.** `std::thread::spawn` is `Builder::spawn(..).expect(..)`
+//!   (`std/src/thread/functions.rs`), and on `wasm32-unknown-unknown` without
+//!   atomics `Thread::new` returns `Err(UNSUPPORTED_PLATFORM)`
+//!   (`std/src/sys/thread/unsupported.rs`), so it panics. With
+//!   `target_feature = "atomics"` the target selects a different thread module
+//!   (`std/src/sys/thread/mod.rs`) but its `Thread` is still the unsupported
+//!   one, so std still cannot spawn there. Independently of std, wgpu's WebGPU
+//!   handle types implement `Send` and `Sync` only under its `send_sync` cfg,
+//!   which is on for native targets and for wasm only with the
+//!   `fragile-send-sync-non-atomic-wasm` feature and no atomics (wgpu 30.0.1
+//!   `build.rs`, `src/backend/webgpu.rs`); the comment there says the types are
+//!   left unmarked when wasm threading is enabled because a `JsValue` is not
+//!   `Send`. So the design measured here, one device shared by reference with a
+//!   second thread, does not type-check in a browser build; a browser design
+//!   would be a worker with its own device, which is not built here, and whether
+//!   a browser can hand a `GPUDevice` to a worker is unconfirmed.
+//!
+//! The harness is native only regardless of mode: on `wasm32-unknown-unknown`
+//! `Instant::now` panics ("time not implemented on this platform",
+//! `std/src/sys/time/unsupported.rs`) and `thread::sleep` panics ("can't sleep",
+//! `std/src/sys/thread/unsupported.rs`), and the pacer uses both. The `beatlm`
+//! crate reads no clock, which is why only the harness is affected.
 
 mod args;
 mod device;
+mod engine;
+mod pace;
 mod report;
 mod run;
 mod stats;
@@ -102,17 +208,31 @@ fn real_main() -> Result<ExitCode> {
 
     let gpu = device::Gpu::open()?;
     eprintln!(
-        "running {} frames on {} ({})",
-        args.frames, gpu.info.name, gpu.info.backend
+        "running {} frames x {} runs, mode {}, on {} ({})",
+        args.frames,
+        args.runs,
+        args.mode.name(),
+        gpu.info.name,
+        gpu.info.backend
     );
-    let outcome = run::run(&gpu, &args)?;
     let env = report::Environment {
         adapter: gpu.info.name.clone(),
         backend: gpu.info.backend.to_string(),
     };
-    print!("{}", report::render(&env, &args, &outcome));
+    let mut violations = 0;
+    for number in 1..=args.runs {
+        // Each run builds its own scheduler, cost model and timer on the same
+        // device, so the difference between two reports is variance, not state
+        // carried over.
+        let outcome = run::run(&gpu, &args)?;
+        if number > 1 {
+            println!();
+        }
+        print!("{}", report::render(&env, &args, number, &outcome));
+        violations += outcome.violations;
+    }
 
-    Ok(if outcome.violations == 0 {
+    Ok(if violations == 0 {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE

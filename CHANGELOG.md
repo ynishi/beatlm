@@ -19,7 +19,11 @@ and this project adheres to
   timestamp queries, read back without blocking the frame loop.
 - `beatlm-bench`: a headless synthetic-load benchmark of the fixed-latency
   promise, with its first baseline recorded in the crate docs.
+- `beatlm-bench --mode sync|thread|async` and `--runs`, with a CPU breakdown
+  into planning, encoding and `queue.submit`.
 
 ### Changed
 
 - Design is documented in the crate docs; the separate ADR directory is gone.
+- The concurrency model is a synchronous `tick` per frame, decided by
+  measurement and recorded in the `beatlm` crate docs.

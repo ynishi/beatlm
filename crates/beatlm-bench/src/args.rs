@@ -13,6 +13,8 @@ usage: beatlm-bench [options]
   --slice-iters N   loop iterations per invocation of a slice kernel
   --render-iters N  loop iterations per pixel of the render pass
   --margin-us N     safety margin in the frame budget, us  (default 2000)
+  --mode M          concurrency candidate: sync, thread or async (default sync)
+  --runs N          repeat the whole run N times on one device (default 1)
   --help            print this text";
 
 /// Loop iterations per slice-kernel invocation that put one slice at 0.8 to
@@ -22,6 +24,30 @@ pub const DEFAULT_SLICE_ITERS: u32 = 500;
 /// Loop iterations per pixel that put the render pass at about 2 ms on an
 /// Apple M1 Pro (Metal); see the crate documentation.
 pub const DEFAULT_RENDER_ITERS: u32 = 50;
+
+/// Which concurrency candidate drives the frame; the crate documentation says
+/// what each one does and what stays the same between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// A synchronous `tick` on the frame-loop thread.
+    Sync,
+    /// A dedicated GPU thread fed frame events over a channel.
+    Thread,
+    /// An `async` `tick` awaited by the frame loop.
+    Async,
+}
+
+impl Mode {
+    /// The spelling `--mode` accepts and the report prints, so a report can be
+    /// matched to the command that produced it.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Sync => "sync",
+            Self::Thread => "thread",
+            Self::Async => "async",
+        }
+    }
+}
 
 /// What a run is configured with.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +64,10 @@ pub struct Args {
     pub render_iters: u32,
     /// The margin subtracted from each frame's budget, in microseconds.
     pub margin_us: u64,
+    /// The concurrency candidate that drives the frame.
+    pub mode: Mode,
+    /// How many times the whole run is repeated in one process.
+    pub runs: u32,
 }
 
 impl Default for Args {
@@ -49,6 +79,8 @@ impl Default for Args {
             slice_iters: DEFAULT_SLICE_ITERS,
             render_iters: DEFAULT_RENDER_ITERS,
             margin_us: 2_000,
+            mode: Mode::Sync,
+            runs: 1,
         }
     }
 }
@@ -69,7 +101,7 @@ pub enum Command {
 /// # Errors
 ///
 /// An unknown option, a missing or malformed value, or a value out of range
-/// (zero frames or zero slices).
+/// (zero frames, zero slices or zero runs).
 pub fn parse<I>(args: I) -> Result<Command>
 where
     I: IntoIterator<Item = String>,
@@ -97,6 +129,8 @@ where
             "--slice-iters" => out.slice_iters = number(&name, &value()?)?,
             "--render-iters" => out.render_iters = number(&name, &value()?)?,
             "--margin-us" => out.margin_us = number(&name, &value()?)?,
+            "--mode" => out.mode = mode(&value()?)?,
+            "--runs" => out.runs = number(&name, &value()?)?,
             _ => bail!("unknown option {name}"),
         }
     }
@@ -106,7 +140,18 @@ where
     if out.slices == 0 {
         bail!("--slices must be at least 1");
     }
+    if out.runs == 0 {
+        bail!("--runs must be at least 1");
+    }
     Ok(Command::Run(out))
+}
+
+/// Parses the value of `--mode`.
+fn mode(text: &str) -> Result<Mode> {
+    [Mode::Sync, Mode::Thread, Mode::Async]
+        .into_iter()
+        .find(|m| m.name() == text)
+        .with_context(|| format!("--mode: {text:?} is not one of sync, thread, async"))
 }
 
 fn number<T>(name: &str, text: &str) -> Result<T>
@@ -157,5 +202,25 @@ mod tests {
         assert!(parse_strs(&["--frames", "x"]).is_err());
         assert!(parse_strs(&["--frames", "0"]).is_err());
         assert!(parse_strs(&["--slices", "0"]).is_err());
+        assert!(parse_strs(&["--runs", "0"]).is_err());
+        assert!(parse_strs(&["--mode", "fibers"]).is_err());
+    }
+
+    #[test]
+    fn mode_and_runs_are_parsed() {
+        let Command::Run(a) = parse_strs(&["--mode", "thread", "--runs=3"]).unwrap() else {
+            panic!("expected a run");
+        };
+        assert_eq!((a.mode, a.runs), (Mode::Thread, 3));
+        let Command::Run(a) = parse_strs(&["--mode=async"]).unwrap() else {
+            panic!("expected a run");
+        };
+        assert_eq!(a.mode, Mode::Async);
+    }
+
+    #[test]
+    fn the_default_is_the_synchronous_candidate_run_once() {
+        let a = Args::default();
+        assert_eq!((a.mode, a.runs), (Mode::Sync, 1));
     }
 }

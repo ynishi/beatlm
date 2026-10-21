@@ -49,42 +49,56 @@
 //!
 //! ## Concurrency model
 //!
-//! Undecided, and decided by measurement rather than by default. The engine is
-//! driven by the host's frame loop — winit natively, `requestAnimationFrame`
-//! in a browser, where the main thread can never block and GPU completion
-//! arrives as promises. The usual default of an async service on a dedicated
-//! thread assumes the library is called into; here the property that matters
-//! is the time from frame start to submission. The candidates:
+//! **A synchronous `tick`, called once per frame on the thread that runs the
+//! host's frame loop, which decides, encodes and submits before it returns.**
+//! GPU completion is never awaited inside a frame: timestamp readbacks finish
+//! through map callbacks and are collected by a later `tick`.
 //!
-//! - a synchronous `tick` called once per frame on the render thread, which
-//!   decides, encodes and submits before returning;
-//! - an async handle over a dedicated GPU thread, fed frame events over a
-//!   channel;
-//! - an `async` `tick` awaited by the host.
+//! The engine is driven by the host's frame loop — winit natively,
+//! `requestAnimationFrame` in a browser, where the main thread can never block
+//! and GPU completion arrives as promises. The usual default of an async
+//! service on a dedicated thread assumes a library that is called into; here
+//! the property that matters is the time from frame start to submission, and
+//! that one code path runs on native and in a browser. Three candidates were
+//! measured with `beatlm-bench` under one configuration (latency 2, four
+//! synthetic slices of about 1 ms, a synthetic render of about 2 ms, 600 frames
+//! at 60 Hz, three runs each) on an Apple M1 Pro, Metal, on 2026-10-21:
 //!
-//! They are compared against a synthetic GPU load on the time from frame start
-//! to submission, its jitter at the 99th percentile, and whether one code path
-//! holds on native and on wasm. The choice and the numbers that made it replace
-//! this section. Whichever wins, [`beatlm_core`] is unaffected: it takes time
-//! and measurements as arguments and has no concurrency model of its own.
-//!
-//! Baseline for the first candidate, measured with `beatlm-bench` (synchronous
-//! `tick`, latency 2, four synthetic slices of about 1 ms and a synthetic
-//! render of about 2 ms per frame, 600 frames at 60 Hz) on an Apple M1 Pro,
-//! Metal, two runs on 2026-10-21:
-//!
-//! | | run 1 | run 2 |
+//! | Candidate | frame start to submit, p99 per run | wrong-latency deliveries |
 //! |---|---|---|
-//! | deliveries at a latency other than 2 | 0 | 0 |
-//! | missed deadlines | 0 | 0 |
-//! | frame start to submit, p50 / p99 / max | 0.64 / 7.7 / 14.8 ms | 0.77 / 2.6 / 8.9 ms |
-//! | GPU time per frame, p50 / p99 / max | 6.8 / 12.6 / 14.4 ms | 7.0 / 11.7 / 12.3 ms |
+//! | synchronous `tick` | 2.0 / 2.1 / 1.8 ms | 0 |
+//! | async handle over a dedicated GPU thread, fed by a channel | 2.3 / 2.3 / 2.6 ms | 0 |
+//! | `async` `tick` awaited by the host | 3.7 / 1.9 / 2.7 ms | 0 |
 //!
-//! The promise held in both runs: every result arrived exactly two frames
-//! after its input. The CPU side is what the other candidates have to beat:
-//! the median is under a millisecond, but the 99th percentile moved from 2.6
-//! to 7.7 ms between two identical runs — up to half a frame spent before
-//! anything reaches the GPU, and not stable enough to plan against.
+//! For the thread candidate the figure runs from the frame loop's frame start
+//! to the GPU thread's submit, so it includes the channel hand-off (0.7 ms at
+//! p99) and any frames queued behind a slow one; the GPU thread does not drop
+//! periods the way the frame loop does. It measures that candidate as a host
+//! would experience it, not the engine's cost alone.
+//!
+//! Why the synchronous `tick`:
+//!
+//! - **The others buy nothing measurable.** The spread between runs of one
+//!   candidate is as large as the spread between candidates. The breakdown
+//!   says where the time goes: planning in the core stays under 0.1 ms at
+//!   p99, while command encoding (1.4–2.2 ms p99) and `queue.submit`
+//!   (0.5–1.2 ms p99) carry the variance in every candidate. Moving the same
+//!   wgpu and driver calls to another thread, or behind an `await`, does not
+//!   change them; issuing fewer of them does.
+//! - **The thread does not exist in a browser.** wgpu's WebGPU device is not
+//!   `Sync` (it holds an `Rc`), so the dedicated-thread candidate does not
+//!   compile for `wasm32-unknown-unknown`, and `std::thread::spawn` is
+//!   unsupported there without atomics.
+//! - **The `async` tick has nothing to wait for.** Readback completes through
+//!   callbacks — natively run inside the `tick`'s non-blocking `device.poll`,
+//!   in a browser as promise callbacks between frames — so an `await`
+//!   in the frame only adds an executor. A `tick` that must not block the
+//!   browser's main thread is synchronous by construction.
+//!
+//! What follows from it: the CPU-side jitter is attacked by encoding fewer
+//! passes per frame — fusion and fewer, larger dispatches — not by
+//! concurrency. [`beatlm_core`] is unaffected either way: it takes time and
+//! measurements as arguments and has no concurrency model of its own.
 
 // Also set as a workspace lint; see the same attribute in `beatlm-core`.
 #![warn(missing_docs)]
