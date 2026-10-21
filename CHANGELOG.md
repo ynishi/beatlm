@@ -52,6 +52,12 @@ and this project adheres to
 - `beatlm-bench` calibrates split parts in a second pass so the loop starts
   from their measurements, refuses splits beyond the timer's capacity before
   building anything, and reports `startup_missed`.
+- `beatlm::load`: a safetensors reader and a configuration-derived inventory
+  of the tensors Depth Anything V2 Small needs, checked against the file.
+- `just setup-depth-anything` and `just reference-depth-anything`: user-run
+  setup that fetches the Apache-2.0 Small weights from a pinned commit and
+  writes reference outputs from the transformers implementation; neither is
+  part of the build or `just check`.
 
 ### Changed
 
