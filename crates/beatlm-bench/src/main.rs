@@ -469,6 +469,8 @@ mod calibrate;
 mod counters;
 mod device;
 mod engine;
+#[cfg(test)]
+mod harness;
 mod load;
 mod net;
 mod pace;
@@ -477,6 +479,8 @@ mod reference;
 mod report;
 mod run;
 mod stats;
+#[cfg(test)]
+mod vit;
 mod workload;
 
 use std::process::ExitCode;

@@ -81,9 +81,11 @@
 //! 2. **Fusion folds an element-wise operation into the heavy kernel before
 //!    it, and only when nothing else needs the tensor between them.** An
 //!    element-wise operation ([`OpKind::Add`], [`OpKind::Relu`],
-//!    [`OpKind::Gelu`], [`OpKind::Scale`]) becomes part of the previous
-//!    kernel's [epilogue](Epilogue) when that kernel's main operation is a
-//!    convolution, a layer norm or a matrix multiply, the element-wise
+//!    [`OpKind::Gelu`], [`OpKind::GeluErf`], [`OpKind::Scale`],
+//!    [`OpKind::ChannelScale`]) becomes part of the previous kernel's
+//!    [epilogue](Epilogue) when that kernel's main operation is a heavy
+//!    operation (any [`MainOp`] but [`MainOp::Map`], the standalone
+//!    element-wise kernel), the element-wise
 //!    operation's input is the tensor that kernel writes (the heavy
 //!    operation's output, or the output of an operation already fused into
 //!    it), that tensor has no other consumer and is not a graph
@@ -112,8 +114,9 @@
 //! 5. **Malformed graphs are errors, not guesses.** An unknown or repeated
 //!    tensor, an element count that disagrees with an operation's shape, a
 //!    tensor read before it is written or written twice, a write to an input or
-//!    a weight, an activation or output nobody writes, a zero dimension and a
-//!    non-finite scale are each a [`KernelError`].
+//!    a weight, an activation or output nobody writes, a zero dimension, a
+//!    non-finite scale and a layer norm epsilon that is not finite and positive
+//!    are each a [`KernelError`].
 //! 6. **A split kernel's parts cover its output exactly once, as consecutive
 //!    kernels.** [`Program::split`] replaces a kernel by `k` kernels, its
 //!    [`Part`]s, each computing a disjoint, contiguous range of the output
@@ -136,7 +139,86 @@
 //!
 //! Every tensor is `f32` and row-major. Activations are NHWC with one image
 //! (`[H][W][C]`, channels contiguous), convolution weights are HWIO
-//! (`[3][3][Cin][Cout]`), and a layer norm normalises the last dimension.
+//! (`[3][3][Cin][Cout]`, `[P][P][Cin][Cout]` for a patch embedding), and a
+//! layer norm and a softmax normalise the last dimension. A sequence of tokens
+//! is `[tokens][channels]`; patch tokens are in row-major patch order, so the
+//! tokens of an `H x W` grid of patches are the NHWC map `[H][W][C]` as they
+//! are. Attention reads the queries, keys and values packed per token,
+//! `[tokens][3][heads][head_dim]`, and lays scores out query first,
+//! `[tokens][heads][tokens]`.
+//!
+//! # Vision transformer operations
+//!
+//! A ViT encoder (DINOv2, the backbone of Depth Anything V2) is these
+//! operations. How each fuses and splits follows from rules 2 and 6; the table
+//! says what that comes to, so it can be checked against the tests.
+//!
+//! | Operation | Fuses into the kernel before it | Takes epilogues | Splits along |
+//! |---|---|---|---|
+//! | [`PatchEmbed`] | no: heavy | yes | patches, in tile rows |
+//! | [`PrependToken`] | no: its output index is not its input's | yes | output elements |
+//! | position embedding: [`OpKind::Add`] of a weight | yes, as [`Epilogue::Add`] | — | — |
+//! | [`AttentionScores`] | no: heavy | yes (the `1 / sqrt(head_dim)` [`OpKind::Scale`]) | query rows, in tile rows |
+//! | [`Softmax`] | no: a row reduction | yes | rows, which are (query, head) pairs, query first |
+//! | [`AttentionValues`] | no: heavy | yes | query rows, in tile rows |
+//! | [`OpKind::GeluErf`] | yes, as [`Epilogue::GeluErf`] | — | — |
+//! | [`OpKind::ChannelScale`] (LayerScale) | yes, as [`Epilogue::ChannelScale`] | — | — |
+//! | [`TokensToMap`] | no: its output index is not its input's | yes | output elements |
+//!
+//! An element-wise operation that does not fuse (its input has a second
+//! consumer, or no heavy kernel precedes it) is a standalone kernel and splits
+//! along its elements, as any other.
+//!
+//! ## Attention: materialised scores
+//!
+//! Self-attention is five operations: one [`MatMul`] from the normalised
+//! tokens to the packed queries, keys and values (`384 -> 1152` for DINOv2
+//! Small, one matrix multiply rather than three, so the normalised tokens are
+//! read once and the kernel is one dispatch), [`AttentionScores`] with the
+//! scale fused, [`Softmax`], [`AttentionValues`], and the output projection, a
+//! [`MatMul`] that LayerScale and the residual add fuse into. The scores are
+//! stored in memory between the three middle kernels, rather than kept in
+//! registers by one kernel that computes the softmax online, block by block of
+//! keys.
+//!
+//! They fit the baseline. At 1370 tokens and 6 heads the scores are
+//! `1370 x 6 x 1370` `f32`s, 45 045 600 bytes (7.5 MB per head), below the
+//! baseline's 128 MiB per binding, so the tensor is one binding as rule 3 of
+//! the [memory plan](crate::memory#rules) requires. The softmax writes a second
+//! tensor of that size while the first is live, so 90 MB of scores are live at
+//! that kernel and the planner places them like any other two tensors. No
+//! kernel's workgroup memory depends on the sequence length: the two products
+//! stage 16 x 16 tiles (2 KiB) and the softmax one value per invocation
+//! (1 KiB), against the baseline's 16 KiB.
+//!
+//! Why materialise, in terms of the frame-budget design ([`Program::parts_within`]
+//! and the crate documentation's scheduler rules): work is placed in frames at
+//! dispatch boundaries, and a kernel whose measured time exceeds the bound is
+//! split into parts. Three kernels give the cost model three measurements and
+//! the scheduler three boundaries, each split along query rows on its own
+//! measurement; an online-softmax kernel would be the longest dispatch of a
+//! block and would be split along the same query rows anyway, which makes its
+//! parts dispatches as well. What materialising costs is two dispatches per
+//! block (each a share of the host's encode time, which is where the frame's
+//! CPU-side variance lives) and the traffic of writing and reading the scores:
+//! about 180 MB per block at these shapes, against about 7.7 GFLOP of
+//! arithmetic per block. It is also the decomposition each of whose kernels has
+//! a reference of its own.
+//!
+//! What the traffic costs was measured with DINOv2 Small's real weights at 518
+//! pixels by the `beatlm` crate's test
+//! `the_encoder_on_the_gpu_matches_the_reference_features`, on an Apple M1 Pro,
+//! Metal, on 2026-10-21, fused and unsplit: the encoder's 118 kernels took 715
+//! to 730 ms of GPU time per run (the sum of every pass's timestamps; two
+//! invocations of the test, five runs each). In the first, by per-kernel
+//! median, the twelve softmax kernels, which read and write the full scores,
+//! took 10 ms of it; the twelve score products 135 ms, the twelve weighted
+//! sums 130 ms and the other matrix multiplies 433 ms. The scores' traffic is
+//! therefore not where the time is; the tiled products are, and an
+//! online-softmax kernel would run the same two products. The decision is
+//! expected to move if, once the products are faster, the softmax's share
+//! grows to matter: an online-softmax kernel removes the 90 MB and the two
+//! dispatches and keeps every other operation as it is.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
@@ -147,9 +229,49 @@ use crate::device::{DeviceFeatures, DeviceProfile};
 use crate::memory::{DType, TensorDesc, TensorId};
 use crate::time::Micros;
 
-/// The epsilon a layer norm adds to the variance before the square root, so a
-/// constant row does not divide by zero.
+/// The epsilon `torch.nn.LayerNorm` adds to the variance by default, for a
+/// [`LayerNorm`] whose model states none. Each layer norm carries its own
+/// ([`LayerNorm::epsilon`]), because models differ: DINOv2 uses `1e-6`.
 pub const LAYER_NORM_EPSILON: f32 = 1e-5;
+
+/// `p` of the erf approximation an [`OpKind::GeluErf`] kernel evaluates.
+///
+/// WGSL has no `erf`, so a kernel computes it as Abramowitz and Stegun,
+/// *Handbook of Mathematical Functions*, formula 7.1.26: for `z >= 0`,
+/// `erfc(z) = (a1 t + a2 t^2 + a3 t^3 + a4 t^4 + a5 t^5) exp(-z^2)` with
+/// `t = 1 / (1 + p z)`, [`GELU_ERF_A`] holding `a1` to `a5`. The book bounds
+/// the formula's absolute error by `1.5e-7` for every `z >= 0`.
+///
+/// GELU is then `x * Phi(x)` with `Phi(x) = erfc(|x| / sqrt 2) / 2` for
+/// negative `x` and `1 - erfc(x / sqrt 2) / 2` otherwise, so the negative side
+/// is a product, not `1 + erf` of a number near `-1`, and loses nothing to
+/// cancellation. Evaluated in `f32` as a kernel does, its largest absolute
+/// error against GELU through an `f64` erf, over `[-10, 10]` in steps of
+/// `2^-12`, is [`GELU_ERF_MAX_ERROR`]; that bound is asserted by
+/// `beatlm-bench`'s CPU test `the_erf_approximation_is_within_its_stated_error`,
+/// and what a GPU's `exp` adds is measured there by its GPU test
+/// `gelu_erf_on_the_gpu_is_within_its_stated_error`.
+///
+/// The constants are here, and not only in the shader text, so that the CPU
+/// test evaluates the same numbers the generated kernel does.
+pub const GELU_ERF_P: f32 = 0.327_591_1;
+
+/// `a1` to `a5` of the erf approximation; see [`GELU_ERF_P`].
+pub const GELU_ERF_A: [f32; 5] = [
+    0.254_829_6,
+    -0.284_496_72,
+    1.421_413_8,
+    -1.453_152_1,
+    1.061_405_4,
+];
+
+/// The largest absolute error of [`OpKind::GeluErf`] evaluated in `f32`
+/// against GELU through an `f64` erf, as stated at [`GELU_ERF_P`].
+///
+/// Measured: `4.13e-7`, at `x = 3.232`, both in `f32` on the CPU and through
+/// the generated kernel on an Apple M1 Pro (Metal), on 2026-10-21; the bound
+/// leaves a fifth above that for a GPU whose `exp` rounds differently.
+pub const GELU_ERF_MAX_ERROR: f32 = 5e-7;
 
 /// The most elements one tensor may have.
 ///
@@ -166,6 +288,11 @@ const ELEMENT_GROUP: u32 = 256;
 /// Invocations per workgroup of a layer norm: one workgroup per row, reducing
 /// through workgroup memory. A power of two, so the reduction halves evenly.
 const LAYER_NORM_LANES: u32 = 64;
+/// Invocations per workgroup of a softmax, one workgroup per row as for a layer
+/// norm. Wider, because an attention row is the sequence length (1370 for
+/// DINOv2 at 518 pixels) rather than a channel count; a power of two for the
+/// same reason.
+const SOFTMAX_LANES: u32 = 256;
 /// Width and height of a matrix-multiply tile, and of its workgroup.
 const MATMUL_TILE: u32 = 16;
 /// Bytes of one `f32`.
@@ -224,11 +351,11 @@ pub struct Conv2d3x3 {
 }
 
 /// Layer normalisation over the last dimension:
-/// `(x - mean) / sqrt(var + LAYER_NORM_EPSILON) * gamma + beta` per row.
+/// `(x - mean) / sqrt(var + epsilon) * gamma + beta` per row.
 ///
 /// Reads `input` (`[rows][channels]`), `gamma` and `beta` (`[channels]`);
 /// writes `[rows][channels]`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LayerNorm {
     /// The rows to normalise.
     pub input: TensorId,
@@ -240,6 +367,128 @@ pub struct LayerNorm {
     pub rows: u32,
     /// The length of a row (channels).
     pub channels: u32,
+    /// Added to the variance before the square root, so a constant row does
+    /// not divide by zero; finite and positive. The model says which:
+    /// [`LAYER_NORM_EPSILON`] is PyTorch's default.
+    pub epsilon: f32,
+}
+
+/// A patch embedding: a convolution of one NHWC image whose kernel and stride
+/// are both `patch`, without padding, written as one token per patch.
+///
+/// Reads `input` (`[grid_h * patch][grid_w * patch][cin]`), `weights`
+/// (`[patch][patch][cin][cout]`, HWIO) and, when present, `bias` (`[cout]`);
+/// writes `[grid_h * grid_w][cout]`, patches in row-major order, which is the
+/// NHWC map `[grid_h][grid_w][cout]` as well. The image is a whole number of
+/// patches by construction, so no pixel is dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PatchEmbed {
+    /// The image.
+    pub input: TensorId,
+    /// The HWIO weights.
+    pub weights: TensorId,
+    /// One value per output channel added to every token, or none.
+    pub bias: Option<TensorId>,
+    /// Patches down the image.
+    pub grid_h: u32,
+    /// Patches across the image.
+    pub grid_w: u32,
+    /// Side of a patch in pixels, and the stride.
+    pub patch: u32,
+    /// Input channels.
+    pub cin: u32,
+    /// Output channels: the token width.
+    pub cout: u32,
+}
+
+/// A token in front of a sequence: `[1 + rows][channels]`, `token` as row 0
+/// and `tokens` after it. A vision transformer's class token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PrependToken {
+    /// The token put first, `[channels]`.
+    pub token: TensorId,
+    /// The sequence, `[rows][channels]`.
+    pub tokens: TensorId,
+    /// Rows of `tokens`.
+    pub rows: u32,
+    /// Width of a token.
+    pub channels: u32,
+}
+
+/// A sequence of `1 + height * width` tokens without its first one, as the
+/// NHWC map `[height][width][channels]`: how a vision transformer's patch
+/// tokens leave it with the class token dropped.
+///
+/// Reads `input` (`[1 + height * width][channels]`). Patch tokens are in
+/// row-major patch order, so the map is rows `1..` of the input as they are;
+/// the operation is that copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TokensToMap {
+    /// The sequence, class token first.
+    pub input: TensorId,
+    /// Rows of the map.
+    pub height: u32,
+    /// Columns of the map.
+    pub width: u32,
+    /// Width of a token, and channels of the map.
+    pub channels: u32,
+}
+
+/// The attention scores of multi-head self-attention, unscaled:
+/// `S[i][h][j] = sum over d of Q[i][h][d] * K[j][h][d]`.
+///
+/// Reads `qkv` (`[tokens][3 * heads * head_dim]`, each row the query, then the
+/// key, then the value of one token, each `[heads][head_dim]`); writes
+/// `[tokens][heads][tokens]`: query, head, key. The layout puts the query
+/// outermost, so a range of query rows is a contiguous range of the scores and
+/// the kernel splits along them (rule 6). The `1 / sqrt(head_dim)` scale is an
+/// [`OpKind::Scale`] after it, which fuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AttentionScores {
+    /// The packed queries, keys and values.
+    pub qkv: TensorId,
+    /// Sequence length.
+    pub tokens: u32,
+    /// Attention heads.
+    pub heads: u32,
+    /// Width of one head.
+    pub head_dim: u32,
+}
+
+/// A softmax over the last dimension, `exp(x - max) / sum exp(x - max)` per
+/// row: subtracting the row's maximum first keeps every `exp` at most one, so
+/// no score overflows.
+///
+/// Reads `input` (`[rows][cols]`); writes `[rows][cols]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Softmax {
+    /// The rows.
+    pub input: TensorId,
+    /// How many rows.
+    pub rows: u32,
+    /// The length of a row: what is normalised over.
+    pub cols: u32,
+}
+
+/// The weighted sum of the values of multi-head self-attention:
+/// `O[i][h][d] = sum over j of P[i][h][j] * V[j][h][d]`.
+///
+/// Reads `probs` (`[tokens][heads][tokens]`, as [`AttentionScores`] lays them
+/// out) and `qkv` (as [`AttentionScores`] reads it, of which it uses the
+/// values); writes `[tokens][heads * head_dim]`, the heads side by side as the
+/// output projection reads them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AttentionValues {
+    /// The attention weights, each row summing to one.
+    pub probs: TensorId,
+    /// The packed queries, keys and values.
+    pub qkv: TensorId,
+    /// Sequence length.
+    pub tokens: u32,
+    /// Attention heads.
+    pub heads: u32,
+    /// Width of one head.
+    pub head_dim: u32,
 }
 
 /// `C[m][n] = A[m][k] * B[k][n] + bias[n]`, all row-major.
@@ -261,9 +510,9 @@ pub struct MatMul {
 
 /// What an operation computes, with the tensors it reads.
 ///
-/// The first three are heavy operations, each a kernel of its own; the rest
-/// are element-wise and may be fused into the kernel before them (rule 2 of
-/// the [module documentation](self#rules)).
+/// The variants holding a struct are heavy operations, each the main operation
+/// of a kernel of its own; the rest are element-wise and may be fused into the
+/// kernel before them (rule 2 of the [module documentation](self#rules)).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum OpKind {
     /// A 3x3 convolution.
@@ -272,6 +521,18 @@ pub enum OpKind {
     LayerNorm(LayerNorm),
     /// A matrix multiply.
     MatMul(MatMul),
+    /// A patch embedding.
+    PatchEmbed(PatchEmbed),
+    /// A token put in front of a sequence.
+    PrependToken(PrependToken),
+    /// A sequence without its first token, as a map.
+    TokensToMap(TokensToMap),
+    /// Multi-head attention scores.
+    AttentionScores(AttentionScores),
+    /// A softmax over rows.
+    Softmax(Softmax),
+    /// Multi-head attention's weighted sum of the values.
+    AttentionValues(AttentionValues),
     /// `a + b`, element by element; both have `elements` elements.
     Add {
         /// One operand.
@@ -296,6 +557,15 @@ pub enum OpKind {
         /// Elements of the operand and of the result.
         elements: u32,
     },
+    /// GELU as defined, `x * Phi(x) = 0.5 x (1 + erf(x / sqrt 2))`, which is
+    /// what `torch.nn.GELU()` computes by default and DINOv2's MLP uses. erf is
+    /// approximated within [`GELU_ERF_MAX_ERROR`]; [`GELU_ERF_P`] says how.
+    GeluErf {
+        /// The operand.
+        input: TensorId,
+        /// Elements of the operand and of the result.
+        elements: u32,
+    },
     /// `x * factor`, for a finite constant `factor`.
     Scale {
         /// The operand.
@@ -305,6 +575,30 @@ pub enum OpKind {
         /// Elements of the operand and of the result.
         elements: u32,
     },
+    /// Element `i` times `scale[i % channels]`: a per-channel multiplier, as a
+    /// vision transformer's LayerScale applies to a residual branch.
+    ChannelScale {
+        /// The operand, `[rows][channels]`.
+        input: TensorId,
+        /// The multipliers, `[channels]`.
+        scale: TensorId,
+        /// Rows of the operand.
+        rows: u32,
+        /// Channels: the operand's last dimension.
+        channels: u32,
+    },
+}
+
+/// The product of `dims`, saturating, so an overflow reads as more than
+/// [`MAX_ELEMENTS`].
+fn product(dims: &[u32]) -> u64 {
+    dims.iter()
+        .fold(1_u64, |acc, &d| acc.saturating_mul(u64::from(d)))
+}
+
+/// Elements of the packed queries, keys and values attention reads.
+fn qkv_elements(tokens: u32, heads: u32, head_dim: u32) -> u64 {
+    product(&[tokens, 3, heads, head_dim])
 }
 
 impl OpKind {
@@ -312,10 +606,7 @@ impl OpKind {
     /// count its shape gives it. Products saturate, so an overflow reads as
     /// more than [`MAX_ELEMENTS`].
     fn reads(&self) -> Vec<(TensorId, u64)> {
-        let mul = |dims: &[u32]| {
-            dims.iter()
-                .fold(1_u64, |acc, &d| acc.saturating_mul(u64::from(d)))
-        };
+        let mul = product;
         match *self {
             Self::Conv2d3x3(c) => {
                 let mut r = vec![
@@ -335,30 +626,69 @@ impl OpKind {
                 r.extend(mm.bias.map(|b| (b, u64::from(mm.n))));
                 r
             }
+            Self::PatchEmbed(p) => {
+                let mut r = vec![
+                    (p.input, mul(&[p.grid_h, p.patch, p.grid_w, p.patch, p.cin])),
+                    (p.weights, mul(&[p.patch, p.patch, p.cin, p.cout])),
+                ];
+                r.extend(p.bias.map(|b| (b, u64::from(p.cout))));
+                r
+            }
+            Self::PrependToken(t) => vec![
+                (t.token, t.channels.into()),
+                (t.tokens, mul(&[t.rows, t.channels])),
+            ],
+            Self::TokensToMap(t) => vec![(
+                t.input,
+                mul(&[t.height, t.width])
+                    .saturating_add(1)
+                    .saturating_mul(t.channels.into()),
+            )],
+            Self::AttentionScores(s) => vec![(s.qkv, qkv_elements(s.tokens, s.heads, s.head_dim))],
+            Self::Softmax(s) => vec![(s.input, mul(&[s.rows, s.cols]))],
+            Self::AttentionValues(v) => vec![
+                (v.probs, mul(&[v.tokens, v.heads, v.tokens])),
+                (v.qkv, qkv_elements(v.tokens, v.heads, v.head_dim)),
+            ],
             Self::Add { a, b, elements } => vec![(a, elements.into()), (b, elements.into())],
             Self::Relu { input, elements }
             | Self::Gelu { input, elements }
+            | Self::GeluErf { input, elements }
             | Self::Scale {
                 input, elements, ..
             } => vec![(input, elements.into())],
+            Self::ChannelScale {
+                input,
+                scale,
+                rows,
+                channels,
+            } => vec![(input, mul(&[rows, channels])), (scale, channels.into())],
         }
     }
 
-    /// The element count of the result.
-    fn output_elements(&self) -> u64 {
-        let mul = |a: u32, b: u32, c: u32| {
-            u64::from(a)
-                .saturating_mul(u64::from(b))
-                .saturating_mul(u64::from(c))
-        };
+    /// The element count of the result, saturating, so an overflow reads as
+    /// more than [`MAX_ELEMENTS`]. A graph builder declares the tensor an
+    /// operation writes with it.
+    #[must_use]
+    pub fn output_elements(&self) -> u64 {
         match *self {
-            Self::Conv2d3x3(c) => mul(c.height, c.width, c.cout),
-            Self::LayerNorm(l) => mul(l.rows, l.channels, 1),
-            Self::MatMul(mm) => mul(mm.m, mm.n, 1),
+            Self::Conv2d3x3(c) => product(&[c.height, c.width, c.cout]),
+            Self::LayerNorm(l) => product(&[l.rows, l.channels]),
+            Self::MatMul(mm) => product(&[mm.m, mm.n]),
+            Self::PatchEmbed(p) => product(&[p.grid_h, p.grid_w, p.cout]),
+            Self::PrependToken(t) => u64::from(t.rows)
+                .saturating_add(1)
+                .saturating_mul(t.channels.into()),
+            Self::TokensToMap(t) => product(&[t.height, t.width, t.channels]),
+            Self::AttentionScores(s) => product(&[s.tokens, s.heads, s.tokens]),
+            Self::Softmax(s) => product(&[s.rows, s.cols]),
+            Self::AttentionValues(v) => product(&[v.tokens, v.heads, v.head_dim]),
             Self::Add { elements, .. }
             | Self::Relu { elements, .. }
             | Self::Gelu { elements, .. }
+            | Self::GeluErf { elements, .. }
             | Self::Scale { elements, .. } => elements.into(),
+            Self::ChannelScale { rows, channels, .. } => product(&[rows, channels]),
         }
     }
 
@@ -368,35 +698,65 @@ impl OpKind {
             Self::Conv2d3x3(c) => [c.height, c.width, c.cin, c.cout].contains(&0),
             Self::LayerNorm(l) => l.rows == 0 || l.channels == 0,
             Self::MatMul(mm) => [mm.m, mm.k, mm.n].contains(&0),
+            Self::PatchEmbed(p) => [p.grid_h, p.grid_w, p.patch, p.cin, p.cout].contains(&0),
+            Self::PrependToken(t) => t.rows == 0 || t.channels == 0,
+            Self::TokensToMap(t) => [t.height, t.width, t.channels].contains(&0),
+            Self::AttentionScores(AttentionScores {
+                tokens,
+                heads,
+                head_dim,
+                ..
+            })
+            | Self::AttentionValues(AttentionValues {
+                tokens,
+                heads,
+                head_dim,
+                ..
+            }) => [tokens, heads, head_dim].contains(&0),
+            Self::Softmax(s) => s.rows == 0 || s.cols == 0,
             Self::Add { elements, .. }
             | Self::Relu { elements, .. }
             | Self::Gelu { elements, .. }
+            | Self::GeluErf { elements, .. }
             | Self::Scale { elements, .. } => elements == 0,
+            Self::ChannelScale { rows, channels, .. } => rows == 0 || channels == 0,
         }
     }
 
     /// The kernel that runs this operation alone.
     fn standalone(&self) -> (MainOp, Vec<Epilogue>) {
+        let map = |input, elements| MainOp::Map { input, elements };
         match *self {
             Self::Conv2d3x3(c) => (MainOp::Conv2d3x3(c), Vec::new()),
             Self::LayerNorm(l) => (MainOp::LayerNorm(l), Vec::new()),
             Self::MatMul(mm) => (MainOp::MatMul(mm), Vec::new()),
-            Self::Add { a, b, elements } => {
-                (MainOp::Map { input: a, elements }, vec![Epilogue::Add(b)])
-            }
-            Self::Relu { input, elements } => {
-                (MainOp::Map { input, elements }, vec![Epilogue::Relu])
-            }
-            Self::Gelu { input, elements } => {
-                (MainOp::Map { input, elements }, vec![Epilogue::Gelu])
-            }
+            Self::PatchEmbed(p) => (MainOp::PatchEmbed(p), Vec::new()),
+            Self::PrependToken(t) => (MainOp::PrependToken(t), Vec::new()),
+            Self::TokensToMap(t) => (MainOp::TokensToMap(t), Vec::new()),
+            Self::AttentionScores(s) => (MainOp::AttentionScores(s), Vec::new()),
+            Self::Softmax(s) => (MainOp::Softmax(s), Vec::new()),
+            Self::AttentionValues(v) => (MainOp::AttentionValues(v), Vec::new()),
+            Self::Add { a, b, elements } => (map(a, elements), vec![Epilogue::Add(b)]),
+            Self::Relu { input, elements } => (map(input, elements), vec![Epilogue::Relu]),
+            Self::Gelu { input, elements } => (map(input, elements), vec![Epilogue::Gelu]),
+            Self::GeluErf { input, elements } => (map(input, elements), vec![Epilogue::GeluErf]),
             Self::Scale {
                 input,
                 factor,
                 elements,
+            } => (map(input, elements), vec![Epilogue::Scale(factor)]),
+            Self::ChannelScale {
+                input,
+                scale,
+                rows,
+                channels,
             } => (
-                MainOp::Map { input, elements },
-                vec![Epilogue::Scale(factor)],
+                // The graph bounded the element count by MAX_ELEMENTS.
+                map(
+                    input,
+                    u32::try_from(product(&[rows, channels])).unwrap_or(u32::MAX),
+                ),
+                vec![Epilogue::ChannelScale { scale, channels }],
             ),
         }
     }
@@ -410,7 +770,16 @@ impl OpKind {
             Self::Add { a, b, .. } if b == chain && a != chain => Some(Epilogue::Add(a)),
             Self::Relu { input, .. } if input == chain => Some(Epilogue::Relu),
             Self::Gelu { input, .. } if input == chain => Some(Epilogue::Gelu),
+            Self::GeluErf { input, .. } if input == chain => Some(Epilogue::GeluErf),
             Self::Scale { input, factor, .. } if input == chain => Some(Epilogue::Scale(factor)),
+            Self::ChannelScale {
+                input,
+                scale,
+                channels,
+                ..
+            } if input == chain && scale != chain => {
+                Some(Epilogue::ChannelScale { scale, channels })
+            }
             _ => None,
         }
     }
@@ -495,7 +864,8 @@ impl Graph {
     /// A tensor not declared, an element count that disagrees with the
     /// operation's shape, a tensor read before an operation wrote it, an
     /// output that is an input or a weight or was already written, a zero
-    /// dimension, a non-finite scale, or a size past [`MAX_ELEMENTS`].
+    /// dimension, a non-finite scale, a layer norm epsilon that is not finite
+    /// and positive, or a size past [`MAX_ELEMENTS`].
     pub fn push(&mut self, kind: OpKind, output: TensorId) -> Result<(), KernelError> {
         let op = self.ops.len();
         if u32::try_from(op.saturating_add(1)).is_err() {
@@ -504,6 +874,11 @@ impl Graph {
         if let OpKind::Scale { factor, .. } = kind {
             if !factor.is_finite() {
                 return Err(KernelError::NonFiniteScale { op });
+            }
+        }
+        if let OpKind::LayerNorm(l) = kind {
+            if !(l.epsilon.is_finite() && l.epsilon > 0.0) {
+                return Err(KernelError::InvalidEpsilon { op });
             }
         }
         if kind.has_zero_dimension() {
@@ -660,7 +1035,7 @@ impl Graph {
 }
 
 /// The heavy part of a kernel: what it computes before its epilogue.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MainOp {
     /// A 3x3 convolution, one invocation per output element.
     Conv2d3x3(Conv2d3x3),
@@ -668,6 +1043,22 @@ pub enum MainOp {
     LayerNorm(LayerNorm),
     /// A tiled matrix multiply, one workgroup per output tile.
     MatMul(MatMul),
+    /// A patch embedding as a tiled matrix multiply of the patches, gathered
+    /// from the image as they are loaded, by the weights: one workgroup per
+    /// output tile.
+    PatchEmbed(PatchEmbed),
+    /// A token in front of a sequence, one invocation per output element.
+    PrependToken(PrependToken),
+    /// A sequence without its first token, one invocation per output element.
+    TokensToMap(TokensToMap),
+    /// Attention scores as one tiled matrix multiply per head, `Q K^T`: one
+    /// workgroup per output tile of a head.
+    AttentionScores(AttentionScores),
+    /// A softmax, one workgroup per row.
+    Softmax(Softmax),
+    /// The weighted sum of the values as one tiled matrix multiply per head,
+    /// `P V`: one workgroup per output tile of a head.
+    AttentionValues(AttentionValues),
     /// Reads `input` element by element: the main operation of a standalone
     /// element-wise kernel, whose epilogue is the operation itself.
     Map {
@@ -691,6 +1082,15 @@ impl MainOp {
                 .into_iter()
                 .flatten()
                 .collect(),
+            Self::PatchEmbed(p) => [Some(p.input), Some(p.weights), p.bias]
+                .into_iter()
+                .flatten()
+                .collect(),
+            Self::PrependToken(t) => vec![t.token, t.tokens],
+            Self::TokensToMap(t) => vec![t.input],
+            Self::AttentionScores(s) => vec![s.qkv],
+            Self::Softmax(s) => vec![s.input],
+            Self::AttentionValues(v) => vec![v.probs, v.qkv],
             Self::Map { input, .. } => vec![input],
         }
     }
@@ -698,11 +1098,16 @@ impl MainOp {
     /// The element count of the result; fits [`MAX_ELEMENTS`] because the
     /// graph checked it.
     fn output_elements(&self) -> u64 {
-        let mul = |a: u32, b: u32| u64::from(a).saturating_mul(u64::from(b));
         match *self {
-            Self::Conv2d3x3(c) => mul(c.height, c.width).saturating_mul(u64::from(c.cout)),
-            Self::LayerNorm(l) => mul(l.rows, l.channels),
-            Self::MatMul(mm) => mul(mm.m, mm.n),
+            Self::Conv2d3x3(c) => OpKind::Conv2d3x3(c).output_elements(),
+            Self::LayerNorm(l) => OpKind::LayerNorm(l).output_elements(),
+            Self::MatMul(mm) => OpKind::MatMul(mm).output_elements(),
+            Self::PatchEmbed(p) => OpKind::PatchEmbed(p).output_elements(),
+            Self::PrependToken(t) => OpKind::PrependToken(t).output_elements(),
+            Self::TokensToMap(t) => OpKind::TokensToMap(t).output_elements(),
+            Self::AttentionScores(s) => OpKind::AttentionScores(s).output_elements(),
+            Self::Softmax(s) => OpKind::Softmax(s).output_elements(),
+            Self::AttentionValues(v) => OpKind::AttentionValues(v).output_elements(),
             Self::Map { elements, .. } => elements.into(),
         }
     }
@@ -713,31 +1118,52 @@ impl MainOp {
             Self::Conv2d3x3(_) => "conv2d3x3",
             Self::LayerNorm(_) => "layernorm",
             Self::MatMul(_) => "matmul",
+            Self::PatchEmbed(_) => "patch_embed",
+            Self::PrependToken(_) => "prepend_token",
+            Self::TokensToMap(_) => "tokens_to_map",
+            Self::AttentionScores(_) => "attention_scores",
+            Self::Softmax(_) => "softmax",
+            Self::AttentionValues(_) => "attention_values",
             Self::Map { .. } => "map",
         }
     }
 
     /// The size of the dimension a kernel is split along: output pixels,
-    /// rows, output rows or elements (see [`Part`]). Fits a `u32` because the
-    /// graph bounds the output by [`MAX_ELEMENTS`].
+    /// rows, output rows, query rows or elements (see [`Part`]). Fits a `u32`
+    /// because the graph bounds the output by [`MAX_ELEMENTS`].
     fn split_extent(&self) -> u32 {
+        let narrow = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
         match *self {
-            Self::Conv2d3x3(c) => {
-                u32::try_from(u64::from(c.height) * u64::from(c.width)).unwrap_or(u32::MAX)
-            }
+            Self::Conv2d3x3(c) => narrow(product(&[c.height, c.width])),
             Self::LayerNorm(l) => l.rows,
             Self::MatMul(mm) => mm.m,
-            Self::Map { elements, .. } => elements,
+            Self::PatchEmbed(p) => narrow(product(&[p.grid_h, p.grid_w])),
+            Self::AttentionScores(s) => s.tokens,
+            Self::Softmax(s) => s.rows,
+            Self::AttentionValues(v) => v.tokens,
+            Self::PrependToken(_) | Self::TokensToMap(_) | Self::Map { .. } => {
+                narrow(self.output_elements())
+            }
         }
     }
 
     /// Units of the split dimension a part boundary moves in: a tile's height
-    /// for a matrix multiply, one unit otherwise.
+    /// for the kernels tiled like a matrix multiply, one unit otherwise.
     const fn split_grain(&self) -> u32 {
-        match self {
-            Self::MatMul(_) => MATMUL_TILE,
-            _ => 1,
-        }
+        if self.is_tiled() { MATMUL_TILE } else { 1 }
+    }
+
+    /// Whether the kernel is a tiled matrix multiply: one workgroup per output
+    /// tile, rows of tiles over the split dimension, columns across the
+    /// output's last dimension and, for attention, one layer of tiles per head.
+    const fn is_tiled(&self) -> bool {
+        matches!(
+            self,
+            Self::MatMul(_)
+                | Self::PatchEmbed(_)
+                | Self::AttentionScores(_)
+                | Self::AttentionValues(_)
+        )
     }
 
     /// Output elements per unit of the split dimension.
@@ -746,7 +1172,24 @@ impl MainOp {
             Self::Conv2d3x3(c) => c.cout.into(),
             Self::LayerNorm(l) => l.channels.into(),
             Self::MatMul(mm) => mm.n.into(),
-            Self::Map { .. } => 1,
+            Self::PatchEmbed(p) => p.cout.into(),
+            Self::AttentionScores(s) => product(&[s.heads, s.tokens]),
+            Self::Softmax(s) => s.cols.into(),
+            Self::AttentionValues(v) => product(&[v.heads, v.head_dim]),
+            Self::PrependToken(_) | Self::TokensToMap(_) | Self::Map { .. } => 1,
+        }
+    }
+
+    /// The tiled kernel's columns of tiles and layers of tiles: the extent of
+    /// the output's columns within one row of the split dimension and one
+    /// layer, and how many layers. `None` for a kernel that is not tiled.
+    fn tile_columns_and_layers(&self) -> Option<(u32, u32)> {
+        match *self {
+            Self::MatMul(mm) => Some((mm.n, 1)),
+            Self::PatchEmbed(p) => Some((p.cout, 1)),
+            Self::AttentionScores(s) => Some((s.tokens, s.heads)),
+            Self::AttentionValues(v) => Some((v.head_dim, v.heads)),
+            _ => None,
         }
     }
 }
@@ -764,8 +1207,18 @@ pub enum Epilogue {
     Relu,
     /// GELU, tanh approximation, as [`OpKind::Gelu`].
     Gelu,
+    /// GELU through erf, as [`OpKind::GeluErf`].
+    GeluErf,
     /// `v * factor`; finite.
     Scale(f32),
+    /// `v * scale[index % channels]`, as [`OpKind::ChannelScale`]; the kernel's
+    /// output has a multiple of `channels` elements, `channels` last.
+    ChannelScale {
+        /// The per-channel multipliers, `[channels]`.
+        scale: TensorId,
+        /// The output's last dimension.
+        channels: u32,
+    },
 }
 
 impl Epilogue {
@@ -775,7 +1228,17 @@ impl Epilogue {
             Self::Add(_) => "add",
             Self::Relu => "relu",
             Self::Gelu => "gelu",
+            Self::GeluErf => "gelu_erf",
             Self::Scale(_) => "scale",
+            Self::ChannelScale { .. } => "channel_scale",
+        }
+    }
+
+    /// The tensor the step reads, if it reads one: it is bound by the kernel.
+    const fn operand(&self) -> Option<TensorId> {
+        match *self {
+            Self::Add(id) | Self::ChannelScale { scale: id, .. } => Some(id),
+            Self::Relu | Self::Gelu | Self::GeluErf | Self::Scale(_) => None,
         }
     }
 }
@@ -833,8 +1296,11 @@ pub enum Limit {
 /// `count`, covering `range` of the kernel's split dimension.
 ///
 /// The split dimension is the one the kernel's grid walks in output order: the
-/// output pixels of a convolution, the rows of a layer norm, the output rows of
-/// a matrix multiply and the elements of a standalone element-wise kernel.
+/// output pixels of a convolution, the rows of a layer norm or a softmax, the
+/// output rows of a matrix multiply, the patches of a patch embedding, the
+/// query rows of the attention scores and of the weighted sum of the values,
+/// and the elements of a standalone element-wise kernel and of the token
+/// copies ([`PrependToken`], [`TokensToMap`]).
 /// Because every layout is row-major with that dimension outermost, a range of
 /// it is a contiguous range of the output ([`KernelSpec::output_range`]).
 /// Rule 6 of the [module documentation](self#rules) says how a kernel's parts
@@ -927,10 +1393,11 @@ impl KernelSpec {
     }
 
     /// The most parts the kernel can be split into: one per unit of its split
-    /// dimension, except a matrix multiply, whose parts are whole rows of
-    /// output tiles. A boundary inside a tile would make both parts run that
-    /// tile's workgroups, each with some invocations idle, so the work would
-    /// grow with the part count.
+    /// dimension, except a kernel tiled like a matrix multiply (the matrix
+    /// multiply, the patch embedding and the two attention products), whose
+    /// parts are whole rows of output tiles. A boundary inside a tile would
+    /// make both parts run that tile's workgroups, each with some invocations
+    /// idle, so the work would grow with the part count.
     #[must_use]
     pub fn max_parts(&self) -> u32 {
         self.main.split_extent().div_ceil(self.main.split_grain())
@@ -1037,17 +1504,15 @@ impl KernelSpec {
     }
 
     /// The tensors the kernel binds, each once, in binding order: the main
-    /// operation's reads, then the epilogue's [`Epilogue::Add`] operands, then
-    /// the output, which is always last.
+    /// operation's reads, then the tensors the epilogue's steps read
+    /// ([`Epilogue::Add`], [`Epilogue::ChannelScale`]) in step order, then the
+    /// output, which is always last.
     ///
     /// Binding `i` of the generated shader is element `i`.
     #[must_use]
     pub fn bindings(&self) -> Vec<TensorId> {
         let mut out: Vec<TensorId> = Vec::new();
-        let added = self.epilogue.iter().filter_map(|e| match e {
-            Epilogue::Add(id) => Some(*id),
-            _ => None,
-        });
+        let added = self.epilogue.iter().filter_map(Epilogue::operand);
         for id in self.main.reads().into_iter().chain(added) {
             if !out.contains(&id) {
                 out.push(id);
@@ -1078,7 +1543,10 @@ impl KernelSpec {
         // The grid covers the part, not the whole output.
         let units = self.part.range.end - self.part.range.start;
         let (workgroup_size, workgroups, workgroup_storage_bytes) = match self.main {
-            MainOp::Conv2d3x3(_) | MainOp::Map { .. } => {
+            MainOp::Conv2d3x3(_)
+            | MainOp::PrependToken(_)
+            | MainOp::TokensToMap(_)
+            | MainOp::Map { .. } => {
                 let range = self.output_range();
                 (
                     [ELEMENT_GROUP, 1, 1],
@@ -1091,11 +1559,26 @@ impl KernelSpec {
                 rows_of(u64::from(units)),
                 LAYER_NORM_LANES * F32_BYTES,
             ),
-            MainOp::MatMul(mm) => (
-                [MATMUL_TILE, MATMUL_TILE, 1],
-                [mm.n.div_ceil(MATMUL_TILE), units.div_ceil(MATMUL_TILE), 1],
-                2 * MATMUL_TILE * MATMUL_TILE * F32_BYTES,
+            MainOp::Softmax(_) => (
+                [SOFTMAX_LANES, 1, 1],
+                rows_of(u64::from(units)),
+                SOFTMAX_LANES * F32_BYTES,
             ),
+            MainOp::MatMul(_)
+            | MainOp::PatchEmbed(_)
+            | MainOp::AttentionScores(_)
+            | MainOp::AttentionValues(_) => {
+                let (columns, layers) = self.main.tile_columns_and_layers().unwrap_or((1, 1));
+                (
+                    [MATMUL_TILE, MATMUL_TILE, 1],
+                    [
+                        columns.div_ceil(MATMUL_TILE),
+                        units.div_ceil(MATMUL_TILE),
+                        layers,
+                    ],
+                    2 * MATMUL_TILE * MATMUL_TILE * F32_BYTES,
+                )
+            }
         };
         Requirements {
             workgroup_size,
@@ -1440,6 +1923,13 @@ pub enum KernelError {
     /// A scale by an infinity or a NaN.
     #[error("operation {op} scales by a non-finite factor")]
     NonFiniteScale {
+        /// The operation's index.
+        op: usize,
+    },
+    /// A layer norm whose epsilon is not finite and positive, so a constant
+    /// row would divide by zero or every row by an infinity.
+    #[error("operation {op} is a layer norm whose epsilon is not finite and positive")]
+    InvalidEpsilon {
         /// The operation's index.
         op: usize,
     },
@@ -1849,6 +2339,7 @@ mod tests {
                     beta: C,
                     rows: 63,
                     channels: 5,
+                    epsilon: LAYER_NORM_EPSILON,
                 }),
                 Y,
             ),
@@ -1966,6 +2457,7 @@ mod tests {
                 beta: BIAS,
                 rows,
                 channels,
+                epsilon: 1e-6,
             }));
         }
         for (m, k, n) in [(1, 1, 1), (4, 8, 4), (16, 3, 2), (33, 5, 7), (37, 21, 19)] {
@@ -1980,6 +2472,77 @@ mod tests {
         }
         for elements in [1, 7, 257, 1000] {
             kinds.push(OpKind::Gelu { input: X, elements });
+            kinds.push(OpKind::GeluErf { input: X, elements });
+        }
+        kinds.extend(encoder_shapes());
+        kinds
+    }
+
+    /// One operation of each vision transformer kind, at a single unit, at
+    /// shapes no tile divides, and at DINOv2 Small's at 518 pixels where the
+    /// kernel splits in rows; one split by elements is tried at a width of 384
+    /// and fewer rows, since its part counts reach its element count.
+    fn encoder_shapes() -> Vec<OpKind> {
+        let mut kinds = Vec::new();
+        for (grid_h, grid_w, patch, cin, cout) in
+            [(1, 1, 1, 1, 1), (5, 7, 3, 2, 19), (37, 37, 14, 3, 384)]
+        {
+            kinds.push(OpKind::PatchEmbed(PatchEmbed {
+                input: X,
+                weights: W,
+                bias: Some(BIAS),
+                grid_h,
+                grid_w,
+                patch,
+                cin,
+                cout,
+            }));
+        }
+        for (rows, channels) in [(1, 1), (35, 19), (40, 384)] {
+            kinds.push(OpKind::PrependToken(PrependToken {
+                token: W,
+                tokens: X,
+                rows,
+                channels,
+            }));
+        }
+        for (height, width, channels) in [(1, 1, 1), (5, 7, 19), (6, 7, 384)] {
+            kinds.push(OpKind::TokensToMap(TokensToMap {
+                input: X,
+                height,
+                width,
+                channels,
+            }));
+        }
+        for (tokens, heads, head_dim) in [(1, 1, 1), (17, 2, 5), (1370, 6, 64)] {
+            kinds.push(OpKind::AttentionScores(AttentionScores {
+                qkv: X,
+                tokens,
+                heads,
+                head_dim,
+            }));
+            kinds.push(OpKind::AttentionValues(AttentionValues {
+                probs: W,
+                qkv: X,
+                tokens,
+                heads,
+                head_dim,
+            }));
+        }
+        for (rows, cols) in [(1, 1), (19, 300), (1370 * 6, 1370)] {
+            kinds.push(OpKind::Softmax(Softmax {
+                input: X,
+                rows,
+                cols,
+            }));
+        }
+        for (rows, channels) in [(1, 1), (35, 19), (40, 384)] {
+            kinds.push(OpKind::ChannelScale {
+                input: X,
+                scale: W,
+                rows,
+                channels,
+            });
         }
         kinds
     }
@@ -2054,18 +2617,26 @@ mod tests {
                     let covered =
                         groups * u64::from(r.workgroup_size[0]) * u64::from(r.workgroup_size[1]);
                     match spec.main() {
-                        MainOp::Conv2d3x3(_) | MainOp::Map { .. } => {
+                        MainOp::Conv2d3x3(_)
+                        | MainOp::PrependToken(_)
+                        | MainOp::TokensToMap(_)
+                        | MainOp::Map { .. } => {
                             assert!(covered >= out.end - out.start, "{what}");
                         }
-                        MainOp::LayerNorm(_) => {
+                        MainOp::LayerNorm(_) | MainOp::Softmax(_) => {
                             assert!(groups >= u64::from(range.end - range.start), "{what}");
                         }
-                        MainOp::MatMul(mm) => {
-                            assert!(r.workgroups[0] * MATMUL_TILE >= mm.n, "{what}");
+                        MainOp::MatMul(_)
+                        | MainOp::PatchEmbed(_)
+                        | MainOp::AttentionScores(_)
+                        | MainOp::AttentionValues(_) => {
+                            let (columns, layers) = spec.main().tile_columns_and_layers().unwrap();
+                            assert!(r.workgroups[0] * MATMUL_TILE >= columns, "{what}");
                             assert!(
                                 r.workgroups[1] * MATMUL_TILE >= range.end - range.start,
                                 "{what}"
                             );
+                            assert_eq!(r.workgroups[2], layers, "{what}");
                         }
                     }
                     assert_eq!(part.check(Variant::Baseline, &baseline), Ok(()), "{what}");
@@ -2277,6 +2848,415 @@ mod tests {
         assert_eq!(whole.split(&[3, 2, 5]), whole.split(&[3, 2, 5]));
     }
 
+    /// DINOv2 Small at 518 pixels: tokens, width, heads, head width, MLP width.
+    const T: u32 = 1370;
+    const D: u32 = 384;
+    const HEADS: u32 = 6;
+    const HEAD_DIM: u32 = 64;
+    const MLP: u32 = 1536;
+
+    /// Declares `id` as a weight of `elements` and returns it.
+    fn weight(g: &mut Graph, id: u32, elements: u32) -> TensorId {
+        g.tensor(TensorId::new(id), TensorRole::Weight, elements.into())
+            .unwrap();
+        TensorId::new(id)
+    }
+
+    /// Appends `kind`, declaring its output as tensor `id` of `role`.
+    fn op(g: &mut Graph, kind: OpKind, id: u32, role: TensorRole) -> TensorId {
+        g.tensor(TensorId::new(id), role, kind.output_elements())
+            .unwrap();
+        g.push(kind, TensorId::new(id)).unwrap();
+        TensorId::new(id)
+    }
+
+    /// One pre-norm DINOv2 block at the real shapes, reading `x` and writing
+    /// the output `Y`, with its tensors numbered from 100.
+    ///
+    /// The tensors that tests name: the packed queries, keys and values
+    /// (110), the scores before and after the scale (111, 112), the
+    /// attention weights (113), the values' weighted sum (114) and the block's
+    /// residual stream between its halves (118).
+    fn encoder_block(g: &mut Graph, x: TensorId) {
+        use TensorRole::Activation as Act;
+        let ln = |input, gamma, beta| {
+            OpKind::LayerNorm(LayerNorm {
+                input,
+                gamma,
+                beta,
+                rows: T,
+                channels: D,
+                epsilon: 1e-6,
+            })
+        };
+        let mm = |a, b, bias, k, n| {
+            OpKind::MatMul(MatMul {
+                a,
+                b,
+                bias: Some(bias),
+                m: T,
+                k,
+                n,
+            })
+        };
+        let (g1, b1) = (weight(g, 100, D), weight(g, 101, D));
+        let (wqkv, bqkv) = (weight(g, 102, D * 3 * D), weight(g, 103, 3 * D));
+        let (wo, bo) = (weight(g, 104, D * D), weight(g, 105, D));
+        let ls1 = weight(g, 106, D);
+        let (g2, b2) = (weight(g, 107, D), weight(g, 108, D));
+        let (w1, bf1) = (weight(g, 120, D * MLP), weight(g, 121, MLP));
+        let (w2, bf2) = (weight(g, 122, MLP * D), weight(g, 123, D));
+        let ls2 = weight(g, 124, D);
+
+        let n1 = op(g, ln(x, g1, b1), 109, Act);
+        let qkv = op(g, mm(n1, wqkv, bqkv, D, 3 * D), 110, Act);
+        let attention = AttentionScores {
+            qkv,
+            tokens: T,
+            heads: HEADS,
+            head_dim: HEAD_DIM,
+        };
+        let scores = op(g, OpKind::AttentionScores(attention), 111, Act);
+        let scaled = op(
+            g,
+            OpKind::Scale {
+                input: scores,
+                factor: 0.125,
+                elements: T * HEADS * T,
+            },
+            112,
+            Act,
+        );
+        let probs = op(
+            g,
+            OpKind::Softmax(Softmax {
+                input: scaled,
+                rows: T * HEADS,
+                cols: T,
+            }),
+            113,
+            Act,
+        );
+        let values = op(
+            g,
+            OpKind::AttentionValues(AttentionValues {
+                probs,
+                qkv,
+                tokens: T,
+                heads: HEADS,
+                head_dim: HEAD_DIM,
+            }),
+            114,
+            Act,
+        );
+        let projected = op(g, mm(values, wo, bo, D, D), 115, Act);
+        let layer_scaled = op(
+            g,
+            OpKind::ChannelScale {
+                input: projected,
+                scale: ls1,
+                rows: T,
+                channels: D,
+            },
+            116,
+            Act,
+        );
+        let x1 = op(
+            g,
+            OpKind::Add {
+                a: layer_scaled,
+                b: x,
+                elements: T * D,
+            },
+            118,
+            Act,
+        );
+        let n2 = op(g, ln(x1, g2, b2), 119, Act);
+        let hidden = op(g, mm(n2, w1, bf1, D, MLP), 125, Act);
+        let activated = op(
+            g,
+            OpKind::GeluErf {
+                input: hidden,
+                elements: T * MLP,
+            },
+            126,
+            Act,
+        );
+        let out = op(g, mm(activated, w2, bf2, MLP, D), 127, Act);
+        let layer_scaled = op(
+            g,
+            OpKind::ChannelScale {
+                input: out,
+                scale: ls2,
+                rows: T,
+                channels: D,
+            },
+            128,
+            Act,
+        );
+        g.tensor(Y, TensorRole::Output, u64::from(T * D)).unwrap();
+        g.push(
+            OpKind::Add {
+                a: x1,
+                b: layer_scaled,
+                elements: T * D,
+            },
+            Y,
+        )
+        .unwrap();
+    }
+
+    fn block_graph() -> Graph {
+        let mut g = Graph::new();
+        g.tensor(X, TensorRole::Input, u64::from(T * D)).unwrap();
+        encoder_block(&mut g, X);
+        g
+    }
+
+    /// Checks `plan` against `program`: no two tensors whose lifetimes overlap
+    /// share a byte, every arena fits one baseline binding, and each kernel's
+    /// tensors are live at that kernel.
+    fn assert_plan_holds(program: &Program, plan: &MemoryPlan) {
+        let baseline = DeviceProfile::webgpu_baseline();
+        assert!(plan.valid_on(&baseline));
+        assert!(
+            plan.arenas()
+                .iter()
+                .all(|&a| a <= baseline.max_arena_size())
+        );
+        let tensors = program.tensors();
+        for (i, a) in tensors.iter().enumerate() {
+            for b in &tensors[i + 1..] {
+                if a.first_use <= b.last_use && b.first_use <= a.last_use {
+                    let (p, q) = (plan.placement(a.id).unwrap(), plan.placement(b.id).unwrap());
+                    assert!(
+                        p.arena != q.arena || p.end() <= q.offset || q.end() <= p.offset,
+                        "tensors {} and {} are live together and share bytes",
+                        a.id.get(),
+                        b.id.get()
+                    );
+                }
+            }
+        }
+        for (k, kernel) in program.kernels().iter().enumerate() {
+            let k = k as u32;
+            for t in kernel.bindings() {
+                let d = tensors.iter().find(|d| d.id == t).unwrap();
+                assert!(d.first_use <= k && k <= d.last_use, "tensor {}", t.get());
+            }
+        }
+    }
+
+    #[test]
+    fn an_encoder_block_fuses_layerscale_residuals_gelu_and_the_attention_scale() {
+        let p = block_graph().lower(Fusion::On).unwrap();
+        assert_eq!(
+            p.kernels().iter().map(KernelSpec::name).collect::<Vec<_>>(),
+            vec![
+                "layernorm",
+                "matmul",
+                "attention_scores+scale",
+                "softmax",
+                "attention_values",
+                "matmul+channel_scale+add",
+                "layernorm",
+                "matmul+gelu_erf",
+                "matmul+channel_scale+add",
+            ]
+        );
+        let names = |k: usize| p.kernels()[k].bindings();
+        // The output projection binds the values, its weights and bias, the
+        // LayerScale vector, the residual and its output.
+        assert_eq!(
+            names(5),
+            [id(114), id(104), id(105), id(106), X, id(118)].to_vec()
+        );
+        assert_eq!(
+            p.kernels()[5].epilogue(),
+            &[
+                Epilogue::ChannelScale {
+                    scale: id(106),
+                    channels: D
+                },
+                Epilogue::Add(X)
+            ]
+        );
+        assert_eq!(p.kernels()[2].epilogue(), &[Epilogue::Scale(0.125)]);
+        assert_eq!(p.kernels()[7].epilogue(), &[Epilogue::GeluErf]);
+        // Fused intermediates are gone; the shared ones stay.
+        for gone in [111, 115, 116, 125, 127, 128] {
+            assert_eq!(lifetime(&p, id(gone)), None, "tensor {gone}");
+        }
+        let unfused = block_graph().lower(Fusion::Off).unwrap();
+        assert_eq!(unfused.kernels().len(), 15);
+        assert_eq!(unfused.kernels()[3].name(), "map+scale");
+        assert_eq!(unfused.kernels()[11].name(), "map+gelu_erf");
+        assert_eq!(unfused.kernels()[7].name(), "map+channel_scale");
+        assert_eq!(
+            unfused.kernels()[7].bindings(),
+            vec![id(115), id(106), id(116)]
+        );
+    }
+
+    #[test]
+    fn an_encoder_blocks_lifetimes_come_from_its_kernels_and_its_plan_holds_split_or_whole() {
+        let whole = block_graph().lower(Fusion::On).unwrap();
+        // Kernel indices of the fused block: the queries, keys and values are
+        // written by the projection (1) and last read by the weighted sum (4);
+        // the scaled scores live from their kernel to the softmax; the
+        // residual stream between the halves from the output projection (5)
+        // to the second residual add (8).
+        assert_eq!(lifetime(&whole, id(110)), Some((1, 4)));
+        assert_eq!(lifetime(&whole, id(112)), Some((2, 3)));
+        assert_eq!(lifetime(&whole, id(113)), Some((3, 4)));
+        assert_eq!(lifetime(&whole, id(118)), Some((5, 8)));
+        assert_eq!(lifetime(&whole, X), Some((0, 8)));
+        // The scores are one tensor of 45 045 600 bytes, within one binding.
+        let scores = whole.tensors().iter().find(|t| t.id == id(112)).unwrap();
+        assert_eq!(scores.elements * 4, 45_045_600);
+        let baseline = DeviceProfile::webgpu_baseline();
+        let plan = MemoryPlan::new(whole.tensors(), &baseline).unwrap();
+        assert_plan_holds(&whole, &plan);
+
+        // Every kernel split along its rows (query rows for attention): the
+        // plan of the split program holds as well, and each attention kernel's
+        // parts are whole tile rows of queries.
+        for count in [2, 3, 7, 86, 200] {
+            let split = whole.split(&vec![count; whole.kernels().len()]).unwrap();
+            let plan = MemoryPlan::new(split.tensors(), &baseline).unwrap();
+            assert_plan_holds(&split, &plan);
+            for part in split.kernels() {
+                if let MainOp::AttentionScores(_) | MainOp::AttentionValues(_) = part.main() {
+                    let r = part.part().range();
+                    assert!(r.start % MATMUL_TILE == 0 && r.end <= T, "{r:?}");
+                }
+            }
+        }
+        let unfused = block_graph().lower(Fusion::Off).unwrap();
+        let plan = MemoryPlan::new(unfused.tensors(), &baseline).unwrap();
+        assert_plan_holds(&unfused, &plan);
+    }
+
+    #[test]
+    fn the_embeddings_fuse_the_position_add_into_the_class_token_kernel() {
+        let (image, w, b, cls, pos) = (id(0), id(1), id(2), id(3), id(4));
+        let mut g = Graph::new();
+        g.tensor(image, TensorRole::Input, 518 * 518 * 3).unwrap();
+        weight(&mut g, 1, 14 * 14 * 3 * D);
+        weight(&mut g, 2, D);
+        weight(&mut g, 3, D);
+        weight(&mut g, 4, T * D);
+        let patches = op(
+            &mut g,
+            OpKind::PatchEmbed(PatchEmbed {
+                input: image,
+                weights: w,
+                bias: Some(b),
+                grid_h: 37,
+                grid_w: 37,
+                patch: 14,
+                cin: 3,
+                cout: D,
+            }),
+            10,
+            TensorRole::Activation,
+        );
+        let tokens = op(
+            &mut g,
+            OpKind::PrependToken(PrependToken {
+                token: cls,
+                tokens: patches,
+                rows: T - 1,
+                channels: D,
+            }),
+            11,
+            TensorRole::Activation,
+        );
+        let embedded = op(
+            &mut g,
+            OpKind::Add {
+                a: tokens,
+                b: pos,
+                elements: T * D,
+            },
+            12,
+            TensorRole::Activation,
+        );
+        op(
+            &mut g,
+            OpKind::TokensToMap(TokensToMap {
+                input: embedded,
+                height: 37,
+                width: 37,
+                channels: D,
+            }),
+            13,
+            TensorRole::Output,
+        );
+        let p = g.lower(Fusion::On).unwrap();
+        assert_eq!(
+            p.kernels().iter().map(KernelSpec::name).collect::<Vec<_>>(),
+            vec!["patch_embed", "prepend_token+add", "tokens_to_map"]
+        );
+        assert_eq!(p.kernels()[1].bindings(), vec![cls, patches, pos, id(12)]);
+        assert_eq!(p.kernels()[0].output_elements(), u64::from((T - 1) * D));
+        assert_eq!(p.kernels()[0].max_parts(), (T - 1).div_ceil(MATMUL_TILE));
+        assert_eq!(
+            p.kernels()[2].output_elements(),
+            u64::from(37 * 37 * D),
+            "the class token is dropped"
+        );
+        assert_eq!(g.lower(Fusion::Off).unwrap().kernels().len(), 4);
+    }
+
+    #[test]
+    fn a_layerscale_by_its_own_input_is_not_fused() {
+        // The multipliers are the tensor flowing out of the kernel, so a fused
+        // step would read the value it is computing.
+        let mut g = Graph::new();
+        g.tensor(X, TensorRole::Input, 4).unwrap();
+        g.tensor(W, TensorRole::Weight, 4).unwrap();
+        g.tensor(A, TensorRole::Activation, 4).unwrap();
+        g.tensor(Y, TensorRole::Output, 4).unwrap();
+        g.push(
+            OpKind::MatMul(MatMul {
+                a: X,
+                b: W,
+                bias: None,
+                m: 2,
+                k: 2,
+                n: 2,
+            }),
+            A,
+        )
+        .unwrap();
+        g.push(
+            OpKind::ChannelScale {
+                input: A,
+                scale: A,
+                rows: 1,
+                channels: 4,
+            },
+            Y,
+        )
+        .unwrap();
+        assert_eq!(g.lower(Fusion::On).unwrap().kernels().len(), 2);
+    }
+
+    #[test]
+    fn the_erf_constants_are_the_published_coefficients_in_f32() {
+        // Abramowitz and Stegun 7.1.26, as printed.
+        assert_eq!(GELU_ERF_P, 0.327_591_1_f64 as f32);
+        let published: [f64; 5] = [
+            0.254_829_592,
+            -0.284_496_736,
+            1.421_413_741,
+            -1.453_152_027,
+            1.061_405_429,
+        ];
+        assert_eq!(GELU_ERF_A, published.map(|a| a as f32));
+    }
+
     #[test]
     fn malformed_graphs_are_errors() {
         let mut g = base(&[A, B]);
@@ -2344,6 +3324,47 @@ mod tests {
                     elements: 0
                 },
                 B
+            ),
+            Err(KernelError::ZeroDimension { op: 0 })
+        );
+        for epsilon in [0.0, -1e-6, f32::NAN, f32::INFINITY] {
+            assert_eq!(
+                g.push(
+                    OpKind::LayerNorm(LayerNorm {
+                        input: X,
+                        gamma: BIAS,
+                        beta: BIAS,
+                        rows: 8,
+                        channels: 4,
+                        epsilon,
+                    }),
+                    id(9)
+                ),
+                Err(KernelError::InvalidEpsilon { op: 0 }),
+                "{epsilon}"
+            );
+        }
+        assert_eq!(
+            g.push(
+                OpKind::AttentionScores(AttentionScores {
+                    qkv: X,
+                    tokens: 4,
+                    heads: 0,
+                    head_dim: 8,
+                }),
+                A
+            ),
+            Err(KernelError::ZeroDimension { op: 0 })
+        );
+        assert_eq!(
+            g.push(
+                OpKind::PrependToken(PrependToken {
+                    token: X,
+                    tokens: X,
+                    rows: 0,
+                    channels: 16,
+                }),
+                A
             ),
             Err(KernelError::ZeroDimension { op: 0 })
         );

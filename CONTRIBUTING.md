@@ -92,6 +92,10 @@ just reference-depth-anything   # optional: the original implementation's output
 cargo test -p beatlm --test depth_anything_v2 -- --ignored
 ```
 
+The tests look for the files under `BEATLM_MODELS_DIR` when it is set, and
+under `models/` at the workspace root otherwise; a worktree, which has no
+`models/` of its own, sets it to the main checkout's.
+
 `setup-depth-anything` fetches from a pinned commit, verifies the file's
 sha256, skips what is already there, and states in its header the source, the
 licence (Apache-2.0) and the notices. `reference-depth-anything` runs
