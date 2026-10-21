@@ -77,14 +77,17 @@
 //! | Tensors whose lifetimes overlap never share memory; arenas respect the adapter's binding size and offset alignment; a tensor too large for an arena is an error, never split. | [`memory::MemoryPlan`] |
 //! | A plan made against the baseline profile is valid on every adapter. | [`device::DeviceProfile::webgpu_baseline`], checked for other profiles by [`memory::MemoryPlan::valid_on`] |
 //! | The steady-state loop allocates nothing and reads nothing back except timestamps. | the plan |
-//! | A kernel stays within the adapter's workgroup memory and requests only features the adapter has; a kernel using subgroups has a variant without them. | the kernel IR |
+//! | A kernel stays within the adapter's workgroup memory and requests only features the adapter has; every kernel has a baseline variant that needs no optional feature, and the variant is selected from the device's profile. | [`kernel::KernelSpec::check`] (selection by [`kernel::KernelSpec::select_variant`]) |
+//! | A tensor's lifetime is derived from the kernels that use it, never stated separately, so the memory plan and the IR cannot disagree. | [`kernel::Program::tensors`] |
+//! | An element-wise operation is fused into the heavy kernel before it only when the tensor between them has no other consumer; fusion is deterministic and changes no result beyond floating-point contraction and reassociation. | [`kernel::Graph::lower`] (the [`kernel#rules`] list) |
 //!
 //! ## What changes, and where
 //!
 //! Decisions expected to move are kept behind one owner each: the statistic a
 //! cost estimate uses lives in [`cost`], the delivery promises in [`sync`],
 //! the order jobs are served in [`schedule`], the packing algorithm that places tensors
-//! in memory in [`memory`]. Shader languages, model formats and GPU backends are
+//! in memory in [`memory`], which operations share a kernel in [`kernel`].
+//! Shader languages, model formats and GPU backends are
 //! not decided here at all; what an adapter reports reaches the core only as
 //! the plain values of a [`device::DeviceProfile`].
 
@@ -96,6 +99,7 @@
 pub mod budget;
 pub mod cost;
 pub mod device;
+pub mod kernel;
 pub mod memory;
 pub mod schedule;
 pub mod sync;

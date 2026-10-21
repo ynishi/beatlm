@@ -3,7 +3,7 @@
 
 use std::fmt::Write as _;
 
-use crate::args::{Args, WorkloadKind};
+use crate::args::{Args, WorkloadKind, fusion_name};
 use crate::engine::{NetReport, Outcome};
 use crate::pace::FRAME_PERIOD;
 use crate::stats::{histogram, summarize};
@@ -55,7 +55,7 @@ fn write_report(
     // is the one without it.
     match args.workload {
         WorkloadKind::Synthetic => writeln!(out)?,
-        WorkloadKind::Net => writeln!(out, " workload=net")?,
+        WorkloadKind::Net => writeln!(out, " workload=net fusion={}", fusion_name(args.fusion))?,
     }
     writeln!(out, "frames: {}", outcome.cpu_us.len())?;
     writeln!(out, "frames_dropped: {}", outcome.dropped)?;
@@ -73,6 +73,8 @@ fn write_report(
     for (frames, count) in histogram(outcome.latencies.iter().copied()) {
         writeln!(out, "latency_frames[{frames}]: {count}")?;
     }
+    write_summary(out, "dispatches_per_job", &outcome.dispatches_per_job)?;
+    write_summary(out, "dispatches_per_frame", &outcome.dispatches_per_frame)?;
     write_summary(out, "frame_start_lateness_us", &outcome.lateness_us)?;
     write_summary(out, "cpu_start_to_submit_us", &outcome.cpu_us)?;
     write_summary(out, "cpu_start_to_tick_end_us", &outcome.tick_us)?;
@@ -129,6 +131,7 @@ fn gpu_frames_over_period(gpu_frame_us: &[u64]) -> usize {
 
 /// The memory plan and the allocation readings of the `net` workload.
 fn write_net(out: &mut String, net: &NetReport) -> std::fmt::Result {
+    writeln!(out, "kernels: {}", net.kernels.join(" "))?;
     writeln!(out, "memory_plan_tensors: {}", net.tensors)?;
     writeln!(out, "memory_plan_io_slots: {}", net.slots)?;
     writeln!(out, "memory_plan_arenas: {}", net.arenas.len())?;

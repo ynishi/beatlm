@@ -18,7 +18,7 @@
 //! | wgpu adapter limits and features | a [`DeviceProfile`](beatlm_core::device::DeviceProfile) of plain values ([`gpu::profile`]) | the core plans memory and picks kernel variants from values, so it never depends on a wgpu version |
 //! | GPU timestamp queries | measured durations ([`gpu`]) | the core's cost model is fed measurements, and only measurements |
 //! | model files (safetensors first) | a graph of tensors and operations | weight formats change and multiply; the graph does not |
-//! | kernel IR | WGSL text, validated by naga | browsers accept only WGSL, and generated text can be read, diffed and checked by naga's parser |
+//! | [kernel IR](beatlm_core::kernel) | WGSL text, validated by naga ([`codegen`]) | browsers accept only WGSL, and generated text can be read, diffed and checked by naga's parser |
 //!
 //! Shaders are generated as WGSL text rather than built as naga IR. Building IR
 //! directly makes the generator responsible for invariants naga's parser
@@ -105,6 +105,7 @@
 // Also set as a workspace lint; see the same attribute in `beatlm-core`.
 #![warn(missing_docs)]
 
+pub mod codegen;
 pub mod gpu;
 
 pub use beatlm_core;
