@@ -7,6 +7,9 @@ members = [
     # The umbrella: what a user depends on. Turns the core's decisions into
     # GPU work through wgpu, and owns the translation from outside formats.
     "crates/beatlm",
+    # A headless host: drives the umbrella with a synthetic GPU load and reports
+    # what it measured. Not published.
+    "crates/beatlm-bench",
 ]
 
 [workspace.package]
@@ -20,7 +23,10 @@ homepage     = "https://github.com/ynishi/beatlm"
 
 [workspace.dependencies]
 beatlm-core = { path = "crates/beatlm-core", version = "0.1.0" }
+beatlm      = { path = "crates/beatlm", version = "0.1.0" }
 thiserror   = "2"
+anyhow      = "1"
+pollster    = "1"
 # Native backends we target first, plus the browser. `wgsl` is the only
 # shader input: kernels are generated as WGSL text and validated by naga.
 wgpu = { version = "30", default-features = false, features = [

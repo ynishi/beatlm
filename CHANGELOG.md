@@ -15,6 +15,10 @@ and this project adheres to
 - `beatlm-core` timing domain: frame budgets, a measurement-fed cost model,
   delivery promises (fixed latency, same frame, on beat) and a scheduler that
   delivers results exactly on their promised frame or reports the miss.
+- `beatlm::gpu::SliceTimer`: GPU time per compute and render pass from
+  timestamp queries, read back without blocking the frame loop.
+- `beatlm-bench`: a headless synthetic-load benchmark of the fixed-latency
+  promise, with its first baseline recorded in the crate docs.
 
 ### Changed
 

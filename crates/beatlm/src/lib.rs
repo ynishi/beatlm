@@ -16,7 +16,7 @@
 //! | Outside | Translated into | Why the translation is here |
 //! |---|---|---|
 //! | wgpu adapter limits and features | a device profile of plain values | the core plans memory and picks kernel variants from values, so it never depends on a wgpu version |
-//! | GPU timestamp queries | measured durations | the core's cost model is fed measurements, and only measurements |
+//! | GPU timestamp queries | measured durations ([`gpu`]) | the core's cost model is fed measurements, and only measurements |
 //! | model files (safetensors first) | a graph of tensors and operations | weight formats change and multiply; the graph does not |
 //! | kernel IR | WGSL text, validated by naga | browsers accept only WGSL, and generated text can be read, diffed and checked by naga's parser |
 //!
@@ -67,8 +67,28 @@
 //! holds on native and on wasm. The choice and the numbers that made it replace
 //! this section. Whichever wins, [`beatlm_core`] is unaffected: it takes time
 //! and measurements as arguments and has no concurrency model of its own.
+//!
+//! Baseline for the first candidate, measured with `beatlm-bench` (synchronous
+//! `tick`, latency 2, four synthetic slices of about 1 ms and a synthetic
+//! render of about 2 ms per frame, 600 frames at 60 Hz) on an Apple M1 Pro,
+//! Metal, two runs on 2026-10-21:
+//!
+//! | | run 1 | run 2 |
+//! |---|---|---|
+//! | deliveries at a latency other than 2 | 0 | 0 |
+//! | missed deadlines | 0 | 0 |
+//! | frame start to submit, p50 / p99 / max | 0.64 / 7.7 / 14.8 ms | 0.77 / 2.6 / 8.9 ms |
+//! | GPU time per frame, p50 / p99 / max | 6.8 / 12.6 / 14.4 ms | 7.0 / 11.7 / 12.3 ms |
+//!
+//! The promise held in both runs: every result arrived exactly two frames
+//! after its input. The CPU side is what the other candidates have to beat:
+//! the median is under a millisecond, but the 99th percentile moved from 2.6
+//! to 7.7 ms between two identical runs — up to half a frame spent before
+//! anything reaches the GPU, and not stable enough to plan against.
 
 // Also set as a workspace lint; see the same attribute in `beatlm-core`.
 #![warn(missing_docs)]
+
+pub mod gpu;
 
 pub use beatlm_core;
