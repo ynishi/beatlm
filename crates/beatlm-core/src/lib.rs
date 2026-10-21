@@ -60,7 +60,9 @@
 //! A promise that cannot be kept is reported, never stretched: the host is told
 //! the deadline was missed and what to show instead ([`sync::MissPolicy`]). A
 //! job that can no longer make its deadline is given up as soon as the
-//! scheduler expects it, so its GPU time goes to the jobs behind it.
+//! scheduler expects it when jobs wait behind it, so its GPU time goes to
+//! them; with none behind it, it runs what its frames hold until its deadline,
+//! so its slices go on being measured.
 //!
 //! ## Rules
 //!
@@ -76,7 +78,7 @@
 //! | A frame's budget is its period minus measured render time minus a margin, never negative. | [`budget::Budget::for_frame`] |
 //! | Work on frames not yet planned is projected one way: pending jobs' remaining slices in submission order, a frame filled until a slice does not fit, the planned frame at its own budget and later frames at the budget the host expects. | [`schedule`](schedule#projecting-the-queue-onto-frames-to-come) (the expected budget set by [`schedule::Scheduler::set_expected_budget`]) |
 //! | An on-beat deadline is the first beat at or after the job's projected finish plus margin, after the work kept ahead of it; it is fixed at submission, and neither a later budget nor a tempo change moves it. | [`schedule::Scheduler::submit`] |
-//! | A job projected to finish after the frame that keeps its deadline gets no more slices and is reported missed in that plan, so the jobs behind it are not held up. | [`schedule::Scheduler::plan_frame`] |
+//! | A job projected to finish after the frame that keeps its deadline, with a job waiting behind it, gets no more slices and is reported missed in that plan, so the jobs behind it are not held up; with none behind it, it is kept, runs what the planned frame's budget holds and is decided by the frame that keeps its deadline, so its slices are still measured. | [`schedule::Scheduler::plan_frame`] ([`schedule`](schedule#a-job-that-cannot-make-its-deadline) says why) |
 //! | A missed deadline is always reported, no later than the frame its deadline arrives with, with the deadline it is for and the policy that says what to show. | [`schedule::Scheduler::plan_frame`] |
 //! | A beat comes from the grid in effect at that beat; a grid put in effect from an instant governs the beats from that instant on. | [`time::BeatMap`] (changed through [`schedule::Scheduler::replace_beat_grid`]) |
 //! | Cost estimates change only through measurements. | [`cost::CostModel::record`] |

@@ -249,7 +249,8 @@ pub struct Facts {
 /// criterion it failed, or `not tested: ` with why the run cannot say.
 ///
 /// A `no` for delivery also says, from this run's diagnosis, how many misses
-/// were jobs abandoned before their first slice and what a job was estimated
+/// were jobs abandoned before their first slice (none, since #41, for a job
+/// with nothing behind it) and what a job was estimated
 /// at when the loop began and ended against what a whole run measured: the
 /// facts the crate documentation ("What a browser run measured") reads the
 /// 120 Hz result from.
@@ -297,17 +298,18 @@ pub fn native_default(facts: &Facts) -> String {
     let rate = facts.delivered as f64 / deadlines as f64;
     if rate < DELIVERY_FLOOR {
         failed.push(format!("delivery_rate {rate:.4} is below {DELIVERY_FLOOR}"));
-        if facts.unstarted > 0 {
-            let run = facts
-                .run_us
-                .map_or_else(|| "unmeasured".to_owned(), |us| format!("{us} us"));
-            failed.push(format!(
-                "{} of {} misses were jobs abandoned before their first slice; a job was \
-                 estimated at {} us when the loop began and {} us when it ended, against a \
-                 whole run of {run} in calibration",
-                facts.unstarted, facts.missed, facts.job_estimate_us.0, facts.job_estimate_us.1
-            ));
-        }
+        // Since #41 a job of the `--submit free` admission is no longer
+        // abandoned before its first slice, so its misses are at the deadline
+        // and `unstarted` is 0: the estimates are said either way.
+        let run = facts
+            .run_us
+            .map_or_else(|| "unmeasured".to_owned(), |us| format!("{us} us"));
+        failed.push(format!(
+            "{} of {} misses were jobs abandoned before their first slice; a job was \
+             estimated at {} us when the loop began and {} us when it ended, against a \
+             whole run of {run} in calibration",
+            facts.unstarted, facts.missed, facts.job_estimate_us.0, facts.job_estimate_us.1
+        ));
     }
     if failed.is_empty() {
         "yes".to_owned()
@@ -424,6 +426,12 @@ mod tests {
         assert!(said.starts_with("no: gpu_frame_us p99 8400"), "{said}");
         assert!(said.contains("2 latency violations"), "{said}");
         assert!(said.contains("delivery_rate 0.9700"), "{said}");
+        // Missed at the deadline, none abandoned before it started: the
+        // estimates are still said.
+        assert!(
+            said.contains("0 of 3 misses were jobs abandoned before their first slice"),
+            "{said}"
+        );
         let starved = Facts {
             delivered: 31,
             missed: 2_561,

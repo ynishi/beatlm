@@ -102,10 +102,10 @@
 //!    render pass, each kernel's median over the second half decides how it is
 //!    split for [`depth::MAX_DISPATCH_US`] (the core's
 //!    `Program::parts_within`), and the split program is run the same way into
-//!    the cost model the loop starts from. Without it the loop could not start:
-//!    every slice would be estimated at the 2 ms prior, every job projected
-//!    past its deadline and abandoned before a slice of it ran, and no slice
-//!    would ever be measured. Each calibration frame starts at an animation
+//!    the cost model the loop starts from. Without it every slice would start
+//!    at the 2 ms prior, every job would be projected past its deadline, and
+//!    only the slices the loop's jobs ran could bring the estimates down.
+//!    Each calibration frame starts at an animation
 //!    frame, and the next at the first animation frame after its timings came
 //!    back, where the bench waits on the device. It needs timestamp queries,
 //!    and the run fails without them.
@@ -172,15 +172,18 @@
 //! p50), and a frame's budget for slices is about 4.3 ms at 120 Hz (8.3 ms
 //! less a 1.9 ms render and the 2 ms margin), against 12.6 ms on the bench's
 //! 60 Hz grid. What the diagnosis lines of the second run say is in
-//! [`diagnosis`] ("What it found in Chrome"): almost every miss was a job
-//! abandoned before its first slice, refused because its estimate, which had
-//! climbed during the loop from 34 ms to 102 ms, projected past its deadline,
-//! while the GPU sat idle. Why the estimates climb is open, and belongs to the
-//! core's cost model and scheduler rather than to this page, which does not
-//! change the scheduling for it. A `no` from `native_default_holds` is
-//! therefore a measurement of this configuration, not a fault the page is
-//! known to have; the line says which criteria failed and, for delivery, the
-//! run's own abandoned jobs and estimates.
+//! [`diagnosis`] ("What it found in Chrome, before #41"): almost every miss
+//! was a job abandoned before its first slice, refused because its estimate,
+//! which had climbed during the loop from 34 ms to 102 ms, projected past its
+//! deadline, while the GPU sat idle. These runs are of the scheduler before
+//! #41, which abandoned such a job even with none behind it, so its slices
+//! were never measured and the estimates could not come down; the core keeps
+//! such a job since ([`diagnosis`] says what that changes here). Why the
+//! estimates climb belongs to the core's cost model and scheduler rather than
+//! to this page, which does not change the scheduling for it. A `no` from
+//! `native_default_holds` is therefore a measurement of this configuration,
+//! not a fault the page is known to have; the line says which criteria failed
+//! and, for delivery, the run's own abandoned jobs and estimates.
 //!
 //! # The host's side of a frame, in a browser
 //!
