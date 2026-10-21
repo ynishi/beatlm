@@ -39,9 +39,10 @@ const W: TensorId = TensorId::new(1);
 const B: TensorId = TensorId::new(2);
 
 /// Part counts each operation is split into: whole, counts that do and do not
-/// divide the kernels' extents, the 86 tile rows of 1370 query rows, and a
-/// count past what the tiled kernels allow, which clamps.
-const PARTS: [u32; 5] = [1, 3, 7, 86, 200];
+/// divide the kernels' extents, the 22 tile rows of 64 of 1370 query rows
+/// (one part per tile row), and a count past what the tiled kernels allow,
+/// which clamps.
+const PARTS: [u32; 5] = [1, 3, 7, 22, 200];
 
 /// `graph` on the GPU against the reference, fused and unfused, whole and in
 /// each of [`PARTS`].
@@ -296,7 +297,7 @@ fn one_encoder_block_with_random_weights_matches_the_reference_block() {
         (Fusion::On, 1),
         (Fusion::Off, 1),
         (Fusion::On, 3),
-        (Fusion::On, 86),
+        (Fusion::On, 22),
     ] {
         let got = run_on_gpu(&device, &queue, &g, fusion, parts, &values);
         assert_close(

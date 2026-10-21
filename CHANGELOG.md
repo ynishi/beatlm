@@ -81,3 +81,7 @@ and this project adheres to
 - `beatlm-bench --workload net` runs generated kernels; the hand-written
   `net.wgsl` is gone, and the network gained biases, a ReLU, a GELU, a
   residual add and a scale for fusion to absorb.
+- Matrix products and 3x3 convolutions use a register-tiled kernel (64x64 or
+  64x32 outputs per workgroup, 4x4 per invocation); the 3x3 convolution is an
+  implicit GEMM. Splits fall on 64-row boundaries. Depth Anything V2 Small
+  runs about four times faster with unchanged results.

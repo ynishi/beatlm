@@ -609,9 +609,10 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     // Shapes that are not multiples of any tile or workgroup size, so the
-    // kernels' bounds handling is exercised.
-    const SMALL_H: u32 = 7;
-    const SMALL_W: u32 = 9;
+    // kernels' bounds handling is exercised, and of more than four tile rows of
+    // pixels, so a tiled kernel splits into four parts.
+    const SMALL_H: u32 = 17;
+    const SMALL_W: u32 = 19;
 
     const KX: TensorId = TensorId::new(0);
     const KW: TensorId = TensorId::new(1);
