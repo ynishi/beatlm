@@ -32,6 +32,16 @@ and this project adheres to
   capped deviation.
 - `beatlm-bench --estimator`, `--background-load`, and the `delivery_rate`
   and `gpu_frames_over_period` report lines.
+- `beatlm-core::kernel`: a typed kernel IR (convolution, layer norm, matrix
+  multiply and element-wise operations), lowering with epilogue fusion that
+  can be switched off, kernel specs checked against a device profile with a
+  baseline variant, and tensor lifetimes for the memory plan derived from the
+  kernels.
+- `beatlm::codegen`: WGSL generated from kernel specs and validated by naga
+  before a pipeline is created, and `Kernels`, every pipeline and bind group of
+  a program created once.
+- `beatlm-bench --fusion on|off` and `--dump-wgsl`, and the
+  `dispatches_per_job`, `dispatches_per_frame` and `kernels` report lines.
 
 ### Changed
 
@@ -42,3 +52,6 @@ and this project adheres to
   longer given to a later job's slice, because jobs share one memory plan.
 - `CostModel::new` takes an `Estimator`; the default is the 0.9 quantile of
   the last 32 measurements, chosen by measurement (breaking).
+- `beatlm-bench --workload net` runs generated kernels; the hand-written
+  `net.wgsl` is gone, and the network gained biases, a ReLU, a GELU, a
+  residual add and a scale for fusion to absorb.
