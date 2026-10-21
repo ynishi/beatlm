@@ -1,6 +1,11 @@
 //! Order statistics and histograms over the samples a run collects.
+//!
+//! The browser host (`beatlm-web`) compiles this file by path, so its report
+//! and its calibration quote the same statistics as the bench's.
 
 use std::collections::BTreeMap;
+
+use beatlm_core::time::Micros;
 
 /// The median, the 99th percentile and the maximum of a set of samples.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +40,17 @@ fn nearest_rank(sorted: &[u64], percent: usize) -> Option<u64> {
     }
     let rank = (sorted.len() * percent).div_ceil(100).max(1);
     sorted.get(rank - 1).copied()
+}
+
+/// The middle of `samples` once sorted, the upper one when there are two;
+/// `None` when there are none.
+///
+/// It is the statistic calibration's decision reads (`calibrate.rs`): it
+/// ignores a few slow frames at either end without a window, a deviation or a
+/// quantile to choose.
+pub fn median(samples: &mut [u64]) -> Option<Micros> {
+    samples.sort_unstable();
+    samples.get(samples.len() / 2).copied().map(Micros::new)
 }
 
 /// How many times each value occurs, in ascending value order.
@@ -73,6 +89,22 @@ mod tests {
     fn small_sets_round_the_rank_up() {
         let s = summarize(&[10, 20, 30]).unwrap();
         assert_eq!((s.p50, s.p99, s.max), (20, 30, 30));
+    }
+
+    #[test]
+    fn the_median_is_the_middle_sample_and_the_upper_of_two() {
+        assert_eq!(median(&mut []), None);
+        assert_eq!(median(&mut [7]), Some(Micros::new(7)));
+        assert_eq!(median(&mut [9, 1, 5]), Some(Micros::new(5)));
+        assert_eq!(median(&mut [4, 1, 3, 2]), Some(Micros::new(3)));
+    }
+
+    #[test]
+    fn the_median_ignores_slow_frames_that_move_a_mean() {
+        // Three early under-clocked frames and one slow one among 28 steady.
+        let mut samples = vec![1_000; 28];
+        samples.extend([9_000, 9_000, 9_000, 20_000]);
+        assert_eq!(median(&mut samples), Some(Micros::new(1_000)));
     }
 
     #[test]

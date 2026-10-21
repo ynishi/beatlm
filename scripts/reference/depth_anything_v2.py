@@ -43,8 +43,9 @@ from them and stay under `models/`, which is not committed.
 Input. A tensor of shape (1, 3, N, N), N the size (518 by default), that is
 already in the model's input space, defined by a formula that needs no random
 numbers, no image file and no transcendental function, so Rust computes the
-same bits (the same formula is `reference_input` in
-`crates/beatlm/tests/depth_anything_v2.rs`, and a test compares the two). For
+same bits (the same formula is `input` in
+`crates/beatlm/src/load/depth_anything_v2/reference.rs`, and a test compares
+the two). For
 channel c, row y and column x, with the integer level
 
     c = 0:  level = x * 255 // (N - 1)              (horizontal ramp)

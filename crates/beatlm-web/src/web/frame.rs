@@ -12,40 +12,44 @@
 //! one clock and need no frame time.
 //!
 //! The frame's work is the bench's synchronous `tick` (`beatlm-bench`'s
-//! `engine.rs`) for the synthetic workload: the same budget and forecast, the
-//! same scheduler and cost model, one timed compute pass per slice handed out
-//! and one timed render pass; the crate documentation says what differs and
-//! why.
+//! `engine.rs`): the same budget and forecast, the same scheduler and cost
+//! model, one timed compute pass per slice handed out and one timed render
+//! pass; the crate documentation says what differs and why. The job is the
+//! synthetic one or the depth model ([`Load`]). The depth model's slices are
+//! its kernels' parts on the slot of their job, a frame submits its input only
+//! when the job before it has had all its slices (the bench's `--submit free`,
+//! its default for the depth workload), and the render pass is the display,
+//! showing the result the frame delivers or, under the miss policy, the last
+//! one delivered.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use beatlm::gpu::{FrameTiming, MAX_SLICES, SliceTimer};
 use beatlm_core::budget::Budget;
 use beatlm_core::cost::{CostModel, Estimator, SliceId};
-use beatlm_core::schedule::{FramePlan, JobId, Scheduler};
+use beatlm_core::schedule::{Due, FramePlan, JobId, Scheduler, SliceRun};
 use beatlm_core::sync::{MissPolicy, SyncPolicy};
 use beatlm_core::time::{FrameIndex, FrameInfo, Micros, TimePoint};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
 
 use super::device::{self, Gpu};
+use super::display::Display;
 use super::page;
 use crate::config::{Config, MARGIN_US, SLICES};
+use crate::depth::still_busy;
+use crate::diagnosis::{self, Reason, Unstarted};
 use crate::pace::{FrameStart, NOMINAL_PERIOD, Pace, Pacer, ms_to_us};
-use crate::report::{Environment, Outcome, STARTUP_FRAMES, render};
+use crate::render_cost::{RENDER_PRIOR, RenderCost};
+use crate::report::{DepthReport, Environment, Outcome, STARTUP_FRAMES, render};
+use crate::slots::Net;
 use crate::workload::Workload;
 
 /// What a slice is assumed to cost until it has been measured: the bench's.
-const SLICE_PRIOR: Micros = Micros::new(2_000);
-/// What the render pass is assumed to cost until it has been measured: the
-/// bench's.
-const RENDER_PRIOR: Micros = Micros::new(2_000);
-/// How many recent render measurements the budget forecast takes its median
-/// over: the bench's, the window of the cost model's default estimate.
-const RENDER_WINDOW: usize = 32;
+pub(super) const SLICE_PRIOR: Micros = Micros::new(2_000);
 /// How long after the last frame the host waits for timings still in flight
 /// before it reports without them, in microseconds: a second, whatever the
 /// display's rate. The bench blocks on the device instead, which a page
@@ -61,18 +65,60 @@ enum Turn {
     Finished,
 }
 
+/// The job each frame submits.
+pub enum Load {
+    /// The bench's synthetic slices and render pass.
+    Synthetic,
+    /// The depth model, realised and calibrated.
+    Depth(Box<DepthLoad>),
+}
+
+/// The depth model as the loop runs it.
+pub struct DepthLoad {
+    /// The split program, with one slot per job that can be in flight.
+    pub net: Net,
+    /// The render pass that shows a slot's input and depth.
+    pub display: Display,
+    /// The cost model calibration measured the parts into.
+    pub cost: CostModel,
+    /// What the setup measured, for the report.
+    pub report: DepthReport,
+}
+
+/// What a run is, past the device and the load.
+pub struct Run {
+    /// Frame indices to run.
+    pub frames: u64,
+    /// The promised latency in frames.
+    pub latency: u32,
+    /// The latency `latency_ms` asked for, when it was asked in time.
+    pub asked: Option<Micros>,
+    /// The display's period measured before the run, when it was: the period
+    /// a latency in time was turned into frames at, and the pacer's prior.
+    pub period: Option<Micros>,
+    /// The job.
+    pub load: Load,
+}
+
 /// The run: the device, the load, the decisions and what was measured.
 pub struct Host {
     gpu: Gpu,
     workload: Workload,
+    load: Load,
+    /// The depth model's job submitted last, with its slices not yet handed
+    /// out, while it has some and has not left the scheduler: a frame submits
+    /// no input while there is one.
+    busy: Option<(JobId, usize)>,
+    /// The slot whose depth the display shows: the last one delivered.
+    shown: Option<u32>,
+    asked: Option<Micros>,
+    period: Option<Micros>,
     /// `None` when the device has no timestamp queries.
     timer: Option<SliceTimer<Tag>>,
     scheduler: Scheduler,
     cost: CostModel,
-    render_estimate: Micros,
-    /// The most recent render measurements, at most [`RENDER_WINDOW`], whose
-    /// median forecasts the frames to come.
-    render_recent: VecDeque<Micros>,
+    /// The render's measurements, which set the budgets.
+    render: RenderCost,
     slices: Vec<SliceId>,
     margin: Micros,
     latency: u32,
@@ -83,10 +129,12 @@ pub struct Host {
     /// When the first callback after the last frame began, in microseconds.
     drain_from_us: Option<u64>,
     outcome: Outcome,
+    /// The index of the frame last run, which timings are collected against.
+    current_frame: u64,
 }
 
 impl Host {
-    /// Builds the run's timer, scheduler and cost model for `config` on `gpu`,
+    /// Builds the run's timer, scheduler and cost model for `run` on `gpu`,
     /// which `workload` was built on.
     ///
     /// # Errors
@@ -94,21 +142,38 @@ impl Host {
     /// A device with timestamp queries and a latency whose jobs in flight
     /// have more slices than the timer can time, a timer or cost model that
     /// cannot be built, or a page without `performance`.
-    pub fn new(gpu: Gpu, workload: Workload, config: &Config) -> Result<Self> {
-        let timer = if gpu.timestamp_query {
+    pub fn new(gpu: Gpu, workload: Workload, mut run: Run) -> Result<Self> {
+        let (slices, jobs, cost) = match &mut run.load {
             // Every frame submits a job, and a job lives `latency` frames past
             // its submission, so `latency + 1` jobs can have slices left in a
             // frame.
-            let capacity = config
-                .latency
-                .checked_add(1)
-                .and_then(|jobs| jobs.checked_mul(SLICES))
+            Load::Synthetic => (
+                SLICES,
+                run.latency.checked_add(1),
+                CostModel::new(SLICE_PRIOR, Estimator::default())
+                    .context("cannot build the cost model")?,
+            ),
+            // A frame submits only once the job before has had its slices, so
+            // one job at a time has slices left.
+            Load::Depth(depth) => (
+                depth.net.kernel_count(),
+                Some(1),
+                std::mem::replace(
+                    &mut depth.cost,
+                    CostModel::new(SLICE_PRIOR, Estimator::default())
+                        .context("cannot build the cost model")?,
+                ),
+            ),
+        };
+        let timer = if gpu.timestamp_query {
+            let capacity = jobs
+                .and_then(|jobs| jobs.checked_mul(slices))
                 .filter(|&capacity| capacity <= MAX_SLICES)
                 .with_context(|| {
                     format!(
-                        "{SLICES} slices for each of the latency + 1 jobs in flight at latency \
-                         {} are more than the GPU timer can time ({MAX_SLICES})",
-                        config.latency
+                        "{slices} slices for each of the jobs with slices left at latency {} \
+                         are more than the GPU timer can time ({MAX_SLICES})",
+                        run.latency
                     )
                 })?;
             Some(
@@ -119,37 +184,43 @@ impl Host {
             None
         };
         let margin = Micros::new(MARGIN_US);
+        let prior = run.period.unwrap_or(NOMINAL_PERIOD);
         let scheduler = Scheduler::new(
             SyncPolicy::FixedLatency {
-                frames: config.latency,
+                frames: run.latency,
             },
             MissPolicy::HoldPrevious,
-            // Before the display's period is known, the nominal one; every
-            // frame sets its own budget from the period measured by then.
-            Budget::for_frame(NOMINAL_PERIOD, RENDER_PRIOR, margin),
+            // Before the display's period is known, the prior; every frame
+            // sets its own budget from the period measured by then.
+            Budget::for_frame(prior, RENDER_PRIOR, margin),
         );
-        let cost = CostModel::new(SLICE_PRIOR, Estimator::default())
-            .context("cannot build the cost model")?;
         let performance = page::window()?
             .performance()
             .context("the window has no performance clock")?;
-        Ok(Self {
+        let mut host = Self {
             gpu,
             workload,
+            load: run.load,
+            busy: None,
+            shown: None,
+            asked: run.asked,
+            period: run.period,
             timer,
             scheduler,
             cost,
-            render_estimate: RENDER_PRIOR,
-            render_recent: VecDeque::with_capacity(RENDER_WINDOW),
-            slices: (0..SLICES).map(SliceId::new).collect(),
+            render: RenderCost::default(),
+            slices: (0..slices).map(SliceId::new).collect(),
             margin,
-            latency: config.latency,
+            latency: run.latency,
             job_dispatches: BTreeMap::new(),
-            pacer: Pacer::new(config.frames),
+            pacer: Pacer::with_prior(run.frames, prior),
             performance,
             drain_from_us: None,
             outcome: Outcome::default(),
-        })
+            current_frame: 0,
+        };
+        host.outcome.diagnosis.job_estimate_us.0 = host.job_estimate();
+        Ok(host)
     }
 
     /// One animation-frame callback, which is one frame, and once the frames
@@ -198,13 +269,30 @@ impl Host {
         // display's period; the frames to come are forecast from the median of
         // the recent renders, as the bench does and for its reason
         // (`Scheduler::set_expected_budget`), at the same period.
-        let budget = Budget::for_frame(start.period, self.render_estimate, self.margin);
-        let forecast = Budget::for_frame(start.period, self.render_forecast(), self.margin);
+        let budget = self.render.budget(start.period, self.margin);
+        let forecast = self.render.expected(start.period, self.margin);
         self.scheduler.set_expected_budget(forecast);
-        self.scheduler
-            .submit(frame, self.slices.clone(), &self.cost)
-            .context("the scheduler rejected the frame's job")?;
+        let takes_input = match self.load {
+            Load::Synthetic => true,
+            Load::Depth(_) => self.busy.is_none(),
+        };
+        let new_job = if takes_input {
+            let job = self
+                .scheduler
+                .submit(frame, self.slices.clone(), &self.cost)
+                .context("the scheduler rejected the frame's job")?;
+            Some(job)
+        } else {
+            None
+        };
         let plan = self.scheduler.plan_frame(frame, budget, &self.cost);
+        self.current_frame = start.index;
+        // The render pass shows what this frame delivers.
+        if let Load::Depth(depth) = &self.load {
+            for delivery in &plan.delivered {
+                self.shown = Some(depth.net.slot_of(delivery.job.get()));
+            }
+        }
 
         let encoding = self.performance.now();
         let mut encoder = self
@@ -230,20 +318,34 @@ impl Host {
                 let mut timestamps = timer.begin_frame(frame.index);
                 for run in &plan.runs {
                     let writes = timestamps.compute_pass((run.job, run.slice))?;
-                    self.workload.encode_slice(&mut encoder, writes);
+                    encode_slice(&self.load, &self.workload, &mut encoder, run, writes)?;
                 }
                 if let Some(view) = &view {
-                    self.workload
-                        .encode_render(&mut encoder, view, timestamps.render_pass()?);
+                    let writes = timestamps.render_pass()?;
+                    encode_render(
+                        &self.load,
+                        &self.workload,
+                        self.shown,
+                        &mut encoder,
+                        view,
+                        writes,
+                    );
                 }
                 timestamps.resolve(&mut encoder);
             }
             None => {
-                for _ in &plan.runs {
-                    self.workload.encode_slice(&mut encoder, None);
+                for run in &plan.runs {
+                    encode_slice(&self.load, &self.workload, &mut encoder, run, None)?;
                 }
                 if let Some(view) = &view {
-                    self.workload.encode_render(&mut encoder, view, None);
+                    encode_render(
+                        &self.load,
+                        &self.workload,
+                        self.shown,
+                        &mut encoder,
+                        view,
+                        None,
+                    );
                 }
             }
         }
@@ -263,7 +365,20 @@ impl Host {
         self.outcome
             .dispatches_per_frame
             .push(plan.runs.len() as u64);
-        self.outcome.submitted += 1;
+        if new_job.is_some() {
+            self.outcome.submitted += 1;
+        }
+        if let Load::Depth(_) = self.load {
+            self.busy = still_busy(
+                self.busy,
+                new_job.map(|job| (job, self.slices.len())),
+                &plan,
+            );
+        }
+        // After the frame's CPU times are taken, so the diagnosis is not
+        // charged to `cpu_plan_us`, the bench's line; before the slices are
+        // counted, which it reads.
+        self.diagnose(start.index, &plan, budget.get(), forecast.get());
         for run in &plan.runs {
             *self.job_dispatches.entry(run.job.get()).or_default() += 1;
         }
@@ -291,20 +406,58 @@ impl Host {
             None => return,
         };
         for timing in ready {
+            let lag = self.current_frame.saturating_sub(timing.frame.get());
+            self.outcome.diagnosis.lag_frames.push(lag);
             self.absorb(timing);
         }
     }
 
-    /// The render time the frames to come are forecast with: the median of the
-    /// recent measurements (the upper one of an even count), or the prior
-    /// before any has arrived.
-    fn render_forecast(&self) -> Micros {
-        let mut recent: Vec<Micros> = self.render_recent.iter().copied().collect();
-        recent.sort_unstable();
-        recent
-            .get(recent.len() / 2)
-            .copied()
-            .unwrap_or(RENDER_PRIOR)
+    /// Records why the plan's misses were missed, what the projection read for
+    /// a job abandoned before it started, and which jobs started, before the
+    /// frame's slices are counted ([`crate::diagnosis`]).
+    fn diagnose(&mut self, index: u64, plan: &FramePlan, now: Micros, expected: Micros) {
+        for missed in &plan.missed {
+            let dispatched = self
+                .job_dispatches
+                .get(&missed.job.get())
+                .copied()
+                .unwrap_or(0);
+            let due = match missed.due {
+                Due::Frame(due) => due.get(),
+                Due::Beat(_) => index,
+            };
+            let reason = diagnosis::reason(dispatched, due, index);
+            self.outcome.diagnosis.missed(reason);
+            if reason == Reason::Unstarted {
+                let estimates: Vec<Micros> =
+                    self.slices.iter().map(|&s| self.cost.estimate(s)).collect();
+                self.outcome.diagnosis.abandoned.push(Unstarted {
+                    frame: index,
+                    now_us: now.get(),
+                    expected_us: expected.get(),
+                    largest_us: estimates.iter().map(|e| e.get()).max().unwrap_or(0),
+                    sum_us: estimates.iter().map(|e| e.get()).sum(),
+                    frames_left: due.saturating_sub(index),
+                    projected_end: diagnosis::project(&estimates, now, expected),
+                });
+            }
+        }
+        let mut started: Vec<u64> = Vec::new();
+        for run in &plan.runs {
+            let job = run.job.get();
+            if !self.job_dispatches.contains_key(&job) && !started.contains(&job) {
+                started.push(job);
+                self.outcome.diagnosis.starts.push(index);
+            }
+        }
+    }
+
+    /// The sum of every slice's estimate now.
+    fn job_estimate(&self) -> u64 {
+        self.slices
+            .iter()
+            .map(|&s| self.cost.estimate(s).get())
+            .sum()
     }
 
     /// Delivers the plan's results and counts its misses.
@@ -330,6 +483,12 @@ impl Host {
 
     /// Feeds one frame's measurements to the cost model and the report.
     fn absorb(&mut self, timing: FrameTiming<Tag>) {
+        let passes: Vec<(SliceId, Micros)> = timing
+            .compute
+            .iter()
+            .map(|&((_, slice), duration)| (slice, duration))
+            .collect();
+        self.outcome.diagnosis.passes(&passes);
         let mut gpu = Micros::ZERO;
         for ((_, slice), duration) in &timing.compute {
             self.cost.record(*slice, *duration);
@@ -342,11 +501,12 @@ impl Host {
             self.outcome.longest_dispatch_us.push(longest);
         }
         if let Some(render) = timing.render {
-            self.render_estimate = render;
-            if self.render_recent.len() == RENDER_WINDOW {
-                self.render_recent.pop_front();
+            self.render.record(render);
+            if timing.compute.is_empty() {
+                self.outcome.render_alone_us.push(render.get());
+            } else {
+                self.outcome.render_with_slices_us.push(render.get());
             }
-            self.render_recent.push_back(render);
             self.outcome
                 .gpu_frame_us
                 .push(gpu.saturating_add(render).get());
@@ -355,6 +515,15 @@ impl Host {
 
     /// Closes the run and returns what it measured.
     fn finish(mut self) -> Outcome {
+        self.outcome.diagnosis.job_estimate_us.1 = self.job_estimate();
+        self.outcome.latency = self.latency;
+        if let Some(asked) = self.asked {
+            self.outcome.latency_asked_us = Some(asked.get());
+            self.outcome.latency_period_us = self.period.map(Micros::get);
+        }
+        if let Load::Depth(depth) = self.load {
+            self.outcome.depth = Some(depth.report);
+        }
         self.outcome.dropped = self.pacer.dropped();
         self.outcome.lateness_us = self.pacer.lateness_us().to_vec();
         self.outcome.display_period_us = self.pacer.measured_period().map(Micros::get);
@@ -370,6 +539,49 @@ impl Host {
         }
         self.outcome.gpu_errors = device::gpu_errors();
         self.outcome
+    }
+}
+
+/// Records the slice `run` hands out as its own compute pass, and after a depth
+/// job's last slice, the copy of its depth the display draws.
+fn encode_slice(
+    load: &Load,
+    workload: &Workload,
+    encoder: &mut wgpu::CommandEncoder,
+    run: &SliceRun,
+    writes: Option<wgpu::ComputePassTimestampWrites<'_>>,
+) -> Result<()> {
+    match load {
+        Load::Synthetic => {
+            workload.encode_slice(encoder, writes);
+            Ok(())
+        }
+        Load::Depth(depth) => {
+            let slot = depth.net.slot_of(run.job.get());
+            depth.net.encode(encoder, slot, run.slice, writes)?;
+            // The job is complete: its depth goes to the display's own buffer,
+            // which no slice writes, so the render pass waits for none.
+            if run.slice.get().saturating_add(1) == depth.net.kernel_count() {
+                depth.display.keep(encoder, slot);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Records the frame's render pass into `view`: the synthetic one, or the
+/// display of slot `shown`.
+fn encode_render(
+    load: &Load,
+    workload: &Workload,
+    shown: Option<u32>,
+    encoder: &mut wgpu::CommandEncoder,
+    view: &wgpu::TextureView,
+    writes: Option<wgpu::RenderPassTimestampWrites<'_>>,
+) {
+    match load {
+        Load::Synthetic => workload.encode_render(encoder, view, writes),
+        Load::Depth(depth) => depth.display.encode(encoder, view, shown, writes),
     }
 }
 

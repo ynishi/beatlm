@@ -7,7 +7,7 @@ default:
     @just --list
 
 # Everything a change owes before it is handed over.
-check: rust-fmt-check rust-clippy rust-test rust-doc wasm-check deny
+check: rust-fmt-check rust-clippy rust-test rust-doc wasm-check scripts-test deny
 
 rust-fmt-check:
     cargo fmt --all -- --check
@@ -29,6 +29,11 @@ rust-doc:
 # Lints the umbrella and the browser host for wasm32-unknown-unknown.
 wasm-check:
     cargo clippy -p beatlm -p beatlm-web --target wasm32-unknown-unknown -- -D warnings
+
+# The scripts' own tests: what the local server maps a path to and what it
+# refuses. The standard library only; `-B` leaves no bytecode in the tree.
+scripts-test:
+    python3 -B -m unittest discover -s scripts -p "test_*.py"
 
 deny:
     cargo deny check
@@ -90,15 +95,22 @@ build-web:
     cp crates/beatlm-web/index.html {{web_out}}/index.html
     echo "build-web: wrote {{web_out}}; serve it with 'just serve-web'"
 
-# A plain static server is enough: the host uses no threads and no shared
-# memory, so the page needs no cross-origin isolation headers.
-# Serves the built page on 127.0.0.1 only.
+# One origin serves the page at / and the models directory at /models/, so the
+# page fetches the weights and references without copying them into
+# {{web_out}}. The models directory is BEATLM_MODELS_DIR, or models/ at the
+# workspace root: the rule the native tests read it by, so a worktree points
+# the variable at the main checkout's. Without it the synthetic workload still
+# runs. scripts/serve_web.py says what it refuses (traversal, listings, any
+# method but GET and HEAD) and why a plain static server is enough.
+# Serves the built page and the models directory on 127.0.0.1 only.
 serve-web port="8000":
     #!/usr/bin/env bash
     set -euo pipefail
     test -f {{web_out}}/index.html || { echo "serve-web: nothing in {{web_out}}; run 'just build-web'" >&2; exit 1; }
-    echo "serve-web: open http://127.0.0.1:{{port}}/?frames=600&latency=2"
-    python3 -m http.server {{port}} --bind 127.0.0.1 --directory {{web_out}}
+    models="${BEATLM_MODELS_DIR:-models}"
+    echo "serve-web: open http://127.0.0.1:{{port}}/?frames=600&latency=2 (synthetic)"
+    echo "serve-web:   or http://127.0.0.1:{{port}}/?model=depth&side=266 (Depth Anything V2 Small)"
+    exec python3 scripts/serve_web.py --port {{port}} --page {{web_out}} --models "$models"
 
 # One worktree per issue, cut from a freshly fetched origin/main.
 worktree-new type slug:

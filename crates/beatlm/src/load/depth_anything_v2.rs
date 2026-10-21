@@ -60,6 +60,8 @@
 //! (`out_indices`) are not checked by that test, and the reference script
 //! checks `out_indices` against `config.json` when it runs.
 
+pub mod reference;
+
 use thiserror::Error;
 
 use super::error::LoadError;

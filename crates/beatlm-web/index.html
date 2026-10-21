@@ -3,6 +3,12 @@
   The page `just build-web` serves beside the module. The module finds the
   canvas and the report by their ids and writes the report as plain text, one
   `name: value` fact per line, ending with `status: done` or `status: failed`.
+  The query string chooses the run: `frames`, `model` (synthetic or depth),
+  `side`, `latency` in frames or `latency_ms` in time, and `arena_bytes`; the
+  crate documentation of beatlm-web (`cargo doc -p beatlm-web`) says what each
+  does. With `model=depth` the module fetches the weights and the references
+  from `models/`, which `just serve-web` maps to the models directory; nothing
+  of the model is in the build output.
 -->
 <html lang="en">
 <head>

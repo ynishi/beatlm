@@ -52,6 +52,7 @@ use crate::device::Gpu;
 use crate::engine::{COST_WINDOW, timer_capacity};
 use crate::net::{Net, Numbers};
 use crate::pace::Pacer;
+use crate::stats::median;
 use crate::workload::Workload;
 
 /// Timed frames of whole jobs in each calibration pass, after one untimed
@@ -88,16 +89,6 @@ pub struct Calibration {
     /// The cost model pass 2 measured the split program's parts into: slice
     /// `i` is part `i` of `program`.
     pub cost: CostModel,
-}
-
-/// The middle of `samples` once sorted, the upper one when there are two;
-/// `None` when there are none.
-///
-/// It is the statistic the decision reads: it ignores a few slow frames at
-/// either end without a window, a deviation or a quantile to choose.
-pub fn median(samples: &mut [u64]) -> Option<Micros> {
-    samples.sort_unstable();
-    samples.get(samples.len() / 2).copied().map(Micros::new)
 }
 
 /// Measures each kernel of `whole`, the network or model lowered and not
@@ -264,25 +255,4 @@ fn measure(
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_median_is_the_middle_sample_and_the_upper_of_two() {
-        assert_eq!(median(&mut []), None);
-        assert_eq!(median(&mut [7]), Some(Micros::new(7)));
-        assert_eq!(median(&mut [9, 1, 5]), Some(Micros::new(5)));
-        assert_eq!(median(&mut [4, 1, 3, 2]), Some(Micros::new(3)));
-    }
-
-    #[test]
-    fn the_median_ignores_slow_frames_that_move_a_mean() {
-        // Three early under-clocked frames and one slow one among 28 steady.
-        let mut samples = vec![1_000; 28];
-        samples.extend([9_000, 9_000, 9_000, 20_000]);
-        assert_eq!(median(&mut samples), Some(Micros::new(1_000)));
-    }
 }

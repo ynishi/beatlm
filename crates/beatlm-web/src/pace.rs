@@ -25,7 +25,11 @@
 //!   carry the host's jitter rather than the display's cadence.
 //! - **Its period is measured from the display**: the median of the last
 //!   [`WINDOW`] per-period intervals, once [`MIN_INTERVALS`] of them exist, and
-//!   [`NOMINAL_PERIOD`] (60 Hz, the bench's) before that. Each callback's gap
+//!   the prior before that: [`NOMINAL_PERIOD`] (60 Hz, the bench's), or the
+//!   period a pacer of its own measured before the run, when the host measured
+//!   one ([`Pacer::with_prior`]). A host that knows the display's period gives
+//!   it, so the first frames of a 120 Hz run are not budgeted for 60 Hz and
+//!   overrun their period while the window fills. Each callback's gap
 //!   since the previous one is divided by the number of periods it counts as
 //!   (the next bullet), and that quotient, in whole microseconds, is the
 //!   window's one sample for the gap. With `n` samples sorted ascending the
@@ -39,8 +43,9 @@
 //!   than half of a window as a display of twice the period, and the budget
 //!   would follow it. And it is a median, and not a low quantile, because the
 //!   timestamps jitter. The nearest-rank 10th percentile of the raw gaps was
-//!   the rule first, and it read 7,700 µs on Chrome 154 on an Apple M1 Pro
-//!   adapter driving a 120 Hz display (2026-10-22, `?frames=3000&latency=2`),
+//!   the rule first, and it read 7,700 µs on Chrome 154 (WebGPU) on an Apple
+//!   M1 Pro adapter driving a 120 Hz display (2026-10-22, synthetic workload,
+//!   `?frames=3000&latency=2`),
 //!   where the callback intervals were p50 8,300 µs and p99 9,400 µs: the
 //!   timestamps jitter by about ±0.6 ms, so the short end of a window is the
 //!   jitter and not the display, 7% short. The budget shrank by the difference,
@@ -168,13 +173,28 @@ pub struct Pacer {
     recent: VecDeque<u64>,
     intervals_us: Vec<u64>,
     lateness_us: Vec<u64>,
+    /// The period frames are given before [`MIN_INTERVALS`] have been seen.
+    prior: Micros,
 }
 
 impl Pacer {
     /// A pacer for `frames` frame indices, whose time zero is the first
-    /// callback.
+    /// callback, with [`NOMINAL_PERIOD`] as its prior.
     #[must_use]
     pub fn new(frames: u64) -> Self {
+        Self::with_prior(frames, NOMINAL_PERIOD)
+    }
+
+    /// A pacer for `frames` frame indices whose frames are given `prior` until
+    /// the display's period has been measured: for a host that measured it
+    /// before the run, by this rule. A prior of zero is the nominal period.
+    #[must_use]
+    pub fn with_prior(frames: u64, prior: Micros) -> Self {
+        let prior = if prior == Micros::ZERO {
+            NOMINAL_PERIOD
+        } else {
+            prior
+        };
         Self {
             frames,
             first_us: None,
@@ -184,6 +204,7 @@ impl Pacer {
             recent: VecDeque::with_capacity(WINDOW),
             intervals_us: Vec::new(),
             lateness_us: Vec::new(),
+            prior,
         }
     }
 
@@ -237,11 +258,11 @@ impl Pacer {
         Pace::Frame(start)
     }
 
-    /// The period frames are given now: the measured one, or
-    /// [`NOMINAL_PERIOD`] before enough intervals have been seen.
+    /// The period frames are given now: the measured one, or the prior before
+    /// enough intervals have been seen.
     #[must_use]
     pub fn period(&self) -> Micros {
-        self.measured_period().unwrap_or(NOMINAL_PERIOD)
+        self.measured_period().unwrap_or(self.prior)
     }
 
     /// The display's period, the median of the recent per-period callback
@@ -721,6 +742,23 @@ mod tests {
             );
         }
         assert_eq!(pacer.dropped(), 0);
+    }
+
+    #[test]
+    fn a_measured_prior_gives_the_first_frames_the_displays_period() {
+        let mut pacer = Pacer::with_prior(100, Micros::new(8_333));
+        for (i, t) in display(120.0, MIN_INTERVALS as u64 + 4, 0)
+            .into_iter()
+            .enumerate()
+        {
+            let Pace::Frame(start) = pacer.frame_at(t) else {
+                panic!("expected a frame");
+            };
+            assert!(start.period.get().abs_diff(8_333) <= 1, "frame {i}");
+        }
+        assert_eq!(pacer.dropped(), 0);
+        assert_eq!(Pacer::with_prior(1, Micros::ZERO).period(), NOMINAL_PERIOD);
+        assert_eq!(Pacer::new(1).period(), NOMINAL_PERIOD);
     }
 
     #[test]

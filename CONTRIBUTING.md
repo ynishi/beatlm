@@ -115,23 +115,27 @@ crates.io, where a `just` recipe means nothing.
 
 ## Running in a browser
 
-The browser host, `beatlm-web`, runs the bench's synthetic workload from
-`requestAnimationFrame` on WebGPU and writes the bench's report into the page.
-In this order:
+The browser host, `beatlm-web`, runs the bench's synthetic workload or Depth
+Anything V2 Small from `requestAnimationFrame` on WebGPU and writes the bench's
+report into the page. In this order:
 
 ```bash
 just setup-web    # once: wasm-bindgen-cli at the version Cargo.lock pins, into cargo's bin
 just build-web    # release wasm build, glue and index.html into target/beatlm-web/
-just serve-web    # serves it on http://127.0.0.1:8000 (python3's http.server)
+just serve-web    # serves it, and the models directory under /models/, on http://127.0.0.1:8000
 ```
 
 Then open `http://127.0.0.1:8000/?frames=600&latency=2` in a browser with
-WebGPU. `build-web` refuses a `wasm-bindgen` command at any other version than
-the crate's, because the glue it generates must match the crate exactly. None
-of the three is part of `just check`, which lints the crate for
-`wasm32-unknown-unknown` without the command. The crate documentation
-(`cargo doc -p beatlm-web`) says what the page measures and what differs from
-a native run.
+WebGPU, or `http://127.0.0.1:8000/?model=depth&side=266` for the depth model,
+which needs the weights (`just setup-depth-anything`) and, for its check
+against the reference, `just reference-depth-anything 266`. `serve-web` reads
+the models directory by the tests' rule, `BEATLM_MODELS_DIR` or `models/`, so a
+worktree sets the variable. `build-web` refuses a `wasm-bindgen` command at any
+other version than the crate's, because the glue it generates must match the
+crate exactly. None of the three is part of `just check`, which lints the crate
+for `wasm32-unknown-unknown` without the command and tests the server's path
+mapping (`scripts-test`). The crate documentation (`cargo doc -p beatlm-web`)
+says what the page measures and what differs from a native run.
 
 ## Documentation
 

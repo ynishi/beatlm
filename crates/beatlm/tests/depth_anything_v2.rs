@@ -18,7 +18,10 @@
 //! `just reference-depth-anything` at [`NATIVE`], the side the position
 //! embedding is stored for, into `reference/`, and
 //! `just reference-depth-anything <side>` at any other multiple of 14 into
-//! `reference/<side>/`. The comparison at [`OTHER`] needs the second.
+//! `reference/<side>/`. The comparison at [`OTHER`] needs the second. The
+//! input's formula, the file layout, the error measures and the tolerances are
+//! `beatlm::load::depth_anything_v2::reference`'s, which the browser host
+//! checks a port with too.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::BTreeMap;
@@ -30,6 +33,10 @@ use beatlm::beatlm_core::memory::{MemoryPlan, TensorId};
 use beatlm::beatlm_core::time::FrameIndex;
 use beatlm::codegen::Kernels;
 use beatlm::gpu::{Arenas, SliceTimer};
+use beatlm::load::depth_anything_v2::reference::{
+    self, DEPTH_MAX_ERROR, DEPTH_MAX_RELATIVE_ERROR, DEPTH_MEAN_ERROR, DepthError,
+    FEATURE_MAX_ERROR, FEATURE_MEAN_ERROR, FeatureError, RELATIVE_FLOOR, floats,
+};
 use beatlm::load::depth_anything_v2::{Config, Role, inventory};
 use beatlm::load::{Archive, Inventory, read_file};
 use beatlm::model::Builder;
@@ -58,13 +65,7 @@ const PATCH: usize = 14;
 /// The channels of a feature.
 const HIDDEN: usize = 384;
 
-/// The channel means and standard deviations of the checkpoint's image
-/// processor (`preprocessor_config.json`), used to put the reference input in
-/// the space the model sees after preprocessing.
-const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
-const STD: [f32; 3] = [0.229, 0.224, 0.225];
-
-/// The model's directory: `depth-anything-v2-small` under `BEATLM_MODELS_DIR`,
+/// The model's directory: [`reference::MODEL_DIR`] under `BEATLM_MODELS_DIR`,
 /// or under the workspace's `models/` when the variable is unset.
 fn model_dir() -> PathBuf {
     std::env::var_os("BEATLM_MODELS_DIR")
@@ -72,27 +73,17 @@ fn model_dir() -> PathBuf {
             || Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models"),
             PathBuf::from,
         )
-        .join("depth-anything-v2-small")
+        .join(reference::MODEL_DIR)
 }
 
-/// Where the reference at `side` is: `reference/` at the stored side,
-/// `reference/<side>/` at any other.
+/// Where the reference at `side` is ([`reference::dir`]).
 fn reference_dir(side: usize) -> PathBuf {
-    let dir = model_dir().join("reference");
-    if side == NATIVE {
-        dir
-    } else {
-        dir.join(side.to_string())
-    }
+    model_dir().join(reference::dir(&Config::small(), side))
 }
 
 /// The recipe that writes the reference at `side`.
 fn reference_recipe(side: usize) -> String {
-    if side == NATIVE {
-        "reference-depth-anything".to_owned()
-    } else {
-        format!("reference-depth-anything {side}")
-    }
+    reference::recipe(&Config::small(), side)
 }
 
 /// Reads a file under `models/`, or fails naming the recipe that creates it.
@@ -105,86 +96,22 @@ fn read_or_explain(path: &Path, recipe: &str) -> Vec<u8> {
     })
 }
 
-/// The 8-bit level of one pixel of the reference image of `side` pixels,
-/// before normalisation.
-///
-/// Channel 0 is a horizontal ramp, channel 1 a vertical ramp, channel 2 a
-/// checkerboard of 37-pixel cells (14 of them across at 518 pixels), so the
-/// image has structure at every scale of the patch grid. Integer arithmetic
-/// only: a level is the same in any language.
-fn level(side: usize, channel: usize, y: usize, x: usize) -> u32 {
-    match channel {
-        0 => (x * 255 / (side - 1)) as u32,
-        1 => (y * 255 / (side - 1)) as u32,
-        _ => (((x / 37 + y / 37) % 2) * 255) as u32,
-    }
-}
-
-/// The reference input of `side` pixels, channel-first (`[1, 3, side, side]`,
-/// row-major).
-///
-/// Each value is `(level / 255 - mean) / std`, computed in single precision,
-/// one rounded operation after another in that order. Division, subtraction
-/// and conversion of a small integer are correctly rounded in IEEE 754 binary32,
-/// so the same sequence gives the same bits in NumPy float32, which is what
-/// `scripts/reference/depth_anything_v2.py` does. No random numbers, no
-/// transcendental functions, no image file.
-fn reference_input(side: usize) -> Vec<f32> {
-    let mut values = Vec::with_capacity(3 * side * side);
-    for channel in 0..3 {
-        for y in 0..side {
-            for x in 0..side {
-                let unit = level(side, channel, y, x) as f32 / 255.0f32;
-                values.push((unit - MEAN[channel]) / STD[channel]);
-            }
-        }
-    }
-    values
+/// The reference input of `side` pixels ([`reference::input`]) as the graph's
+/// NHWC image.
+fn reference_image(side: usize) -> Vec<f32> {
+    to_nhwc(&reference::input(side), side)
 }
 
 /// A channel-first image of `side` pixels as the graph's NHWC image.
 fn to_nhwc(nchw: &[f32], side: usize) -> Vec<f32> {
-    assert_eq!(nchw.len(), 3 * side * side);
-    let mut image = vec![0.0; nchw.len()];
-    for c in 0..3 {
-        for p in 0..side * side {
-            image[p * 3 + c] = nchw[c * side * side + p];
-        }
-    }
-    image
-}
-
-#[test]
-fn the_reference_input_formula_is_pinned() {
-    assert_eq!(level(NATIVE, 0, 5, 0), 0);
-    assert_eq!(level(NATIVE, 0, 5, 36), 17);
-    assert_eq!(level(NATIVE, 0, 5, 517), 255);
-    assert_eq!(level(NATIVE, 1, 517, 5), 255);
-    assert_eq!(level(NATIVE, 1, 36, 5), 17);
-    assert_eq!((level(NATIVE, 2, 0, 36), level(NATIVE, 2, 0, 37)), (0, 255));
-    assert_eq!(
-        (level(NATIVE, 2, 37, 37), level(NATIVE, 2, 37, 36)),
-        (0, 255)
-    );
-    // At another side the ramps span that side, and the cells stay 37 pixels.
-    assert_eq!(level(OTHER, 0, 5, OTHER - 1), 255);
-    assert_eq!(level(OTHER, 1, OTHER / 2, 5), 127);
-    assert_eq!((level(OTHER, 2, 0, 36), level(OTHER, 2, 0, 37)), (0, 255));
-
-    let input = reference_input(NATIVE);
-    assert_eq!(input.len(), 3 * NATIVE * NATIVE);
-    assert_eq!(input[0], (0.0f32 - 0.485f32) / 0.229f32);
-    assert_eq!(input[NATIVE - 1], (1.0f32 - 0.485f32) / 0.229f32);
-    let green_start = NATIVE * NATIVE;
-    assert_eq!(input[green_start], (0.0f32 - 0.456f32) / 0.224f32);
-    assert_eq!(reference_input(OTHER).len(), 3 * OTHER * OTHER);
+    reference::to_nhwc(nchw, side).expect("an image of three channels and `side` pixels")
 }
 
 #[test]
 #[ignore = "needs `just setup-depth-anything`"]
 fn the_inventory_matches_the_real_file_exactly() {
     let bytes = read_or_explain(
-        &model_dir().join("model.safetensors"),
+        &model_dir().join(reference::WEIGHTS_FILE),
         "setup-depth-anything",
     );
     let archive = Archive::parse(&bytes).expect("the downloaded file is a safetensors file");
@@ -201,18 +128,19 @@ fn the_inventory_matches_the_real_file_exactly() {
 /// bit for bit.
 fn assert_input_matches_the_formula(side: usize) {
     let bytes = read_or_explain(
-        &reference_dir(side).join("input.f32"),
+        &reference_dir(side).join(reference::INPUT_FILE),
         &reference_recipe(side),
     );
-    let expected: Vec<u8> = reference_input(side)
-        .iter()
-        .flat_map(|v| v.to_le_bytes())
-        .collect();
+    let expected = reference::input(side);
 
-    assert_eq!(bytes.len(), expected.len(), "the file has the wrong size");
-    let first_difference = bytes.iter().zip(&expected).position(|(a, b)| a != b);
     assert_eq!(
-        first_difference, None,
+        bytes.len(),
+        expected.len() * 4,
+        "the file has the wrong size"
+    );
+    assert_eq!(
+        reference::first_difference(&bytes, &expected),
+        None,
         "the input differs from the formula at this byte offset"
     );
 }
@@ -221,34 +149,6 @@ fn assert_input_matches_the_formula(side: usize) {
 #[ignore = "needs `just reference-depth-anything`"]
 fn the_rust_input_is_bit_identical_to_the_one_python_wrote() {
     assert_input_matches_the_formula(NATIVE);
-}
-
-/// The tolerance of the comparison with the reference features: the largest
-/// absolute difference of any element. The reference ran in PyTorch on the
-/// CPU in `f32`; the GPU sums in other orders and evaluates `exp`, `erf` and
-/// the inverse square root its own way, and the differences grow through
-/// twelve residual layers.
-///
-/// Set against what the test measured at 518 pixels on an Apple M1 Pro,
-/// Metal, on 2026-10-21, in two runs: a largest difference of 5.9e-4 and
-/// 6.3e-4 (stage 6; the reference's largest magnitude there is 73) and a mean
-/// of at most 1.2e-5, over stages 3, 6, 9 and 12. The GPU's result is not
-/// bit-identical from run to run. The test prints the figures of every run.
-/// The comparison at [`OTHER`] applies the same tolerances; it adds the
-/// host's resampling of the position embedding, which rounds differently from
-/// PyTorch's by single-precision rounding only.
-const FEATURE_MAX_ERROR: f32 = 2e-3;
-
-/// The tolerance on the mean absolute difference over a feature; see
-/// [`FEATURE_MAX_ERROR`].
-const FEATURE_MEAN_ERROR: f32 = 5e-5;
-
-/// Raw little-endian `f32`s.
-fn floats(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect()
 }
 
 /// The checked weights file, its inventory, and an input as the graph's NHWC
@@ -264,7 +164,7 @@ impl Files {
     /// is stored NCHW.
     fn read(config: &Config, side: usize) -> Self {
         let nchw = floats(&read_or_explain(
-            &reference_dir(side).join("input.f32"),
+            &reference_dir(side).join(reference::INPUT_FILE),
             &reference_recipe(side),
         ));
         Self::with_image(config, to_nhwc(&nchw, side))
@@ -273,12 +173,12 @@ impl Files {
     /// The weights, and the reference input's formula at `side`: for a run
     /// that needs no reference.
     fn formula(config: &Config, side: usize) -> Self {
-        Self::with_image(config, to_nhwc(&reference_input(side), side))
+        Self::with_image(config, reference_image(side))
     }
 
     fn with_image(config: &Config, image: Vec<f32>) -> Self {
         let weights = read_or_explain(
-            &model_dir().join("model.safetensors"),
+            &model_dir().join(reference::WEIGHTS_FILE),
             "setup-depth-anything",
         );
         let inventory = inventory(config).expect("the small configuration is valid");
@@ -526,22 +426,16 @@ fn encoder_matches_the_reference_features(side: usize) {
     for (&stage, &feature) in config.out_indices.iter().zip(&enc.features) {
         let got = loaded.read(feature);
         assert_eq!(got.len(), grid * grid * HIDDEN);
-        let name = format!("encoder_stage_{stage}.f32");
+        let name = reference::feature_file(stage);
         let want = floats(&read_or_explain(&dir.join(&name), &recipe));
         assert_eq!(want.len(), grid * grid * HIDDEN, "{name}");
-        let diffs: Vec<f64> = got
-            .iter()
-            .zip(&want)
-            .map(|(&g, &w)| f64::from((g - w).abs()))
-            .collect();
-        let max = diffs.iter().copied().fold(0.0, f64::max);
-        let mean = diffs.iter().sum::<f64>() / diffs.len() as f64;
-        let scale = want.iter().map(|w| f64::from(w.abs())).fold(0.0, f64::max);
+        let error = FeatureError::of(&got, &want).expect("a feature of the reference's size");
         println!(
-            "{side} pixels, stage {stage:2}: max abs error {max:.3e}, mean abs error {mean:.3e} \
-             (largest reference magnitude {scale:.3})"
+            "{side} pixels, stage {stage:2}: max abs error {:.3e}, mean abs error {:.3e} \
+             (largest reference magnitude {:.3})",
+            error.max, error.mean, error.scale
         );
-        if !(max <= f64::from(FEATURE_MAX_ERROR) && mean <= f64::from(FEATURE_MEAN_ERROR)) {
+        if !error.within_tolerance() {
             failures.push(stage);
         }
     }
@@ -576,94 +470,6 @@ fn the_encoder_on_the_gpu_matches_the_reference_features() {
     encoder_matches_the_reference_features(NATIVE);
 }
 
-/// The shape the reference's manifest records for tensor `name`.
-///
-/// The manifest is the JSON `scripts/reference/depth_anything_v2.py` writes,
-/// one object per tensor with its `name`, `file` and `shape`; this reads the
-/// first `[...]` after the name's entry, which is that tensor's shape, rather
-/// than take a JSON parser as a dependency for one array of integers.
-fn manifest_shape(manifest: &str, name: &str) -> Vec<usize> {
-    let entry = format!("\"name\": \"{name}\"");
-    let at = manifest
-        .find(&entry)
-        .unwrap_or_else(|| panic!("the manifest lists no {name}"));
-    let rest = &manifest[at..];
-    let shape = rest.find("\"shape\"").expect("the entry has a shape");
-    let open = rest[shape..].find('[').unwrap() + shape;
-    let close = rest[open..].find(']').unwrap() + open;
-    rest[open + 1..close]
-        .split(',')
-        .map(|d| d.trim().parse().expect("a dimension"))
-        .collect()
-}
-
-/// The tolerance on the largest absolute difference of the depth.
-///
-/// The depth inherits the encoder's differences from the reference (see
-/// [`FEATURE_MAX_ERROR`]) and adds the head's own, of convolutions summing in
-/// another order than PyTorch's. Set against what the test measured at 518
-/// pixels on an Apple M1 Pro, Metal, on 2026-10-21, in two invocations,
-/// identical in both: a largest difference of 5.96e-6 fused and 6.68e-6
-/// unfused, a mean of 1.02e-6 and 1.01e-6, and a largest relative difference
-/// of 2.05e-6 and 2.12e-6, on a reference depth from 1.48 to 3.64. The
-/// tolerances leave room for an encoder at the edge of its own, three times
-/// what it measured, and as much again for the head on another adapter. The
-/// comparison at [`OTHER`] applies them unchanged.
-const DEPTH_MAX_ERROR: f32 = 5e-5;
-
-/// The tolerance on the mean absolute difference of the depth; see
-/// [`DEPTH_MAX_ERROR`].
-const DEPTH_MEAN_ERROR: f32 = 1e-5;
-
-/// The tolerance on the largest relative difference of the depth, measured
-/// over the pixels whose reference depth is at least [`RELATIVE_FLOOR`] of
-/// its largest; see [`DEPTH_MAX_ERROR`].
-const DEPTH_MAX_RELATIVE_ERROR: f32 = 2e-5;
-
-/// The share of the largest reference depth below which a pixel's relative
-/// error is not counted: the final ReLU clips depth to zero, and near zero a
-/// difference of rounding size is a large ratio that says nothing about the
-/// port.
-const RELATIVE_FLOOR: f64 = 0.01;
-
-/// What a [`Loaded`] model's depth differs from the reference by.
-struct DepthError {
-    max: f64,
-    mean: f64,
-    max_relative: f64,
-    /// The reference's largest depth.
-    scale: f64,
-}
-
-impl DepthError {
-    fn of(got: &[f32], want: &[f32]) -> Self {
-        assert_eq!(got.len(), want.len());
-        let scale = want.iter().map(|w| f64::from(w.abs())).fold(0.0, f64::max);
-        let (mut max, mut sum, mut max_relative) = (0.0_f64, 0.0_f64, 0.0_f64);
-        for (&g, &w) in got.iter().zip(want) {
-            let d = f64::from(g - w).abs();
-            max = max.max(d);
-            sum += d;
-            let w = f64::from(w).abs();
-            if w >= RELATIVE_FLOOR * scale {
-                max_relative = max_relative.max(d / w);
-            }
-        }
-        Self {
-            max,
-            mean: sum / got.len() as f64,
-            max_relative,
-            scale,
-        }
-    }
-
-    fn within_tolerance(&self) -> bool {
-        self.max <= f64::from(DEPTH_MAX_ERROR)
-            && self.mean <= f64::from(DEPTH_MEAN_ERROR)
-            && self.max_relative <= f64::from(DEPTH_MAX_RELATIVE_ERROR)
-    }
-}
-
 /// The whole of Depth Anything V2 Small at `side` pixels, the encoder and the
 /// DPT head built from the real weights by
 /// `beatlm::model::depth_anything_v2::model`, run on the GPU on the reference
@@ -683,11 +489,15 @@ fn whole_model_matches_the_reference_depth(side: usize) {
     let recipe = reference_recipe(side);
     let config = Config::small();
     let files = Files::read(&config, side);
-    let manifest = String::from_utf8(read_or_explain(&dir.join("manifest.json"), &recipe))
-        .expect("the manifest is text");
-    let shape = manifest_shape(&manifest, "predicted_depth");
+    let manifest = String::from_utf8(read_or_explain(
+        &dir.join(reference::MANIFEST_FILE),
+        &recipe,
+    ))
+    .expect("the manifest is text");
+    let shape = reference::manifest_shape(&manifest, reference::DEPTH_NAME)
+        .expect("the manifest records the depth's shape");
     assert_eq!(shape, [1, side, side]);
-    let want = floats(&read_or_explain(&dir.join("predicted_depth.f32"), &recipe));
+    let want = floats(&read_or_explain(&dir.join(reference::DEPTH_FILE), &recipe));
     assert_eq!(want.len(), shape.iter().product::<usize>());
     let (low, high) = want
         .iter()
@@ -718,7 +528,8 @@ fn whole_model_matches_the_reference_depth(side: usize) {
         let loaded = Loaded::new(&gpu, &graph, fusion, &uploads);
         loaded.run(None, 0);
         println!("{side} pixels, {fusion:?}: {}", loaded.describe());
-        let error = DepthError::of(&loaded.read(m.depth), &want);
+        let error =
+            DepthError::of(&loaded.read(m.depth), &want).expect("a depth of the reference's size");
         println!(
             "{side} pixels, {fusion:?}: depth max abs error {:.3e}, mean abs error {:.3e}, max \
              relative error {:.3e} (over pixels at least {RELATIVE_FLOOR} of the largest \
@@ -818,7 +629,7 @@ fn the_whole_model_runs_on_the_gpu_at_every_timed_side() {
     // side.
     let mut files = Files::formula(&config, TIMED_SIDES[0]);
     for side in TIMED_SIDES {
-        files.image = to_nhwc(&reference_input(side), side);
+        files.image = reference_image(side);
         let mut builder = Builder::new();
         let m = model(&mut builder, &config, side).expect("the model builds");
         let (graph, uploads) = files.uploads(builder, m.image);

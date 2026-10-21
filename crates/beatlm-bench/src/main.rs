@@ -675,6 +675,7 @@ mod pace;
 mod reference;
 mod report;
 mod run;
+mod slots;
 mod stats;
 #[cfg(test)]
 mod vit;
