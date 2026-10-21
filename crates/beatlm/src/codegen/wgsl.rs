@@ -1,38 +1,50 @@
 //! The templates: one per kind of main operation, sharing a header, the binding
 //! declarations, the part's range and the epilogue hook.
 //!
-//! Every template computes one value per output element and stores it as
-//! `out[i] = epilogue(value, i)`; [`epilogue`] writes that function from the
-//! spec's steps, so the templates know nothing about fusion. The convolution
-//! template reads its input through `prologue(value)` the same way
-//! ([`prologue`]). Layouts are the ones [`beatlm_core::kernel`] documents.
+//! Every template stores each output value as `out[i] = epilogue(value, i)`;
+//! [`epilogue`] writes that function from the spec's steps, so the templates
+//! know nothing about fusion. The 3x3 convolution reads its input through
+//! `prologue(value)` the same way ([`prologue`]). Layouts are the ones
+//! [`beatlm_core::kernel`] documents.
 //!
 //! Every template also walks only its part's range of the output, read from
 //! the constants [`part_constants`] names, so the text is the whole kernel's
 //! and one shader module serves every part.
 //!
-//! Four kernels are one tiled matrix multiply ([`tiled`]) that differ only in
-//! where an element of each operand is read and where a result is stored: the
-//! matrix multiply itself, the patch embedding (the left operand gathered from
-//! the image's patches), and the attention scores and the weighted sum of the
-//! values (one product per head, the head being the grid's `z`). Each writes
-//! those three accesses as WGSL functions, so the tiling, the barriers and the
-//! bounds handling are written once.
+//! Five kernels are one register-tiled matrix multiply ([`tiled`]) that differ
+//! only in where an element of each operand is read and where a result is
+//! stored: the matrix multiply itself (which the 1x1 convolution lowers to),
+//! the patch embedding (the left operand gathered from the image's patches),
+//! the 3x3 convolution (the left operand gathered from the image's 3x3
+//! windows, an implicit GEMM), and the attention scores and the weighted sum
+//! of the values (one product per head, the head being the grid's `z`). Each
+//! writes those three accesses as WGSL functions, so the tiling, the barriers
+//! and the bounds handling are written once.
+//!
+//! The register-tiled template replaced two kernels that each computed one
+//! output per invocation: a 16 x 16 tiled matrix multiply for the four
+//! products, and a convolution that read its input and weights straight from
+//! memory, nine taps times the input channels per output. With real weights at
+//! 518 pixels, on an Apple M1 Pro, Metal, it took Depth Anything V2 Small
+//! from about 860 ms of GPU time per run to about 205 ms; the core's
+//! [`Tile`](beatlm_core::kernel::Tile) has the measurements by kind of kernel,
+//! and why its tiles and no others. Neither old kernel was kept: no shape of
+//! the model ran faster on it.
 
 use std::fmt::Write as _;
 
 use beatlm_core::kernel::{
     AttentionScores, AttentionValues, Conv2d3x3, ConvTranspose2d, Epilogue, GELU_ERF_A, GELU_ERF_P,
     KernelSpec, LayerNorm, MainOp, MatMul, PatchEmbed, PrependToken, Prologue, Requirements,
-    ResizeBilinear, Softmax, TokensToMap, Variant,
+    ResizeBilinear, Softmax, Tile, TokensToMap, Variant,
 };
 use beatlm_core::memory::TensorId;
 
 use super::ENTRY_POINT;
 
-/// First unit of the part: an output element for the convolution, the map and
-/// the token copies, a row for the layer norm, the softmax and the tiled
-/// kernels.
+/// First unit of the part: an output element for the transposed convolution,
+/// the resampling, the map and the token copies, a row for the layer norm, the
+/// softmax and the tiled kernels (an output pixel of the 3x3 convolution).
 const PART_START: &str = "PART_START";
 /// One past the last unit of the part, in the unit of [`PART_START`].
 const PART_END: &str = "PART_END";
@@ -58,18 +70,24 @@ pub(super) fn text(spec: &KernelSpec, variant: Variant) -> String {
         "only the convolution template applies a prologue: {}",
         spec.name()
     );
+    let tiled_as = |t: Tiled, out: &mut String| match spec.tile() {
+        Some(tile) => tiled(out, &t, tile, &req, &y),
+        // Every main operation with a `Tiled` has a tile; a text without an
+        // entry point fails validation rather than running something else.
+        None => out.push_str("// no tile for a tiled kernel\n"),
+    };
     match *spec.main() {
         MainOp::Conv2d3x3(c) => {
             prologue(&mut out, spec.prologue());
-            conv(&mut out, &c, &req, &names, &y);
+            tiled_as(conv(&c, &names), &mut out);
         }
         MainOp::ConvTranspose2d(c) => conv_transpose(&mut out, &c, &req, &names, &y),
         MainOp::ResizeBilinear(r) => resize_bilinear(&mut out, &r, &req, &names, &y),
         MainOp::LayerNorm(l) => layer_norm(&mut out, &l, &req, &names, &y),
-        MainOp::MatMul(mm) => tiled(&mut out, &matmul(&mm, &names), &req, &y),
-        MainOp::PatchEmbed(p) => tiled(&mut out, &patch_embed(&p, &names), &req, &y),
-        MainOp::AttentionScores(s) => tiled(&mut out, &attention_scores(&s, &names), &req, &y),
-        MainOp::AttentionValues(v) => tiled(&mut out, &attention_values(&v, &names), &req, &y),
+        MainOp::MatMul(mm) => tiled_as(matmul(&mm, &names), &mut out),
+        MainOp::PatchEmbed(p) => tiled_as(patch_embed(&p, &names), &mut out),
+        MainOp::AttentionScores(s) => tiled_as(attention_scores(&s, &names), &mut out),
+        MainOp::AttentionValues(v) => tiled_as(attention_values(&v, &names), &mut out),
         MainOp::Softmax(s) => softmax(&mut out, &s, &req, &names, &y),
         MainOp::PrependToken(t) => prepend_token(&mut out, &t, &req, &names, &y),
         MainOp::TokensToMap(t) => tokens_to_map(&mut out, &t, &req, &names, &y),
@@ -83,8 +101,7 @@ pub(super) fn text(spec: &KernelSpec, variant: Variant) -> String {
 const fn by_element(main: &MainOp) -> bool {
     matches!(
         main,
-        MainOp::Conv2d3x3(_)
-            | MainOp::ConvTranspose2d(_)
+        MainOp::ConvTranspose2d(_)
             | MainOp::ResizeBilinear(_)
             | MainOp::PrependToken(_)
             | MainOp::TokensToMap(_)
@@ -127,6 +144,7 @@ fn overrides(out: &mut String, whole: &KernelSpec, variant: Variant) {
         main if by_element(main) => "output elements",
         MainOp::AttentionScores(_) | MainOp::AttentionValues(_) => "query rows",
         MainOp::PatchEmbed(_) => "patches",
+        MainOp::Conv2d3x3(_) => "output pixels",
         _ => "rows",
     };
     let _ = writeln!(
@@ -357,75 +375,47 @@ fn prologue(out: &mut String, steps: &[Prologue]) {
     out.push_str("    return v;\n}\n\n");
 }
 
-/// One invocation per output element of the part, numbered in memory order
-/// (channel fastest) from the part's first element over a grid of rows
-/// `PART_GRID_ROW` workgroups wide. Output pixel `(y, x)` is centred on input
-/// pixel `(y * STRIDE, x * STRIDE)`; every input value goes through
-/// `prologue`, which [`prologue`] writes.
-fn conv(out: &mut String, c: &Conv2d3x3, req: &Requirements, names: &Names, y: &str) {
-    let bias = c.bias.map_or(String::new(), |b| {
-        format!("    acc = acc + {}[co];\n", names.of(b))
-    });
-    let _ = write!(
-        out,
-        "\
-const H: u32 = {h}u;
-const W: u32 = {w}u;
-const OW: u32 = {ow}u;
-const STRIDE: u32 = {stride}u;
-const CIN: u32 = {cin}u;
-const COUT: u32 = {cout}u;
-const GROUP: u32 = {group}u;
-
-// 3x3 convolution, zero padding of 1, stride STRIDE: NHWC input of H x W, output
-// rows OW wide, HWIO weights.
-{entry}
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(local_invocation_index) lane: u32,
-) {{
-    let element = {PART_START} + (wid.y * {PART_GRID_ROW} + wid.x) * GROUP + lane;
-    if (element >= {PART_END}) {{
-        return;
-    }}
-    let co = element % COUT;
-    let pixel = element / COUT;
-    let py = i32((pixel / OW) * STRIDE);
-    let px = i32((pixel % OW) * STRIDE);
-    var acc = 0.0;
-    for (var ky = 0; ky < 3; ky = ky + 1) {{
-        let iy = py + ky - 1;
-        if (iy < 0 || iy >= i32(H)) {{
-            continue;
-        }}
-        for (var kx = 0; kx < 3; kx = kx + 1) {{
-            let ix = px + kx - 1;
-            if (ix < 0 || ix >= i32(W)) {{
-                continue;
-            }}
-            let src = (u32(iy) * W + u32(ix)) * CIN;
-            let tap = u32(ky * 3 + kx) * CIN * COUT + co;
-            for (var ci = 0u; ci < CIN; ci = ci + 1u) {{
-                acc = acc + prologue({x}[src + ci]) * {wt}[tap + ci * COUT];
-            }}
-        }}
-    }}
-{bias}    {y}[element] = epilogue(acc, element);
-}}
-",
-        h = c.height,
-        w = c.width,
-        ow = c.out_width(),
-        stride = c.stride,
-        cin = c.cin,
-        cout = c.cout,
-        group = req.workgroup_size[0],
-        entry = entry(req),
-        x = names.of(c.input),
-        wt = names.of(c.weights),
-    );
+/// The 3x3 convolution as a tiled matrix multiply, an implicit GEMM: row
+/// `row` of the left operand is output pixel `(row / OW, row % OW)`, and
+/// reduction index `ka` is tap `(ky, kx)` and input channel `ci`, in the HWIO
+/// weights' `[3][3][CIN]` order, so the weights are the right operand
+/// `[9 * CIN][COUT]` as they are stored. The left operand is never written
+/// out: each value is read from the input pixel the tap lands on as it is
+/// staged, through `prologue` ([`prologue`]), and is zero where the tap lands
+/// in the padding. Output pixel `(y, x)` is centred on input pixel
+/// `(y * STRIDE, x * STRIDE)`.
+fn conv(c: &Conv2d3x3, names: &Names) -> Tiled {
+    Tiled {
+        what: "3x3 convolution, zero padding of 1, stride STRIDE: the 3x3 windows of the NHWC\n\
+               // input of H x W, [output pixels][9 * CIN] with output rows OW wide, times the\n\
+               // HWIO weights [9 * CIN][COUT], tiled.",
+        k: 9 * c.cin,
+        n: c.cout,
+        consts: vec![
+            ("H", c.height),
+            ("W", c.width),
+            ("OW", c.out_width()),
+            ("STRIDE", c.stride),
+            ("CIN", c.cin),
+        ],
+        load_a: format!(
+            "    let tap = ka / CIN;\n    \
+             let iy = i32((row / OW) * STRIDE + tap / 3u) - 1;\n    \
+             let ix = i32((row % OW) * STRIDE + tap % 3u) - 1;\n    \
+             if (iy < 0 || iy >= i32(H) || ix < 0 || ix >= i32(W)) {{\n        \
+             return 0.0;\n    }}\n    \
+             return prologue({}[(u32(iy) * W + u32(ix)) * CIN + ka % CIN]);",
+            names.of(c.input)
+        ),
+        load_b: format!("    return {}[kb * N + col];", names.of(c.weights)),
+        b_along_k: false,
+        index: "    return row * N + col;".to_owned(),
+        bias: c.bias.map(|b| names.of(b)),
+    }
 }
 
-/// One invocation per output element of the part, numbered as for [`conv`]:
+/// One invocation per output element of the part, numbered as in
+/// [`per_element`]:
 /// output pixel `(oy, ox)` lies in the block input pixel
 /// `(oy / F, ox / F)` writes, at tap `(oy % F, ox % F)` of the kernel, so the
 /// element is that pixel's channels times that tap's weights, plus the bias.
@@ -473,7 +463,8 @@ fn conv_transpose(
     );
 }
 
-/// One invocation per output element of the part, numbered as for [`conv`].
+/// One invocation per output element of the part, numbered as in
+/// [`per_element`].
 /// The sampling ratios are the core's ([`ResizeBilinear::ratios`]), written
 /// exactly, and the source position is `ratio * index` in `f32`, as PyTorch
 /// computes it; the two input rows and columns around it are the one it
@@ -697,36 +688,135 @@ struct Tiled {
     /// `fn load_b(kb: u32, col: u32, layer: u32) -> f32`: the right operand at
     /// reduction index `kb`, output column `col`, in layer `layer`.
     load_b: String,
+    /// Whether neighbouring reduction indices of the right operand are
+    /// neighbours in memory (the keys of the attention scores), rather than
+    /// neighbouring columns (every other right operand): the invocations
+    /// staging it then walk the reduction fastest, so neighbouring invocations
+    /// read neighbouring values either way.
+    b_along_k: bool,
     /// `fn out_index(row: u32, col: u32, layer: u32) -> u32`.
     index: String,
     /// The bias binding added per output column, when there is one.
     bias: Option<String>,
 }
 
-/// One workgroup per output tile of the part, rows counted from the part's
-/// first row, columns along `x` and layers (heads) along `z`, staging a tile of
-/// each operand in workgroup memory per step along `k`. Tiles that run off the
-/// part's rows or the operands load zeros, so every invocation reaches every
-/// barrier, and store nothing.
-fn tiled(out: &mut String, t: &Tiled, req: &Requirements, y: &str) {
-    let tile = req.workgroup_size[0];
-    let bias = t.bias.as_ref().map_or(String::new(), |b| {
-        format!("        acc = acc + {b}[col];\n")
-    });
+/// One workgroup per output tile of the part (the core's
+/// [`Tile`](beatlm_core::kernel::Tile)), rows counted from the part's first
+/// row, columns along `x` and layers (heads) along `z`.
+///
+/// The loop: for every step of `TILE_DEPTH` reduction indices, the workgroup
+/// stages the step's `TILE_ROWS x TILE_DEPTH` block of the left operand and
+/// `TILE_DEPTH x TILE_COLUMNS` block of the right one in workgroup memory,
+/// reduction index outermost, so that a row of either is a run of `vec4`s;
+/// then every invocation reads, per reduction index, the `vec4`s of its
+/// `ROWS_PER x COLUMNS_PER` block's rows and columns and adds their outer
+/// product to accumulators it keeps in registers. Each staged value is read by
+/// a whole row or column of invocations, and each value read by an invocation
+/// is used four times or more, which is what makes the tile pay: the template
+/// it replaced read two values from workgroup memory per multiply-add.
+///
+/// Staging numbers the block's values so neighbouring invocations load
+/// neighbouring values from memory: reduction index fastest for the left
+/// operand, whose rows run along the reduction in every kernel; columns or
+/// reduction index fastest for the right one, as [`Tiled::b_along_k`] says.
+/// The rows of a staged block are padded ([`Tile::left_stride`]) so that the
+/// invocations writing one step's values spread over the banks. Values past
+/// the part's rows or the operands are staged as zeros, so every invocation
+/// reaches every barrier and the extra products add nothing, and outputs past
+/// them are not stored.
+///
+/// Each invocation stages whole `vec4`s: four rows (or columns) at one
+/// reduction index, gathered in a function variable and written to workgroup
+/// memory at once. The first version wrote each staged value into its
+/// component of a workgroup `vec4` through a computed index
+/// (`mm_a[at / 4u][at % 4u] = v`); naga accepted it, and on an Apple M1 Pro,
+/// Metal, on 2026-10-22, every tiled kernel then computed wrong values, while
+/// the same text staging whole `vec4`s matches the references. Do not go back
+/// to writing single components of workgroup vectors.
+///
+/// Every output of an invocation's block is summed over the reduction in
+/// index order, as one output per invocation was, so a part computes what the
+/// whole kernel does (rule 6 of the core's
+/// [module documentation](beatlm_core::kernel#rules)), and the real-weight
+/// tests measured the same errors as with the template this replaced.
+///
+/// [`Tile::left_stride`]: beatlm_core::kernel::Tile::left_stride
+fn tiled(out: &mut String, t: &Tiled, tile: Tile, req: &Requirements, y: &str) {
+    let lanes = tile.invocations();
+    let (per_row, per_col) = (tile.rows_per_invocation, tile.columns_per_invocation);
+    debug_assert!(
+        per_row % 4 == 0 && per_col % 4 == 0,
+        "the template stages and reads vec4s of rows and columns: {tile:?}"
+    );
     let consts: String = t
         .consts
         .iter()
         .map(|(name, value)| format!("const {name}: u32 = {value}u;\n"))
         .collect();
+    let (b_kk, b_c) = if t.b_along_k {
+        ("e % TILE_DEPTH", "(e / TILE_DEPTH) * 4u")
+    } else {
+        ("e / (TILE_COLUMNS / 4u)", "(e % (TILE_COLUMNS / 4u)) * 4u")
+    };
+    let bias = t.bias.as_ref().map_or(String::new(), |b| {
+        format!("            v = v + {b}[col + c];\n")
+    });
+    // The accumulators: `acc_i_j` holds row `i` of the invocation's block,
+    // columns `4 j` to `4 j + 3`.
+    let (rows_v, cols_v) = (per_row / 4, per_col / 4);
+    let mut declare = String::new();
+    let mut multiply = String::new();
+    let mut store = String::new();
+    for v in 0..rows_v {
+        let _ = writeln!(
+            multiply,
+            "            let a{v} = mm_a[kk * LEFT_VEC4S + a_at + {v}u];"
+        );
+    }
+    for v in 0..cols_v {
+        let _ = writeln!(
+            multiply,
+            "            let b{v} = mm_b[kk * RIGHT_VEC4S + b_at + {v}u];"
+        );
+    }
+    for i in 0..per_row {
+        let lane = ["x", "y", "z", "w"][(i % 4) as usize];
+        for j in 0..cols_v {
+            let _ = writeln!(declare, "    var acc_{i}_{j} = vec4<f32>(0.0);");
+            let _ = writeln!(
+                multiply,
+                "            acc_{i}_{j} = acc_{i}_{j} + a{}.{lane} * b{j};",
+                i / 4
+            );
+            let _ = writeln!(
+                store,
+                "    store(row_at + {i}u, col_at + {}u, layer, acc_{i}_{j});",
+                4 * j
+            );
+        }
+    }
     let _ = write!(
         out,
         "\
 const K: u32 = {k}u;
 const N: u32 = {n}u;
-const TILE: u32 = {tile}u;
+const TILE_ROWS: u32 = {rows}u;
+const TILE_COLUMNS: u32 = {columns}u;
+const TILE_DEPTH: u32 = {depth}u;
+const ROWS_PER: u32 = {per_row}u;
+const COLUMNS_PER: u32 = {per_col}u;
+const LANES: u32 = {lanes}u;
+// A staged row of each operand, in values and in vec4s.
+const LEFT_STRIDE: u32 = {left}u;
+const RIGHT_STRIDE: u32 = {right}u;
+const LEFT_VEC4S: u32 = {left_v}u;
+const RIGHT_VEC4S: u32 = {right_v}u;
 {consts}
-var<workgroup> mm_tile_a: array<f32, {cells}>;
-var<workgroup> mm_tile_b: array<f32, {cells}>;
+// One step of each operand, reduction index outermost: value (r, kk) of the
+// left operand at kk * LEFT_STRIDE + r, (kk, c) of the right at
+// kk * RIGHT_STRIDE + c.
+var<workgroup> mm_a: array<vec4<f32>, {a_cells}>;
+var<workgroup> mm_b: array<vec4<f32>, {b_cells}>;
 
 fn load_a(row: u32, ka: u32, layer: u32) -> f32 {{
 {load_a}
@@ -740,44 +830,84 @@ fn out_index(row: u32, col: u32, layer: u32) -> u32 {{
 {index}
 }}
 
-// {what}
-{entry}
-    @builtin(local_invocation_id) lid: vec3<u32>,
-    @builtin(workgroup_id) wid: vec3<u32>,
-) {{
-    let row = {PART_START} + wid.y * TILE + lid.y;
-    let col = wid.x * TILE + lid.x;
-    let layer = wid.z;
-    var acc = 0.0;
-    let steps = (K + TILE - 1u) / TILE;
-    for (var t = 0u; t < steps; t = t + 1u) {{
-        let ka = t * TILE + lid.x;
-        let kb = t * TILE + lid.y;
-        var va = 0.0;
-        if (row < {PART_END} && ka < K) {{
-            va = load_a(row, ka, layer);
-        }}
-        var vb = 0.0;
-        if (kb < K && col < N) {{
-            vb = load_b(kb, col, layer);
-        }}
-        mm_tile_a[lid.y * TILE + lid.x] = va;
-        mm_tile_b[lid.y * TILE + lid.x] = vb;
-        workgroupBarrier();
-        for (var i = 0u; i < TILE; i = i + 1u) {{
-            acc = acc + mm_tile_a[lid.y * TILE + i] * mm_tile_b[i * TILE + lid.x];
-        }}
-        workgroupBarrier();
+// Stores four neighbouring results of one row, those inside the part and the
+// output.
+fn store(row: u32, col: u32, layer: u32, values: vec4<f32>) {{
+    if (row >= {PART_END}) {{
+        return;
     }}
-    if (row < {PART_END} && col < N) {{
-{bias}        let i = out_index(row, col, layer);
-        {y}[i] = epilogue(acc, i);
+    for (var c = 0u; c < 4u; c = c + 1u) {{
+        if (col + c < N) {{
+            var v = values[c];
+{bias}            let i = out_index(row, col + c, layer);
+            {y}[i] = epilogue(v, i);
+        }}
     }}
 }}
+
+// {what}
+// Each workgroup computes a TILE_ROWS x TILE_COLUMNS tile of the output, each
+// invocation a ROWS_PER x COLUMNS_PER block of it in registers.
+{entry}
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(local_invocation_index) lane: u32,
+    @builtin(workgroup_id) wid: vec3<u32>,
+) {{
+    let row0 = {PART_START} + wid.y * TILE_ROWS;
+    let col0 = wid.x * TILE_COLUMNS;
+    let layer = wid.z;
+    // Where the invocation's block starts, in vec4s of a staged row.
+    let a_at = lid.y * (ROWS_PER / 4u);
+    let b_at = lid.x * (COLUMNS_PER / 4u);
+{declare}    for (var k0 = 0u; k0 < K; k0 = k0 + TILE_DEPTH) {{
+        // Four rows of the left operand at one reduction index per vec4.
+        for (var e = lane; e < TILE_ROWS / 4u * TILE_DEPTH; e = e + LANES) {{
+            let kk = e % TILE_DEPTH;
+            let r = (e / TILE_DEPTH) * 4u;
+            let ka = k0 + kk;
+            var v = vec4<f32>(0.0);
+            for (var q = 0u; q < 4u; q = q + 1u) {{
+                let row = row0 + r + q;
+                if (row < {PART_END} && ka < K) {{
+                    v[q] = load_a(row, ka, layer);
+                }}
+            }}
+            mm_a[kk * LEFT_VEC4S + r / 4u] = v;
+        }}
+        // Four columns of the right operand at one reduction index per vec4.
+        for (var e = lane; e < TILE_DEPTH * TILE_COLUMNS / 4u; e = e + LANES) {{
+            let kk = {b_kk};
+            let c = {b_c};
+            let kb = k0 + kk;
+            var v = vec4<f32>(0.0);
+            for (var q = 0u; q < 4u; q = q + 1u) {{
+                let col = col0 + c + q;
+                if (kb < K && col < N) {{
+                    v[q] = load_b(kb, col, layer);
+                }}
+            }}
+            mm_b[kk * RIGHT_VEC4S + c / 4u] = v;
+        }}
+        workgroupBarrier();
+        for (var kk = 0u; kk < TILE_DEPTH; kk = kk + 1u) {{
+{multiply}        }}
+        workgroupBarrier();
+    }}
+    let row_at = row0 + lid.y * ROWS_PER;
+    let col_at = col0 + lid.x * COLUMNS_PER;
+{store}}}
 ",
         k = t.k,
         n = t.n,
-        cells = tile * tile,
+        rows = tile.rows,
+        columns = tile.columns,
+        depth = tile.depth,
+        left = tile.left_stride(),
+        right = tile.right_stride(),
+        left_v = tile.left_stride() / 4,
+        right_v = tile.right_stride() / 4,
+        a_cells = tile.depth * tile.left_stride() / 4,
+        b_cells = tile.depth * tile.right_stride() / 4,
         load_a = t.load_a,
         load_b = t.load_b,
         index = t.index,
@@ -795,6 +925,7 @@ fn matmul(mm: &MatMul, names: &Names) -> Tiled {
         consts: Vec::new(),
         load_a: format!("    return {}[row * K + ka];", names.of(mm.a)),
         load_b: format!("    return {}[kb * N + col];", names.of(mm.b)),
+        b_along_k: false,
         index: "    return row * N + col;".to_owned(),
         bias: mm.bias.map(|b| names.of(b)),
     }
@@ -821,6 +952,7 @@ fn patch_embed(p: &PatchEmbed, names: &Names) -> Tiled {
             names.of(p.input)
         ),
         load_b: format!("    return {}[kb * N + col];", names.of(p.weights)),
+        b_along_k: false,
         index: "    return row * N + col;".to_owned(),
         bias: p.bias.map(|b| names.of(b)),
     }
@@ -849,6 +981,7 @@ fn attention_scores(s: &AttentionScores, names: &Names) -> Tiled {
         consts: attention_consts(s.tokens, s.heads, s.head_dim),
         load_a: format!("    return {qkv}[row * QKV_ROW + layer * HEAD_DIM + ka];"),
         load_b: format!("    return {qkv}[col * QKV_ROW + KEYS_AT + layer * HEAD_DIM + kb];"),
+        b_along_k: true,
         index: "    return (row * HEADS + layer) * TOKENS + col;".to_owned(),
         bias: None,
     }
@@ -870,6 +1003,7 @@ fn attention_values(v: &AttentionValues, names: &Names) -> Tiled {
             "    return {}[kb * QKV_ROW + VALUES_AT + layer * HEAD_DIM + col];",
             names.of(v.qkv)
         ),
+        b_along_k: false,
         index: "    return row * KEYS_AT + layer * HEAD_DIM + col;".to_owned(),
         bias: None,
     }

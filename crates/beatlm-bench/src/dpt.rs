@@ -39,13 +39,16 @@ const PARTS: [u32; 5] = [1, 2, 3, 7, 64];
 fn strided_and_unbiased_3x3_convolutions_match_the_reference() {
     // The reassembly's downsampling at its real shape (37 to 19, 384
     // channels, bias), the neck's convolution without bias at an odd output
-    // count, and a small stride-3 case; none of the output counts is a
-    // multiple of the 256 invocations of a workgroup.
+    // count, and small stride-2 and stride-3 cases; none of the output
+    // counts is a multiple of the 64-pixel tile rows the convolution splits
+    // on, and each has at least two tile rows (180 and 108 output pixels), so
+    // the split counts in `PARTS` reach the odd shapes rather than clamping
+    // to one part.
     for (seed, (h, w, cin, cout, stride), bias) in [
         (1, (37, 37, 384, 384, 2), true),
         (2, (37, 37, 192, 64, 1), false),
-        (3, (7, 9, 5, 37, 2), false),
-        (4, (8, 11, 3, 6, 3), true),
+        (3, (23, 29, 5, 37, 2), false),
+        (4, (26, 35, 3, 6, 3), true),
     ] {
         let x = uniform(seed, (h * w * cin) as usize, -1.0, 1.0);
         let wt = weights(seed + 10, 9 * cin * cout, 9 * cin);

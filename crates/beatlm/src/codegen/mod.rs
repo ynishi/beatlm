@@ -6,16 +6,16 @@
 //! place a shader language is spoken. It owns these rules:
 //!
 //! - **WGSL text is the interface.** A spec becomes text through one template
-//!   per kind of main operation (convolution; transposed convolution;
-//!   bilinear resampling; layer norm; softmax; one tiled matrix multiply
-//!   serving the matrix multiply, the 1x1 convolution, the patch embedding and
+//!   per kind of main operation (transposed convolution; bilinear resampling;
+//!   layer norm; softmax; one register-tiled matrix multiply serving the
+//!   matrix multiply, the 1x1 and 3x3 convolutions, the patch embedding and
 //!   the two attention products; the token copies; and a map for a standalone
 //!   element-wise kernel), each of which stores every output
 //!   value through one `epilogue(value, index)` function generated from the
 //!   spec's [`Epilogue`](beatlm_core::kernel::Epilogue) steps. That function is
 //!   how fusion reaches the shader: a fused kernel is the heavy template with a
-//!   longer epilogue. The convolution also loads every input value through a
-//!   `prologue(value)` function generated from the spec's
+//!   longer epilogue. The 3x3 convolution also loads every input value through
+//!   a `prologue(value)` function generated from the spec's
 //!   [`Prologue`](beatlm_core::kernel::Prologue) steps, which is how a ReLU
 //!   fused forwards reaches it. naga IR is never built directly; the crate
 //!   documentation says why.
@@ -36,8 +36,9 @@
 //! - **Shapes are constants in the text.** A kernel is generated for one shape,
 //!   so its dimensions are WGSL `const`s, costing no uniform buffer and no
 //!   pipeline constant; the launch geometry (workgroup size and count) is the
-//!   core's [`Requirements`](beatlm_core::kernel::Requirements), which the
-//!   template reads rather than restates.
+//!   core's [`Requirements`](beatlm_core::kernel::Requirements), and the tile
+//!   of a tiled kernel the core's [`Tile`](beatlm_core::kernel::Tile), which
+//!   the templates read rather than restate.
 //! - **A part's range is a pipeline-overridable constant.** A kernel the core
 //!   split ([`Program::split`](beatlm_core::kernel::Program::split)) is the
 //!   same text for every part: each template declares the range of the output
@@ -564,7 +565,92 @@ mod tests {
         ];
         all.extend(encoder_heavies());
         all.extend(decoder_heavies());
+        all.extend(wide_heavies());
         all
+    }
+
+    /// Tiled kernels whose outputs are wider than the narrow tile, so the
+    /// other tile's text is generated too, at odd shapes: a matrix multiply, a
+    /// strided convolution with a bias and the attention scores.
+    fn wide_heavies() -> Vec<Heavy> {
+        let (m, k, n) = (37, 21, 70);
+        let (h, w, cin, cout) = (7, 9, 3, 37);
+        let (tokens, heads, head_dim) = (41, 2, 5);
+        let heavies: Vec<Heavy> = vec![
+            (
+                vec![(X, u64::from(m * k)), (W, u64::from(k * n)), (P, n.into())],
+                OpKind::MatMul(MatMul {
+                    a: X,
+                    b: W,
+                    bias: Some(P),
+                    m,
+                    k,
+                    n,
+                }),
+                (u64::from(m * n), n),
+            ),
+            (
+                vec![
+                    (X, u64::from(h * w * cin)),
+                    (W, u64::from(9 * cin * cout)),
+                    (P, u64::from(cout)),
+                ],
+                OpKind::Conv2d3x3(Conv2d3x3 {
+                    input: X,
+                    weights: W,
+                    bias: Some(P),
+                    height: h,
+                    width: w,
+                    cin,
+                    cout,
+                    stride: 2,
+                }),
+                (u64::from(4 * 5 * cout), cout),
+            ),
+            (
+                vec![(X, u64::from(tokens * 3 * heads * head_dim))],
+                OpKind::AttentionScores(AttentionScores {
+                    qkv: X,
+                    tokens,
+                    heads,
+                    head_dim,
+                }),
+                (u64::from(tokens * heads * tokens), tokens),
+            ),
+        ];
+        heavies
+    }
+
+    #[test]
+    fn both_tiles_are_generated_and_read_from_the_core() {
+        let mut columns = std::collections::BTreeSet::new();
+        for (inputs, heavy, out) in heavies() {
+            let p = program(&inputs, heavy, out, &[], Fusion::On);
+            let spec = &p.kernels()[0];
+            let Some(tile) = spec.tile() else {
+                continue;
+            };
+            let text = generate(spec, Variant::Baseline).unwrap();
+            columns.insert(tile.columns);
+            let [x, y, z] = tile.workgroup_size();
+            for line in [
+                format!("const TILE_ROWS: u32 = {}u;", tile.rows),
+                format!("const TILE_COLUMNS: u32 = {}u;", tile.columns),
+                format!("const TILE_DEPTH: u32 = {}u;", tile.depth),
+                format!("@workgroup_size({x}, {y}, {z})"),
+                format!(
+                    "var<workgroup> mm_a: array<vec4<f32>, {}>;",
+                    tile.depth * tile.left_stride() / 4
+                ),
+            ] {
+                assert!(text.contains(&line), "{line} in\n{text}");
+            }
+            // One accumulator per four outputs of the invocation's block.
+            let accumulators = text.matches("= vec4<f32>(0.0);\n").count();
+            let block = tile.rows_per_invocation * tile.columns_per_invocation / 4;
+            assert_eq!(accumulators as u32, block + 2, "{}", spec.name());
+        }
+        assert_eq!(columns.len(), 2, "{columns:?}");
     }
 
     /// The DPT head's heavy ops, at odd shapes: a strided convolution with and

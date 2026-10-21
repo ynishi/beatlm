@@ -201,8 +201,8 @@
 //! tensor of that size while the first is live, so 90 MB of scores are live at
 //! that kernel and the planner places them like any other two tensors. No
 //! kernel's workgroup memory depends on the sequence length: the two products
-//! stage 16 x 16 tiles (2 KiB) and the softmax one value per invocation
-//! (1 KiB), against the baseline's 16 KiB.
+//! stage the blocks of their [`Tile`] (8704 bytes at most) and the softmax one
+//! value per invocation (1 KiB), against the baseline's 16 KiB.
 //!
 //! Why materialise, in terms of the frame-budget design ([`Program::parts_within`]
 //! and the crate documentation's scheduler rules): work is placed in frames at
@@ -233,6 +233,12 @@
 //! grows to matter: an online-softmax kernel removes the 90 MB and the two
 //! dispatches and keeps every other operation as it is.
 //!
+//! The products became faster with register tiling ([`Tile`], which has the
+//! measurements): on the same machine, on 2026-10-22, the score products took
+//! 29.5 ms, the weighted sums 27.6 ms and the softmax kernels still 10.1 ms of
+//! a 160 ms encoder. The softmax's share grew from 1.4 % to 6 %, and the
+//! products are still where the attention's time is.
+//!
 //! # Dense prediction (DPT) operations
 //!
 //! The DPT head of Depth Anything V2 is these operations, with
@@ -242,14 +248,15 @@
 //!
 //! | Operation | Fuses into the kernel before it | Takes epilogues | Splits along |
 //! |---|---|---|---|
-//! | [`Conv2d3x3`], any stride, bias or none | no: heavy | yes, and a ReLU [prologue](Prologue) | output pixels |
+//! | [`Conv2d3x3`], any stride, bias or none | no: heavy, a tiled product of its 3x3 windows | yes, and a ReLU [prologue](Prologue) | output pixels, in tile rows |
 //! | [`Conv2d1x1`] | no: heavy, a [`MatMul`] of the pixels | yes | pixels, in tile rows |
 //! | [`ConvTranspose2d`] | no: heavy | yes | output pixels |
 //! | [`ResizeBilinear`] | no: its output index is not its input's | yes | output pixels |
 //! | [`OpKind::Relu`] whose input has another consumer, before a [`Conv2d3x3`] | no, so it becomes that convolution's prologue | — | — |
 //!
-//! None of them declares workgroup memory but the 1x1 convolution, which is
-//! the matrix multiply's 2 KiB. Their tensors fit the baseline's 128 MiB per
+//! None of them declares workgroup memory but the two convolutions tiled like
+//! a matrix multiply, the 3x3 and the 1x1, which stage the blocks of their
+//! [`Tile`] (8704 bytes at most). Their tensors fit the baseline's 128 MiB per
 //! binding (rule 3 of the [memory plan](crate::memory#rules)): the largest of
 //! Depth Anything V2 Small at 518 pixels are the head's two `518 x 518 x 32`
 //! maps, 34 345 472 bytes each, and the last fusion layer's `296 x 296 x 64`,
@@ -271,10 +278,12 @@
 //! per unit, which is where the host's encode time and the frame's CPU-side
 //! variance go (the concurrency model in the `beatlm` crate documentation),
 //! and the write and read of a tensor of `x`'s size and its place in the
-//! memory plan, for a `max` on every value the convolution loads. That is far
+//! memory plan, for a `max` on every value the convolution loads. That is
 //! more `max`es than a standalone kernel's one per element, because the
-//! convolution loads each input value once per tap and output channel, 9 x 64
-//! times at the head's width; the measurement below is what says whether they
+//! convolution loads each input value once per tap and per tile of output
+//! channels it stages the value for (nine times at the head's width of 64,
+//! one tile wide; when measured below, it loaded each once per tap and output
+//! channel, 9 x 64 times); the measurement below is what says whether they
 //! cost anything. The ReLU is exact, so no result changes (rule 3).
 //!
 //! What it comes to was measured with Depth Anything V2 Small's real weights
@@ -296,7 +305,12 @@
 //! decoder's, the 3x3 convolutions took 129 ms (the one-invocation-per-output
 //! kernel, nine taps times the input channels per element, at up to 518 x
 //! 518), the 1x1 convolutions 15 ms, the transposed convolutions 1.2 ms and
-//! the resamplings 0.8 ms.
+//! the resamplings 0.8 ms. That convolution was then replaced by a tiled
+//! product of its 3x3 windows, which took the 3x3 convolutions to 36 ms and
+//! the decoder to 43 ms ([`Tile`] has the measurements). The unfused program
+//! then put the seven standalone ReLUs at 151 microseconds and the 21
+//! convolutions at 36.3 ms, against 36.5 fused: the prologue still costs and
+//! saves no GPU time these runs can see.
 //!
 //! It is no wider than this case: one step, ReLU, into one main operation,
 //! the 3x3 convolution, because that is the case the model has. A prologue
@@ -377,8 +391,27 @@ const LAYER_NORM_LANES: u32 = 64;
 /// DINOv2 at 518 pixels) rather than a channel count; a power of two for the
 /// same reason.
 const SOFTMAX_LANES: u32 = 256;
-/// Width and height of a matrix-multiply tile, and of its workgroup.
-const MATMUL_TILE: u32 = 16;
+/// The tile of a tiled kernel whose output has more than
+/// [`NARROW_TILE`]`.columns` columns; [`Tile`] says why this one.
+const TILE: Tile = Tile {
+    rows: 64,
+    columns: 64,
+    depth: 16,
+    rows_per_invocation: 4,
+    columns_per_invocation: 4,
+};
+/// The tile of a tiled kernel whose output has at most `columns` columns:
+/// [`TILE`] at half the width, so no more than half of it is idle on a
+/// narrow output. As tall as [`TILE`], so every tiled kernel's parts align to
+/// the same rows.
+const NARROW_TILE: Tile = Tile {
+    columns: 32,
+    ..TILE
+};
+/// Values added to each staged row of a tile in workgroup memory, so the
+/// invocations of a workgroup writing one step of the reduction each write a
+/// different bank; four keeps every row a whole number of `vec4`s.
+const TILE_PADDING: u32 = 4;
 /// Bytes of one `f32`.
 const F32_BYTES: u32 = 4;
 /// The profile every program is checked against, so it runs everywhere.
@@ -1372,7 +1405,10 @@ impl Graph {
 /// The heavy part of a kernel: what it computes before its epilogue.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MainOp {
-    /// A 3x3 convolution, one invocation per output element.
+    /// A 3x3 convolution as a tiled matrix multiply: the `[pixels][9 * cin]`
+    /// windows of the input, gathered as they are loaded with the padding as
+    /// zeros, by the HWIO weights, which are `[9 * cin][cout]` as they are.
+    /// One workgroup per output tile.
     Conv2d3x3(Conv2d3x3),
     /// A transposed convolution whose kernel is its stride, one invocation per
     /// output element, each reading the one input pixel whose block it is in.
@@ -1500,23 +1536,24 @@ impl MainOp {
         }
     }
 
-    /// Units of the split dimension a part boundary moves in: a tile's height
+    /// Units of the split dimension a part boundary moves in: a tile's rows
     /// for the kernels tiled like a matrix multiply, one unit otherwise.
-    const fn split_grain(&self) -> u32 {
-        if self.is_tiled() { MATMUL_TILE } else { 1 }
+    fn split_grain(&self) -> u32 {
+        self.tile().map_or(1, |t| t.rows)
     }
 
-    /// Whether the kernel is a tiled matrix multiply: one workgroup per output
-    /// tile, rows of tiles over the split dimension, columns across the
+    /// The tile of a kernel tiled like a matrix multiply: one workgroup per
+    /// output tile, rows of tiles over the split dimension, columns across the
     /// output's last dimension and, for attention, one layer of tiles per head.
-    const fn is_tiled(&self) -> bool {
-        matches!(
-            self,
-            Self::MatMul(_)
-                | Self::PatchEmbed(_)
-                | Self::AttentionScores(_)
-                | Self::AttentionValues(_)
-        )
+    /// [`NARROW_TILE`] for an output of at most its columns, [`TILE`]
+    /// otherwise, as [`Tile`] says why. `None` for every other kernel.
+    fn tile(&self) -> Option<Tile> {
+        let (columns, _) = self.tile_columns_and_layers()?;
+        Some(if columns <= NARROW_TILE.columns {
+            NARROW_TILE
+        } else {
+            TILE
+        })
     }
 
     /// Output elements per unit of the split dimension.
@@ -1542,6 +1579,7 @@ impl MainOp {
         match *self {
             Self::MatMul(mm) => Some((mm.n, 1)),
             Self::PatchEmbed(p) => Some((p.cout, 1)),
+            Self::Conv2d3x3(c) => Some((c.cout, 1)),
             Self::AttentionScores(s) => Some((s.tokens, s.heads)),
             Self::AttentionValues(v) => Some((v.head_dim, v.heads)),
             _ => None,
@@ -1652,6 +1690,160 @@ pub struct Requirements {
     pub storage_buffers: u32,
     /// Optional features the kernel uses.
     pub features: DeviceFeatures,
+}
+
+/// The block of output one workgroup of a tiled kernel computes, and how it is
+/// shared among the workgroup's invocations.
+///
+/// The tiled kernels are matrix products: the matrix multiply (and the 1x1
+/// convolution lowered to it), the patch embedding, the 3x3 convolution as a
+/// product of its input's 3x3 windows by the weights, and the two attention
+/// products per head. A workgroup computes `rows x columns` outputs; for every
+/// step of `depth` along the reduction it stages a `rows x depth` block of the
+/// left operand and a `depth x columns` block of the right one in workgroup
+/// memory, and each invocation accumulates a
+/// `rows_per_invocation x columns_per_invocation` block of outputs in
+/// registers from them. Staging is what one load from memory buys: each staged
+/// value is used by every invocation of a row or column of the workgroup, and
+/// each value an invocation reads from workgroup memory by every output of its
+/// block in that row or column. The umbrella crate's `codegen` module writes
+/// the loop and documents it.
+///
+/// A part boundary of a tiled kernel moves in whole `rows`: a boundary inside a
+/// tile would make both parts run that tile's workgroups, each with some
+/// invocations idle (rule 6 of the [module documentation](self#rules)).
+///
+/// # Which tile
+///
+/// Two tiles, chosen by the output's columns: `64 x 64` for more than 32
+/// columns and `64 x 32` for at most 32, both staging 16 reduction indices per
+/// step, both with blocks of `4 x 4` per invocation (256 and 128 invocations,
+/// 8704 and 6656 bytes of workgroup memory, against the baseline's 256 and
+/// 16 KiB). Both are 64 rows tall, so every tiled kernel's parts align to 64
+/// rows. They replaced one `16 x 16` tile of one output per invocation for the
+/// matrix products, and one invocation per output element, with no tiling,
+/// for the 3x3 convolution.
+///
+/// The choice is fixed in the code, not measured per adapter, because one
+/// sweep over every shape of the model found no kernel whose best tile was a
+/// third one. Each candidate was tried as the tile of every tiled kernel, with
+/// Depth Anything V2 Small's real weights at 518 pixels, by the `beatlm`
+/// crate's test `the_whole_model_on_the_gpu_matches_the_reference_depth`,
+/// fused and unsplit, on an Apple M1 Pro, Metal, on 2026-10-22: one invocation
+/// per candidate, the model's GPU time per run over its five runs, and the
+/// summed per-kernel medians of each kind, in milliseconds.
+///
+/// | Tile (rows x columns x depth, block, invocations) | Model per run | Encoder matrix multiplies (48) | Attention scores (12) | Weighted sums (12) | 3x3 convolutions (21) | of which the two of 32 channels | 1x1 convolution to one channel |
+/// |---|---|---|---|---|---|---|---|
+/// | 64 x 64 x 16, 4 x 4, 256 | 214.0–214.7 | 90.5 | 29.5 | 27.6 | 46.6 | 25.2 | 1.64 |
+/// | 64 x 64 x 8, 4 x 4, 256 | 239.8–257.7 | 101.9 | 33.8 | 30.9 | 55.1 | 29.4 | 1.70 |
+/// | 32 x 64 x 16, 4 x 4, 128 | 246.4–249.5 | 105.2 | 34.0 | 33.0 | 53.0 | 28.4 | 2.04 |
+/// | 64 x 32 x 16, 4 x 4, 128 | 235.4–236.9 | 107.1 | 33.9 | 34.2 | 40.2 | 14.9 | 1.12 |
+/// | 128 x 64 x 16, 8 x 4, 256 | 574.8–583.1 | 171.3 | 216.2 | 39.9 | 91.6 | 49.8 | 24.8 |
+/// | 64 x 128 x 16, 4 x 8, 256 | 706.0–709.5 | 171.0 | 216.1 | 64.6 | 159.5 | 96.2 | 47.5 |
+///
+/// What that says:
+///
+/// - **Blocks of 4 x 4.** Both blocks of 32 outputs per invocation were two
+///   to seven times slower on every kind than 4 x 4. The runs do not say why
+///   (register pressure, and with it fewer workgroups in flight, is the
+///   likely cause), only that on this adapter they lose. A depth of 32 was not
+///   tried: with the padding, `64 x 64 x 32` needs 17 408 bytes, past the
+///   baseline's 16 KiB.
+/// - **64 x 64 x 16 for every output wider than 32 columns.** It was the
+///   fastest of all on each of those kernels: the encoder's matrix multiplies
+///   (384 to 1536 columns), both attention products (1370 and 64 columns, the
+///   latter only 132 workgroups), the convolutions to 64 and 384 channels,
+///   and the 1x1 convolutions to 48 to 384 channels (the one to 48 took 0.189
+///   ms against 0.217 at 64 x 32). Halving the depth or the rows slowed every
+///   one of them.
+/// - **64 x 32 x 16 for at most 32.** On the head's two convolutions to 32
+///   channels, at 296 and 518 pixels, it took 14.9 ms against 25.2, because a
+///   64-column tile leaves half its invocations' columns idle there; on the
+///   last 1x1 convolution, to one channel, 1.12 against 1.64.
+///
+/// With that rule the same test, run twice on the same machine on the same
+/// day, measured against the kernels it replaced (one run on 2026-10-21; the
+/// encoder and decoder are the summed per-kernel medians of the whole-model
+/// test), in milliseconds:
+///
+/// | | Before | After |
+/// |---|---|---|
+/// | Whole model, GPU time per run | 860.2–861.4 | 203.1–204.9, 204.2–205.2 |
+/// | Encoder | 714.7 | 160.3, 160.5 |
+/// | Decoder | 145.2 | 42.6, 42.5 |
+/// | Encoder matrix multiplies (48) | 433.5 | 90.4, 90.5 |
+/// | Attention scores (12) | 135.0 | 29.5, 29.6 |
+/// | Weighted sums of the values (12) | 129.6 | 27.6, 27.6 |
+/// | Patch embedding | 4.8 | 1.03, 1.03 |
+/// | 3x3 convolutions (21) | 128.0 | 36.5, 36.4 |
+/// | 1x1 convolutions (9) | 15.3 | 4.22, 4.22 |
+/// | Softmax (12), untouched | 10.1 | 10.1, 10.1 |
+///
+/// The encoder's own test, `the_encoder_on_the_gpu_matches_the_reference_features`,
+/// went from 721.3–736.2 ms per run to 160.3–172.3 and 160.6–174.5. The
+/// encoder's matrix multiplies went from about 134 to about 640 GFLOPS. Both
+/// tests measured the same errors against the reference as before, to every
+/// digit they print.
+///
+/// The rule is expected to move when another adapter is measured: the sweep
+/// above is one machine's, and a different best tile there is a reason to
+/// choose between tiles by measurement on the adapter in use, as splitting
+/// does ([`KernelSpec::parts_within`]), rather than to change these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Tile {
+    /// Output rows of the tile, along the split dimension.
+    pub rows: u32,
+    /// Output columns of the tile, along the output's last dimension (within
+    /// one head, for attention).
+    pub columns: u32,
+    /// Reduction indices staged per step.
+    pub depth: u32,
+    /// Output rows each invocation accumulates; a multiple of four.
+    pub rows_per_invocation: u32,
+    /// Output columns each invocation accumulates; a multiple of four.
+    pub columns_per_invocation: u32,
+}
+
+impl Tile {
+    /// The workgroup: one invocation per block of outputs, columns of blocks
+    /// along `x` and rows along `y`.
+    #[must_use]
+    pub const fn workgroup_size(&self) -> [u32; 3] {
+        [
+            self.columns / self.columns_per_invocation,
+            self.rows / self.rows_per_invocation,
+            1,
+        ]
+    }
+
+    /// Invocations of the workgroup.
+    #[must_use]
+    pub const fn invocations(&self) -> u32 {
+        let [x, y, _] = self.workgroup_size();
+        x * y
+    }
+
+    /// Values between two consecutive reduction indices of the staged left
+    /// operand: its rows, padded by four values so the invocations writing one
+    /// step's values write different banks, and kept a multiple of four so a
+    /// staged row is read as `vec4`s.
+    #[must_use]
+    pub const fn left_stride(&self) -> u32 {
+        self.rows + TILE_PADDING
+    }
+
+    /// As [`left_stride`](Self::left_stride), for the right operand's columns.
+    #[must_use]
+    pub const fn right_stride(&self) -> u32 {
+        self.columns + TILE_PADDING
+    }
+
+    /// Bytes of workgroup memory both staged blocks take.
+    #[must_use]
+    pub const fn workgroup_storage_bytes(&self) -> u32 {
+        self.depth * (self.left_stride() + self.right_stride()) * F32_BYTES
+    }
 }
 
 /// A device limit a kernel can exceed.
@@ -1775,14 +1967,23 @@ impl KernelSpec {
     }
 
     /// The most parts the kernel can be split into: one per unit of its split
-    /// dimension, except a kernel tiled like a matrix multiply (the matrix
-    /// multiply, the patch embedding and the two attention products), whose
-    /// parts are whole rows of output tiles. A boundary inside a tile would
-    /// make both parts run that tile's workgroups, each with some invocations
-    /// idle, so the work would grow with the part count.
+    /// dimension, except a kernel with a [`tile`](Self::tile), whose parts are
+    /// whole rows of output tiles. A boundary inside a tile would make both
+    /// parts run that tile's workgroups, each with some invocations idle, so
+    /// the work would grow with the part count.
     #[must_use]
     pub fn max_parts(&self) -> u32 {
         self.main.split_extent().div_ceil(self.main.split_grain())
+    }
+
+    /// The tile of a kernel tiled like a matrix multiply (the matrix multiply,
+    /// the patch embedding, the 3x3 convolution and the two attention
+    /// products), which its template stages and its parts align to; `None`
+    /// for every other kernel. The same for every [`Variant`], because the
+    /// parts are cut before a variant is selected.
+    #[must_use]
+    pub fn tile(&self) -> Option<Tile> {
+        self.main.tile()
     }
 
     /// The output elements this spec's dispatch writes, a contiguous range of
@@ -1937,43 +2138,37 @@ impl KernelSpec {
         let storage_buffers = u32::try_from(self.bindings().len()).unwrap_or(u32::MAX);
         // The grid covers the part, not the whole output.
         let units = self.part.range.end - self.part.range.start;
-        let (workgroup_size, workgroups, workgroup_storage_bytes) = match self.main {
-            MainOp::Conv2d3x3(_)
-            | MainOp::ConvTranspose2d(_)
-            | MainOp::ResizeBilinear(_)
-            | MainOp::PrependToken(_)
-            | MainOp::TokensToMap(_)
-            | MainOp::Map { .. } => {
+        let (workgroup_size, workgroups, workgroup_storage_bytes) = match (self.main, self.tile()) {
+            (_, Some(tile)) => {
+                let (columns, layers) = self.main.tile_columns_and_layers().unwrap_or((1, 1));
+                (
+                    tile.workgroup_size(),
+                    [
+                        columns.div_ceil(tile.columns),
+                        units.div_ceil(tile.rows),
+                        layers,
+                    ],
+                    tile.workgroup_storage_bytes(),
+                )
+            }
+            (MainOp::LayerNorm(_), None) => (
+                [LAYER_NORM_LANES, 1, 1],
+                rows_of(u64::from(units)),
+                LAYER_NORM_LANES * F32_BYTES,
+            ),
+            (MainOp::Softmax(_), None) => (
+                [SOFTMAX_LANES, 1, 1],
+                rows_of(u64::from(units)),
+                SOFTMAX_LANES * F32_BYTES,
+            ),
+            // One invocation per output element: the transposed convolution,
+            // the resampling, the token copies and the standalone maps.
+            (_, None) => {
                 let range = self.output_range();
                 (
                     [ELEMENT_GROUP, 1, 1],
                     rows_of((range.end - range.start).div_ceil(u64::from(ELEMENT_GROUP))),
                     0,
-                )
-            }
-            MainOp::LayerNorm(_) => (
-                [LAYER_NORM_LANES, 1, 1],
-                rows_of(u64::from(units)),
-                LAYER_NORM_LANES * F32_BYTES,
-            ),
-            MainOp::Softmax(_) => (
-                [SOFTMAX_LANES, 1, 1],
-                rows_of(u64::from(units)),
-                SOFTMAX_LANES * F32_BYTES,
-            ),
-            MainOp::MatMul(_)
-            | MainOp::PatchEmbed(_)
-            | MainOp::AttentionScores(_)
-            | MainOp::AttentionValues(_) => {
-                let (columns, layers) = self.main.tile_columns_and_layers().unwrap_or((1, 1));
-                (
-                    [MATMUL_TILE, MATMUL_TILE, 1],
-                    [
-                        columns.div_ceil(MATMUL_TILE),
-                        units.div_ceil(MATMUL_TILE),
-                        layers,
-                    ],
-                    2 * MATMUL_TILE * MATMUL_TILE * F32_BYTES,
                 )
             }
         };
@@ -2754,24 +2949,96 @@ mod tests {
     }
 
     #[test]
+    fn the_tile_follows_the_outputs_columns_and_every_tile_is_as_tall() {
+        let baseline = DeviceProfile::webgpu_baseline();
+        for tile in [TILE, NARROW_TILE] {
+            assert_eq!(tile.rows, TILE.rows, "{tile:?}");
+            assert_eq!(tile.rows_per_invocation % 4, 0, "{tile:?}");
+            assert_eq!(tile.columns_per_invocation % 4, 0, "{tile:?}");
+            assert_eq!(tile.rows % tile.rows_per_invocation, 0, "{tile:?}");
+            assert_eq!(tile.columns % tile.columns_per_invocation, 0, "{tile:?}");
+            assert!(tile.invocations() <= baseline.max_compute_invocations_per_workgroup);
+            assert!(tile.workgroup_storage_bytes() <= baseline.max_compute_workgroup_storage_size);
+        }
+        let conv = |cout| {
+            OpKind::Conv2d3x3(Conv2d3x3 {
+                input: X,
+                weights: W,
+                bias: None,
+                height: 37,
+                width: 37,
+                cin: 3,
+                cout,
+                stride: 1,
+            })
+        };
+        let matmul = |n| {
+            OpKind::MatMul(MatMul {
+                a: X,
+                b: W,
+                bias: None,
+                m: 1370,
+                k: 3,
+                n,
+            })
+        };
+        for (op, columns) in [
+            (conv(1), 1),
+            (conv(32), 32),
+            (conv(33), 33),
+            (conv(64), 64),
+            (matmul(1), 1),
+            (matmul(32), 32),
+            (matmul(48), 48),
+            (matmul(1152), 1152),
+        ] {
+            let p = single(op).lower(Fusion::On).unwrap();
+            let k = &p.kernels()[0];
+            let want = if columns <= 32 { NARROW_TILE } else { TILE };
+            assert_eq!(k.tile(), Some(want), "{}", k.name());
+            // 1369 pixels and 1370 rows are 22 tile rows, the last short, and
+            // every part boundary is a tile row's.
+            assert_eq!(k.max_parts(), 22, "{}", k.name());
+            let split = p.split(&[5]).unwrap();
+            for part in split.kernels() {
+                let r = part.part().range();
+                assert_eq!(r.start % TILE.rows, 0, "{}: {r:?}", k.name());
+            }
+        }
+        // Kernels that are not tiled have none.
+        let relu = single(OpKind::Relu {
+            input: X,
+            elements: 1000,
+        })
+        .lower(Fusion::On)
+        .unwrap();
+        assert_eq!(relu.kernels()[0].tile(), None);
+    }
+
+    #[test]
     fn a_device_below_a_kernels_needs_is_refused() {
         let mut g = base(&[]);
         push(&mut g, matmul(Y));
         let p = g.lower(Fusion::On).unwrap();
         let k = &p.kernels()[0];
         let r = k.requirements(Variant::Baseline);
-        assert_eq!(r.workgroup_size, [16, 16, 1]);
+        // A narrow output: a 64 x 32 tile of 4 x 4 blocks, staging 16
+        // reduction indices of both operands, each staged row padded by four
+        // values.
+        assert_eq!(r.workgroup_size, [8, 16, 1]);
         assert_eq!(r.workgroups, [1, 1, 1]);
-        assert_eq!(r.workgroup_storage_bytes, 2048);
+        assert_eq!(r.workgroup_storage_bytes, 16 * (68 + 36) * 4);
+        let baseline = DeviceProfile::webgpu_baseline();
+        assert!(r.workgroup_storage_bytes <= baseline.max_compute_workgroup_storage_size);
 
         let mut small = DeviceProfile::webgpu_baseline();
-        small.max_compute_workgroup_storage_size = 1024;
+        small.max_compute_workgroup_storage_size = 6144;
         assert_eq!(
             k.check(Variant::Baseline, &small),
             Err(KernelError::ExceedsLimit {
                 limit: Limit::WorkgroupStorageSize,
-                needed: 2048,
-                available: 1024
+                needed: 6656,
+                available: 6144
             })
         );
         assert!(k.select_variant(&small).is_err());
@@ -3074,25 +3341,43 @@ mod tests {
                     let covered =
                         groups * u64::from(r.workgroup_size[0]) * u64::from(r.workgroup_size[1]);
                     match spec.main() {
-                        MainOp::Conv2d3x3(_)
-                        | MainOp::ConvTranspose2d(_)
+                        MainOp::ConvTranspose2d(_)
                         | MainOp::ResizeBilinear(_)
                         | MainOp::PrependToken(_)
                         | MainOp::TokensToMap(_)
                         | MainOp::Map { .. } => {
+                            assert_eq!(spec.tile(), None, "{what}");
                             assert!(covered >= out.end - out.start, "{what}");
                         }
                         MainOp::LayerNorm(_) | MainOp::Softmax(_) => {
+                            assert_eq!(spec.tile(), None, "{what}");
                             assert!(groups >= u64::from(range.end - range.start), "{what}");
                         }
                         MainOp::MatMul(_)
                         | MainOp::PatchEmbed(_)
+                        | MainOp::Conv2d3x3(_)
                         | MainOp::AttentionScores(_)
                         | MainOp::AttentionValues(_) => {
+                            // A tile row is the grain, and the grid covers the
+                            // part's rows and every column in whole tiles.
+                            let tile = spec.tile().unwrap();
+                            assert_eq!(part.tile(), Some(tile), "{what}");
+                            assert_eq!(grain, tile.rows, "{what}");
                             let (columns, layers) = spec.main().tile_columns_and_layers().unwrap();
-                            assert!(r.workgroups[0] * MATMUL_TILE >= columns, "{what}");
+                            assert_eq!(r.workgroup_size, tile.workgroup_size(), "{what}");
+                            assert_eq!(
+                                r.workgroup_storage_bytes,
+                                tile.workgroup_storage_bytes(),
+                                "{what}"
+                            );
+                            assert!(r.workgroups[0] * tile.columns >= columns, "{what}");
                             assert!(
-                                r.workgroups[1] * MATMUL_TILE >= range.end - range.start,
+                                (r.workgroups[0] - 1) * tile.columns < columns,
+                                "{what}: a column of tiles with no output"
+                            );
+                            assert_eq!(
+                                r.workgroups[1],
+                                (range.end - range.start).div_ceil(tile.rows),
                                 "{what}"
                             );
                             assert_eq!(r.workgroups[2], layers, "{what}");
@@ -3169,13 +3454,17 @@ mod tests {
     /// Three kernels, with fusion off: a matmul, then two element-wise
     /// kernels, one of which reads a tensor two kernels back.
     fn three_kernels() -> Program {
+        let m = THREE_KERNELS_ROWS;
+        let elements = m * 3;
         let mut g = Graph::new();
-        g.tensor(X, TensorRole::Input, 40 * 8).unwrap();
+        g.tensor(X, TensorRole::Input, u64::from(m * 8)).unwrap();
         g.tensor(W, TensorRole::Weight, 8 * 3).unwrap();
         g.tensor(BIAS, TensorRole::Weight, 3).unwrap();
-        g.tensor(A, TensorRole::Activation, 120).unwrap();
-        g.tensor(B, TensorRole::Activation, 120).unwrap();
-        g.tensor(Y, TensorRole::Output, 120).unwrap();
+        g.tensor(A, TensorRole::Activation, elements.into())
+            .unwrap();
+        g.tensor(B, TensorRole::Activation, elements.into())
+            .unwrap();
+        g.tensor(Y, TensorRole::Output, elements.into()).unwrap();
         push(
             &mut g,
             (
@@ -3183,30 +3472,21 @@ mod tests {
                     a: X,
                     b: W,
                     bias: Some(BIAS),
-                    m: 40,
+                    m,
                     k: 8,
                     n: 3,
                 }),
                 A,
             ),
         );
-        push(
-            &mut g,
-            (
-                OpKind::Relu {
-                    input: A,
-                    elements: 120,
-                },
-                B,
-            ),
-        );
+        push(&mut g, (OpKind::Relu { input: A, elements }, B));
         push(
             &mut g,
             (
                 OpKind::Add {
                     a: B,
                     b: A,
-                    elements: 120,
+                    elements,
                 },
                 Y,
             ),
@@ -3214,13 +3494,19 @@ mod tests {
         g.lower(Fusion::Off).unwrap()
     }
 
+    /// Rows of the matmul of [`three_kernels`]: three tile rows, the last
+    /// short.
+    const THREE_KERNELS_ROWS: u32 = 2 * TILE.rows + TILE.rows / 2;
+
     #[test]
     fn splitting_stretches_lifetimes_over_the_parts_and_the_plan_still_holds() {
         let whole = three_kernels();
         assert_eq!(whole.kernels().len(), 3);
         let baseline = DeviceProfile::webgpu_baseline();
-        // The matmul has three tile rows; the maps have 120 elements.
-        for parts in [[1, 1, 1], [2, 1, 1], [3, 2, 5], [9, 7, 1], [1, 4, 120]] {
+        // The matmul has three tile rows; the maps have `3 * m` elements, so
+        // the last count is one part per element.
+        let elements = THREE_KERNELS_ROWS * 3;
+        for parts in [[1, 1, 1], [2, 1, 1], [3, 2, 5], [9, 7, 1], [1, 4, elements]] {
             let split = whole.split(&parts).unwrap();
             let counts: Vec<u32> = parts
                 .iter()
@@ -3587,7 +3873,8 @@ mod tests {
             for part in split.kernels() {
                 if let MainOp::AttentionScores(_) | MainOp::AttentionValues(_) = part.main() {
                     let r = part.part().range();
-                    assert!(r.start % MATMUL_TILE == 0 && r.end <= T, "{r:?}");
+                    let rows = part.tile().unwrap().rows;
+                    assert!(r.start % rows == 0 && r.end <= T, "{r:?}");
                 }
             }
         }
@@ -3659,7 +3946,7 @@ mod tests {
         );
         assert_eq!(p.kernels()[1].bindings(), vec![cls, patches, pos, id(12)]);
         assert_eq!(p.kernels()[0].output_elements(), u64::from((T - 1) * D));
-        assert_eq!(p.kernels()[0].max_parts(), (T - 1).div_ceil(MATMUL_TILE));
+        assert_eq!(p.kernels()[0].max_parts(), (T - 1).div_ceil(TILE.rows));
         assert_eq!(
             p.kernels()[2].output_elements(),
             u64::from(37 * 37 * D),
@@ -3937,7 +4224,7 @@ mod tests {
             })
         );
         assert_eq!(k.name(), "matmul");
-        assert_eq!(k.max_parts(), (37 * 37_u32).div_ceil(MATMUL_TILE));
+        assert_eq!(k.max_parts(), (37 * 37_u32).div_ceil(TILE.rows));
     }
 
     #[test]
