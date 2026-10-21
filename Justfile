@@ -31,6 +31,21 @@ wasm-check:
 deny:
     cargo deny check
 
+# Third-party weights are fetched on request, never by `check`, the build or a
+# test. The script states the source, the terms and the notices.
+
+# Fetches the Depth Anything V2 Small weights (Apache-2.0) into the gitignored
+# models/, at a pinned commit, verified by sha256.
+setup-depth-anything:
+    bash scripts/setup-depth-anything.sh
+
+# Runs the original implementation on a fixed input and writes the encoder
+# features and the depth it predicts next to the weights, for the port to be
+# compared with. Needs `uv`; builds an isolated Python environment with torch.
+# Run `just setup-depth-anything` first.
+reference-depth-anything:
+    uv run --isolated --no-project scripts/reference/depth_anything_v2.py
+
 # One worktree per issue, cut from a freshly fetched origin/main.
 worktree-new type slug:
     git fetch origin

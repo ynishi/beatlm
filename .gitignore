@@ -19,6 +19,10 @@ CLAUDE*.md
 **/.claude/*
 !.claude/CLAUDE.md
 
+# Python bytecode beside the sidecar scripts under scripts/. Running a script
+# through `uv` can leave it, and a staged .pyc is a build artifact in the tree.
+__pycache__/
+
 # OS / editor
 .DS_Store
 *.swp
