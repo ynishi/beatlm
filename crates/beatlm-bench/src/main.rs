@@ -313,12 +313,12 @@
 //! and jobs run in submission order and never interleave (the core's
 //! scheduler owns the rule). Submitting every frame's input then queues most
 //! jobs behind work that leaves them too few frames, and the scheduler
-//! abandons each of those in the frame it arrives and reports it missed (it
-//! owns that rule too). The engine's test
+//! abandons each of those once the next input queues behind it and reports it
+//! missed (it owns that rule too). The engine's test
 //! `a_job_longer_than_a_frame_misses_most_inputs_when_every_frame_submits_and_none_when_free`
 //! shows it on the scheduler alone, with a job of five frames' estimates under
 //! latency 5: every frame's input delivers 26 results in 120 frames and misses
-//! 93, where submitting only when the engine is free delivers 23 and misses
+//! 92, where submitting only when the engine is free delivers 23 and misses
 //! none. Before the scheduler abandoned such jobs it was worse: each kept job
 //! held the budget to its deadline, the one behind it started too late, and
 //! every frame's input delivered 1 and missed 114. So `--submit` (default

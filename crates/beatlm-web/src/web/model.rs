@@ -159,7 +159,7 @@ pub async fn calibrate(
         gpu.timestamp_query,
         "the depth model needs timestamp queries, which this device does not have: the loop's \
          scheduler plans each job from measured kernel times, and without them every job would be \
-         estimated at the prior and abandoned"
+         estimated at the prior for good"
     );
     let mut first = WholeRuns::new(whole.kernels().len());
     {

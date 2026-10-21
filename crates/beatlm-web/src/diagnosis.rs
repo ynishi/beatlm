@@ -21,7 +21,7 @@
 //! long: on an Apple adapter a pass boundary can include time the pass waited
 //! behind earlier work (`beatlm_core::cost`'s table, natively).
 //!
-//! # What it found in Chrome
+//! # What it found in Chrome, before #41
 //!
 //! Chrome 154 (WebGPU) on an Apple M1 Pro driving a 120 Hz display (period
 //! 8 300 µs), 2026-10-22, Depth Anything V2 Small,
@@ -49,16 +49,27 @@
 //! Two explanations were tested and refuted by these lines: a render pass
 //! whose measurement carried the frame's slices, which would have shrunk the
 //! budget (`crate::render_cost`), and a single slice estimated above the
-//! expected budget, which the projection refuses whatever the latency (the
-//! test `a_slice_estimated_over_every_expected_frame_keeps_jobs_from_starting`
-//! shows that rule). What remains open is why the slices measure slower in the
+//! expected budget, which no plan hands out whatever the latency (the test
+//! `a_slice_estimated_over_every_expected_frame_keeps_jobs_from_finishing`
+//! shows that rule). What remained was why the slices measure slower in the
 //! loop than in calibration, so that the estimates climb until whole jobs no
-//! longer fit their deadline, and the estimates of slices no job runs any more
-//! are never measured again. One reading, unverified, is the GPU's clock: most
-//! frames of the loop leave the GPU idle, and the render pass, the same work
-//! every frame, measured faster in the frames that also ran slices. The page
-//! does not change the scheduling for it; the feedback between the estimates
-//! and the jobs they let run is the core's to settle.
+//! longer fit their deadline, and that the estimates of slices no job runs any
+//! more are never measured again. One reading, unverified, is the GPU's clock:
+//! most frames of the loop leave the GPU idle, and the render pass, the same
+//! work every frame, measured faster in the frames that also ran slices.
+//!
+//! These runs were before #41, and every figure above is of the scheduler
+//! then, which abandoned every job projected past its deadline. The second
+//! half, the feedback between the estimates and the jobs they let run, was the
+//! core's to settle, and #41 settled it: a job with no job waiting behind it,
+//! which with the `--submit free` admission is every job, is no longer
+//! abandoned but kept to its deadline, so its slices run and are measured
+//! (`beatlm_core::schedule`, "A job that cannot make its deadline"). Under it
+//! a miss of this page is reported at its deadline, not before its first
+//! slice. The test
+//! `a_job_estimated_past_its_frames_runs_alone_and_its_estimates_come_down`
+//! shows the recovery on the scheduler alone. Why the slices measure slower
+//! in the loop stays open.
 
 use std::collections::BTreeMap;
 
@@ -366,24 +377,32 @@ mod tests {
     }
 
     /// A property of the core's rules, not the page's finding: a slice whose
-    /// estimate exceeds the expected budget fits no frame, so the projection
-    /// refuses every job at arrival, nothing runs, and no estimate moves
-    /// again. Rare slow measurements can put a slice there at 120 Hz, where
-    /// the expected budget is 4 400 µs, and not at 60 Hz, where it is
-    /// 12 767 µs. The Chrome runs refuted this as the page's collapse
+    /// estimate exceeds every frame's budget is handed out by no plan, so it
+    /// is never measured again and no job that has it finishes. Rare slow
+    /// measurements can put a slice there at 120 Hz, where the expected
+    /// budget is 4 400 µs, and not at 60 Hz, where it is 12 767 µs. The Chrome
+    /// runs refuted this as the page's collapse
     /// (`unstarted_slice_fits_no_frame` 0; the module documentation).
+    ///
+    /// Before #41 the projection refused every such job at arrival, so after
+    /// the first frames no slice ran at all (more than 1 000 jobs abandoned
+    /// before they started, the last slice before frame 1 500). Since, a job
+    /// with no job behind it is kept: every job starts and runs its slices up
+    /// to that one, and is missed at its deadline, so the lock that is left is
+    /// that slice's alone.
     #[test]
-    fn a_slice_estimated_over_every_expected_frame_keeps_jobs_from_starting() {
+    fn a_slice_estimated_over_every_expected_frame_keeps_jobs_from_finishing() {
         // One pass in 20 measuring 5 ms longer than it ran.
         let at_120 = simulate(8_300, 20, 5_000, 1, 3_000);
-        let last = at_120.last_slice_frame.expect("jobs ran at first");
-        assert!(last < 1_500, "{at_120:?}");
-        assert!(
-            at_120.diagnosis.unstarted > 1_000,
-            "{:?}",
-            at_120.diagnosis.unstarted
+        let last = at_120.last_slice_frame.expect("jobs ran");
+        assert!(last > 2_900, "{at_120:?}");
+        assert_eq!(at_120.diagnosis.unstarted, 0, "{at_120:?}");
+        assert_eq!(at_120.diagnosis.started, 0, "{at_120:?}");
+        assert_eq!(
+            (at_120.delivered, at_120.diagnosis.at_deadline),
+            (8, 113),
+            "{at_120:?}"
         );
-        assert!(at_120.delivered < 100, "{}", at_120.delivered);
         let at_60 = simulate(16_667, 20, 5_000, 1, 3_000);
         assert_eq!(at_60.diagnosis.unstarted, 0);
         assert_eq!(at_60.diagnosis.started + at_60.diagnosis.at_deadline, 0);
@@ -397,32 +416,39 @@ mod tests {
         assert!(steady.delivered > 300, "{}", steady.delivered);
     }
 
-    /// The refusal the Chrome run measured, as a property of the rules: a job
-    /// whose estimates sum past what its frames hold is abandoned at arrival
-    /// although every slice fits a frame, so nothing runs and the estimates
-    /// stay where they are; estimated at what it takes, the same job is
-    /// delivered every time. Seeded at four times its 29 ms (the page's had
-    /// grown to about three and a half), the job projects past 25 frames of
-    /// 4 400 µs. What made the page's estimates grow is not modelled.
+    /// The refusal the Chrome run measured, as a property of the rules, and
+    /// its recovery since #41. Seeded at four times its 29 ms (the page's had
+    /// grown to about three and a half), the job's estimates sum past what its
+    /// 25 frames of 4 400 µs hold, although every slice fits a frame.
+    ///
+    /// Before #41 the job was abandoned at arrival, nothing ran and the
+    /// estimates stayed where they were: every one of more than 2 900 inputs
+    /// was missed before its first slice, none was delivered, and the job's
+    /// estimate ended as it began. Since, a job with no job behind it is kept:
+    /// it runs what its frames hold, those slices are measured at what they
+    /// take, and once enough are the job fits and is delivered. Estimated at
+    /// what it takes, the same job is delivered every time. What made the
+    /// page's estimates grow is not modelled.
     #[test]
-    fn a_job_estimated_past_its_frames_never_starts_and_its_estimates_never_move() {
+    fn a_job_estimated_past_its_frames_runs_alone_and_its_estimates_come_down() {
         let inflated = simulate(8_300, u64::MAX, 0, 4, 3_000);
+        assert_eq!(inflated.diagnosis.unstarted, 0, "{inflated:?}");
+        assert_eq!(inflated.diagnosis.started, 0, "{inflated:?}");
+        // 29 jobs are missed, each at its deadline, while the estimates come
+        // down to what the slices take.
         assert_eq!(
-            inflated.diagnosis.started + inflated.diagnosis.at_deadline,
-            0,
+            (inflated.delivered, inflated.diagnosis.at_deadline),
+            (297, 29),
             "{inflated:?}"
         );
-        assert!(
-            inflated.diagnosis.unstarted > 2_900,
-            "{:?}",
-            inflated.diagnosis.unstarted
-        );
-        assert_eq!(inflated.delivered, 0);
-        assert_eq!(inflated.last_slice_frame, None);
-        assert_eq!(inflated.job_estimate_us.0, inflated.job_estimate_us.1);
+        assert_eq!(inflated.job_estimate_us, (115_200, 28_800));
         let measured = simulate(8_300, u64::MAX, 0, 1, 3_000);
         assert_eq!(measured.diagnosis.unstarted, 0);
-        assert!(measured.delivered > 300, "{}", measured.delivered);
+        assert_eq!(
+            measured.diagnosis.started + measured.diagnosis.at_deadline,
+            0
+        );
+        assert_eq!(measured.delivered, 425);
     }
 
     #[test]

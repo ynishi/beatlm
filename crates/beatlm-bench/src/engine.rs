@@ -878,21 +878,25 @@ mod tests {
     fn a_job_longer_than_a_frame_misses_most_inputs_when_every_frame_submits_and_none_when_free() {
         // 45 ms of work at 10 ms a frame is five frames, and latency 5 gives
         // a job six. Every frame's input: a job whose projection behind the
-        // unfinished work ahead does not fit its six frames is abandoned in
-        // the frame it arrives, and the inputs that fit are delivered. Before
-        // jobs were abandoned each kept job held the budget to its deadline,
-        // the one behind started too late, and this delivered 1 and missed
-        // 114.
-        assert_eq!(schedule_alone(Submit::Every, 45, 5, 120), (120, 26, 93));
+        // unfinished work ahead does not fit its six frames is abandoned once
+        // the next frame's input queues behind it, and the inputs that fit are
+        // delivered; the last input, with nothing behind it, is still pending
+        // when the run ends. Before jobs were abandoned each kept job held the
+        // budget to its deadline, the one behind started too late, and this
+        // delivered 1 and missed 114. Until #41 a job was abandoned in the
+        // frame it arrived, the last one too, and this missed 93.
+        assert_eq!(schedule_alone(Submit::Every, 45, 5, 120), (120, 26, 92));
         // Only once the last job's slices are all handed out: one input every
         // five frames, and every deadline that arrived is met.
         assert_eq!(schedule_alone(Submit::Free, 45, 5, 120), (24, 23, 0));
-        // At latency 3 a job gets four frames and needs five, so it is missed
-        // in the frame it is submitted, without running a slice, and the next
-        // frame takes the next input: every input is missed, and none spends
-        // GPU time. Before jobs were abandoned each ran for four frames first,
-        // and one in four was submitted.
-        assert_eq!(schedule_alone(Submit::Free, 45, 3, 120), (120, 0, 120));
+        // At latency 3 a job gets four frames and needs five. With no job
+        // behind it, it is kept: it runs four frames' slices, so they are
+        // measured, and is missed at its deadline, and the frame after takes
+        // the next input: one in four is submitted, and every one is missed.
+        // Until #41 each was missed in the frame it was submitted, without
+        // running a slice, and every frame took an input: 120 submitted, 120
+        // missed.
+        assert_eq!(schedule_alone(Submit::Free, 45, 3, 120), (30, 0, 30));
     }
 
     #[test]

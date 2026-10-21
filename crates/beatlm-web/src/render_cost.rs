@@ -14,9 +14,13 @@
 //! the rule feeds that back twice: the next frame's budget shrinks by `s`, so
 //! slice-free frames alternate with full ones; and once more than half of the
 //! recent frames ran slices, the median forecast is a render that fills the
-//! period, no slice fits an expected frame, and the scheduler abandons the job
-//! it was running. The test `a_render_that_waits_for_the_slices_starves_the_jobs`
-//! shows it on the scheduler alone. It was suspected of the depth model's
+//! period and no slice fits an expected frame. Before #41 the scheduler then
+//! abandoned the job it was running, and jobs starved: more than three missed
+//! for each delivered. Since, a job with no job behind it is kept, as every
+//! job of the `--submit free` admission is, and runs in the frames whose own
+//! budget has room, so the alternation halves what is delivered instead. The
+//! test `a_render_that_waits_for_the_slices_slows_the_jobs` shows it on the
+//! scheduler alone. It was suspected of the depth model's
 //! collapse in Chrome and measured not to be it: with the display reading no
 //! buffer a slice writes, the render measured p50 1 245 µs in frames with
 //! slices and 1 901 µs without (Chrome 154, WebGPU, Apple M1 Pro, 120 Hz,
@@ -201,17 +205,18 @@ mod tests {
     }
 
     #[test]
-    fn a_render_that_waits_for_the_slices_starves_the_jobs() {
+    fn a_render_that_waits_for_the_slices_slows_the_jobs() {
         // A job of 29 ms over budgets of 4.4 ms takes 7 frames, so a 25-frame
         // promise is met by every job when the render is measured alone...
         let alone = simulate(false, 3_000);
-        assert!(alone.delivered > 350, "{alone:?}");
-        assert_eq!(alone.missed, 0, "{alone:?}");
-        // ...and by few when its measurement carries the slices: the frames
-        // alternate between full and empty, and the forecast median, a render
-        // that fills the period, leaves no expected frame room for a slice.
+        assert_eq!((alone.delivered, alone.missed), (425, 0), "{alone:?}");
+        // ...and when its measurement carries the slices the frames alternate
+        // between full and empty, and the forecast median, a render that fills
+        // the period, leaves no expected frame room for a slice. The job, with
+        // none behind it, is kept and runs in the full frames: every promise
+        // is still met, at about half the rate. Before #41 it was abandoned
+        // and more than three jobs were missed for each delivered.
         let waits = simulate(true, 3_000);
-        println!("render measured alone: {alone:?}; with the slices: {waits:?}");
-        assert!(waits.missed > 3 * waits.delivered, "{waits:?}");
+        assert_eq!((waits.delivered, waits.missed), (218, 0), "{waits:?}");
     }
 }
