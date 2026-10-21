@@ -32,20 +32,35 @@ pub fn conv3x3(
     input: &[f32],
     weights: &[f32],
     bias: Option<&[f32]>,
-    (h, w, cin, cout): (usize, usize, usize, usize),
+    shape: (usize, usize, usize, usize),
 ) -> Vec<f32> {
-    let mut out = vec![0.0; h * w * cout];
-    for y in 0..h {
-        for x in 0..w {
+    conv3x3_strided(input, weights, bias, shape, 1)
+}
+
+/// [`conv3x3`] at `stride`: output pixel `(y, x)` is centred on input pixel
+/// `(y * stride, x * stride)`, and the result is `[oh][ow][cout]` with
+/// `oh = (h - 1) / stride + 1`, PyTorch's `floor((h + 2 - 3) / stride) + 1`.
+pub fn conv3x3_strided(
+    input: &[f32],
+    weights: &[f32],
+    bias: Option<&[f32]>,
+    (h, w, cin, cout): (usize, usize, usize, usize),
+    stride: usize,
+) -> Vec<f32> {
+    let (oh, ow) = ((h - 1) / stride + 1, (w - 1) / stride + 1);
+    let mut out = vec![0.0; oh * ow * cout];
+    for y in 0..oh {
+        for x in 0..ow {
             for co in 0..cout {
                 let mut acc = bias.map_or(0.0, |b| f64::from(b[co]));
                 for ky in 0..3 {
                     for kx in 0..3 {
-                        // The tap reads (y + ky - 1, x + kx - 1); outside the
-                        // image it reads zero and adds nothing.
-                        let (Some(iy), Some(ix)) =
-                            ((y + ky).checked_sub(1), (x + kx).checked_sub(1))
-                        else {
+                        // The tap reads (y s + ky - 1, x s + kx - 1); outside
+                        // the image it reads zero and adds nothing.
+                        let (Some(iy), Some(ix)) = (
+                            (y * stride + ky).checked_sub(1),
+                            (x * stride + kx).checked_sub(1),
+                        ) else {
                             continue;
                         };
                         if iy >= h || ix >= w {
@@ -58,11 +73,173 @@ pub fn conv3x3(
                         }
                     }
                 }
-                out[(y * w + x) * cout + co] = acc as f32;
+                out[(y * ow + x) * cout + co] = acc as f32;
             }
         }
     }
     out
+}
+
+/// 1x1 convolution plus `bias` per output channel when given: `input` is
+/// `[pixels][cin]`, `weights` `[cin][cout]`, the result `[pixels][cout]`.
+/// Written per pixel and channel, not through [`matmul`], so the two are
+/// independent definitions of the same numbers.
+pub fn conv1x1(
+    input: &[f32],
+    weights: &[f32],
+    bias: Option<&[f32]>,
+    (pixels, cin, cout): (usize, usize, usize),
+) -> Vec<f32> {
+    let mut out = vec![0.0; pixels * cout];
+    for p in 0..pixels {
+        let x = &input[p * cin..][..cin];
+        for co in 0..cout {
+            let mut acc = bias.map_or(0.0, |b| f64::from(b[co]));
+            for (ci, &v) in x.iter().enumerate() {
+                acc += f64::from(v) * f64::from(weights[ci * cout + co]);
+            }
+            out[p * cout + co] = acc as f32;
+        }
+    }
+    out
+}
+
+/// Transposed convolution of kernel and stride `f`, no padding, written as
+/// its definition: every input pixel adds its channels times each tap of the
+/// HWIO weights `[f][f][cin][cout]` into the output pixel that tap reaches,
+/// `(y f + ky, x f + kx)`; then the bias. `input` is `[h][w][cin]`, the result
+/// `[h f][w f][cout]`. The kernel gathers instead, which is the same because
+/// no two input pixels reach one output pixel; this reference does not assume
+/// that.
+pub fn conv_transpose(
+    input: &[f32],
+    weights: &[f32],
+    bias: Option<&[f32]>,
+    (h, w, cin, cout, f): (usize, usize, usize, usize, usize),
+) -> Vec<f32> {
+    let ow = w * f;
+    let mut acc = vec![0.0_f64; h * f * ow * cout];
+    for y in 0..h {
+        for x in 0..w {
+            let pixel = &input[(y * w + x) * cin..][..cin];
+            for ky in 0..f {
+                for kx in 0..f {
+                    let o = ((y * f + ky) * ow + x * f + kx) * cout;
+                    for (ci, &v) in pixel.iter().enumerate() {
+                        let taps = &weights[((ky * f + kx) * cin + ci) * cout..][..cout];
+                        for (a, &t) in acc[o..o + cout].iter_mut().zip(taps) {
+                            *a += f64::from(v) * f64::from(t);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    acc.chunks_exact(cout)
+        .flat_map(|px| {
+            px.iter()
+                .enumerate()
+                .map(|(co, &a)| (a + bias.map_or(0.0, |b| f64::from(b[co]))) as f32)
+        })
+        .collect()
+}
+
+/// Bilinear resampling with aligned corners, in `f64`: output row `oy` reads
+/// input position `oy (ih - 1) / (oh - 1)` (zero for one output row) and
+/// interpolates between the rows at its floor and the next, clamped to the
+/// last; columns likewise. `input` is `[ih][iw][c]`, the result `[oh][ow][c]`.
+pub fn resize_bilinear(
+    input: &[f32],
+    (ih, iw, oh, ow, c): (usize, usize, usize, usize, usize),
+) -> Vec<f32> {
+    // The position along one axis: the two indices and the second's weight.
+    let axis = |o: usize, input: usize, output: usize| {
+        let pos = if output > 1 {
+            o as f64 * (input - 1) as f64 / (output - 1) as f64
+        } else {
+            0.0
+        };
+        let i0 = (pos.floor() as usize).min(input - 1);
+        let i1 = (i0 + 1).min(input - 1);
+        (i0, i1, pos - i0 as f64)
+    };
+    let at = |y: usize, x: usize, ch: usize| f64::from(input[(y * iw + x) * c + ch]);
+    let mut out = Vec::with_capacity(oh * ow * c);
+    for oy in 0..oh {
+        let (y0, y1, ly) = axis(oy, ih, oh);
+        for ox in 0..ow {
+            let (x0, x1, lx) = axis(ox, iw, ow);
+            for ch in 0..c {
+                let top = (1.0 - lx) * at(y0, x0, ch) + lx * at(y0, x1, ch);
+                let bottom = (1.0 - lx) * at(y1, x0, ch) + lx * at(y1, x1, ch);
+                out.push(((1.0 - ly) * top + ly * bottom) as f32);
+            }
+        }
+    }
+    out
+}
+
+/// The two 3x3 convolutions of one pre-activation residual unit, HWIO, with
+/// their biases.
+pub struct UnitWeights<'a> {
+    /// The first convolution's weights and bias.
+    pub conv1: (&'a [f32], &'a [f32]),
+    /// The second convolution's weights and bias.
+    pub conv2: (&'a [f32], &'a [f32]),
+}
+
+/// `x + conv2(relu(conv1(relu(x))))` on an `[h][w][c]` map, both convolutions
+/// 3x3 with padding 1 from `c` to `c`: the DPT head's residual unit, written
+/// as its forward pass.
+pub fn residual_unit(
+    x: &[f32],
+    w: &UnitWeights<'_>,
+    (h, wd, c): (usize, usize, usize),
+) -> Vec<f32> {
+    let shape = (h, wd, c, c);
+    let first = conv3x3(&relu(x), w.conv1.0, Some(w.conv1.1), shape);
+    let second = conv3x3(&relu(&first), w.conv2.0, Some(w.conv2.1), shape);
+    add(&second, x)
+}
+
+/// The weights of one DPT feature-fusion layer.
+pub struct FusionWeights<'a> {
+    /// The unit applied to the stage's map; required when there is a previous
+    /// layer, and not read otherwise.
+    pub unit1: Option<UnitWeights<'a>>,
+    /// The unit applied to the sum.
+    pub unit2: UnitWeights<'a>,
+    /// The 1x1 projection after the resampling, `[c][c]` and `[c]`.
+    pub projection: (&'a [f32], &'a [f32]),
+}
+
+/// One DPT feature-fusion layer, written as its forward pass:
+/// `x = previous + unit1(stage)` (or `stage` alone without a previous layer),
+/// then `projection(resize(unit2(x), out))` with the resampling bilinear and
+/// corners aligned. `stage` and `previous` are `[size][c]`, the result
+/// `[out][c]`.
+///
+/// Panics when there is a previous layer and `w.unit1` is `None`: a test that
+/// forgot a weight.
+pub fn fusion_layer(
+    previous: Option<&[f32]>,
+    stage: &[f32],
+    w: &FusionWeights<'_>,
+    ((h, wd), (oh, ow), c): ((usize, usize), (usize, usize), usize),
+) -> Vec<f32> {
+    let x = match (previous, &w.unit1) {
+        (Some(p), Some(unit1)) => add(p, &residual_unit(stage, unit1, (h, wd, c))),
+        (Some(_), None) => panic!("a fusion layer with a previous one needs its first unit"),
+        (None, _) => stage.to_vec(),
+    };
+    let x = residual_unit(&x, &w.unit2, (h, wd, c));
+    let resized = resize_bilinear(&x, (h, wd, oh, ow, c));
+    conv1x1(
+        &resized,
+        w.projection.0,
+        Some(w.projection.1),
+        (oh * ow, c, c),
+    )
 }
 
 /// Layer normalisation over the `c` channels of each of `rows` rows, with
@@ -377,11 +554,34 @@ pub fn run(graph: &Graph, values: &mut BTreeMap<TensorId, Vec<f32>>) {
     for op in graph.ops() {
         let get = |id: TensorId| values[&id].as_slice();
         let result = match op.kind {
-            OpKind::Conv2d3x3(c) => conv3x3(
+            OpKind::Conv2d3x3(c) => conv3x3_strided(
                 get(c.input),
                 get(c.weights),
                 c.bias.map(get),
                 (n(c.height), n(c.width), n(c.cin), n(c.cout)),
+                n(c.stride),
+            ),
+            OpKind::Conv2d1x1(c) => conv1x1(
+                get(c.input),
+                get(c.weights),
+                c.bias.map(get),
+                (n(c.height) * n(c.width), n(c.cin), n(c.cout)),
+            ),
+            OpKind::ConvTranspose2d(c) => conv_transpose(
+                get(c.input),
+                get(c.weights),
+                c.bias.map(get),
+                (n(c.height), n(c.width), n(c.cin), n(c.cout), n(c.factor)),
+            ),
+            OpKind::ResizeBilinear(r) => resize_bilinear(
+                get(r.input),
+                (
+                    n(r.in_height),
+                    n(r.in_width),
+                    n(r.out_height),
+                    n(r.out_width),
+                    n(r.channels),
+                ),
             ),
             OpKind::LayerNorm(l) => layernorm(
                 get(l.input),
@@ -469,6 +669,55 @@ mod tests {
         assert_eq!(out, vec![4.0; 4]);
         let out = conv3x3(&[1.0; 4], &[1.0; 9], Some(&[0.5]), (2, 2, 1, 1));
         assert_eq!(out, vec![4.5; 4]);
+    }
+
+    #[test]
+    fn a_strided_convolution_samples_every_stride_th_pixel() {
+        // The centre-tap identity at stride 2 picks pixels (0, 0), (0, 2), ...
+        let (h, w) = (5, 4);
+        let mut weights = vec![0.0; 9];
+        weights[4] = 1.0;
+        let input: Vec<f32> = (0..h * w).map(|i| i as f32).collect();
+        let out = conv3x3_strided(&input, &weights, None, (h, w, 1, 1), 2);
+        assert_eq!(out, vec![0.0, 2.0, 8.0, 10.0, 16.0, 18.0]);
+        // All ones: corner (0, 0) sees four taps, (0, 1) at column 2 six.
+        let ones = conv3x3_strided(&[1.0; 20], &[1.0; 9], Some(&[0.5]), (h, w, 1, 1), 2);
+        assert_eq!(ones[..2], [4.5, 6.5]);
+    }
+
+    #[test]
+    fn a_1x1_convolution_is_the_matrix_product_of_its_pixels() {
+        let x: Vec<f32> = (0..15).map(|i| i as f32 * 0.25 - 1.0).collect();
+        let w: Vec<f32> = (0..6).map(|i| 0.5 - i as f32 * 0.3).collect();
+        let b = [0.1, -0.2];
+        assert_eq!(
+            conv1x1(&x, &w, Some(&b), (5, 3, 2)),
+            matmul(&x, &w, Some(&b), (5, 3, 2))
+        );
+    }
+
+    #[test]
+    fn a_transposed_convolution_writes_one_block_per_input_pixel() {
+        // A 1 x 2 one-channel map, kernel 2: each pixel's block is the pixel
+        // times the kernel, so the output rows are [a k0, a k1, b k0, b k1]
+        // and [a k2, a k3, b k2, b k3].
+        let k = [1.0, 2.0, 3.0, 4.0];
+        let out = conv_transpose(&[10.0, -1.0], &k, Some(&[0.5]), (1, 2, 1, 1, 2));
+        assert_eq!(out, vec![10.5, 20.5, -0.5, -1.5, 30.5, 40.5, -2.5, -3.5]);
+    }
+
+    #[test]
+    fn aligned_corner_resampling_keeps_the_corners_and_interpolates_linearly() {
+        // One channel, 2 x 2 to 3 x 3: the corners stay, the middle is the
+        // mean.
+        let out = resize_bilinear(&[0.0, 2.0, 4.0, 6.0], (2, 2, 3, 3, 1));
+        assert_eq!(out, vec![0.0, 1.0, 2.0, 2.0, 3.0, 4.0, 4.0, 5.0, 6.0]);
+        // A ramp stays a ramp at any size: x = 0..4 to 7 columns is 0, 0.5, ...
+        let ramp: Vec<f32> = (0..4).map(|v| v as f32).collect();
+        let wide = resize_bilinear(&ramp, (1, 4, 1, 7, 1));
+        assert_eq!(wide, vec![0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]);
+        // One output row reads row 0.
+        assert_eq!(resize_bilinear(&[1.0, 9.0], (2, 1, 1, 1, 1)), vec![1.0]);
     }
 
     #[test]

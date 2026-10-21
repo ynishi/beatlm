@@ -95,6 +95,17 @@
 //!    another operation reads, and it is deterministic: the same graph lowers
 //!    to the same program. [`Fusion::Off`] lowers the same graph to one kernel
 //!    per operation.
+//!
+//!    One element-wise operation also fuses forwards. An [`OpKind::Relu`] that
+//!    does not fold into the kernel before it becomes the
+//!    [prologue](Prologue) of the operation right after it when that is a
+//!    [`Conv2d3x3`] reading the ReLU's output as its image, and the ReLU's
+//!    output is an activation nothing else reads: the convolution then reads
+//!    the ReLU's input and applies the ReLU to each value it loads, and the
+//!    ReLU's output disappears as a fused intermediate does. Folding backwards
+//!    is tried first, so a ReLU that can join the kernel before it does. The
+//!    [DPT section](self#relu-before-a-convolution-a-prologue) says why this
+//!    case exists.
 //! 3. **Fusion changes no result beyond floating-point contraction and
 //!    reassociation.** A fused kernel applies the same operations in the same
 //!    order to the same `f32` values; the only difference is that the
@@ -102,7 +113,9 @@
 //!    loaded as `f32`, which is exact. A shader compiler may contract a
 //!    multiply and an add across the former boundary into one fused
 //!    multiply-add, or reorder an addition, and that rounding difference is the
-//!    only one fusion allows.
+//!    only one fusion allows. A ReLU prologue changes nothing at all: the
+//!    maximum of an `f32` and zero is exact, so the convolution multiplies the
+//!    same values whether the ReLU's result was stored first or not.
 //! 4. **Every kernel runs on the baseline.** Every spec has
 //!    [`Variant::Baseline`], which needs no optional feature, and
 //!    [`Graph::lower`] refuses a graph whose baseline variant would not fit
@@ -219,6 +232,77 @@
 //! expected to move if, once the products are faster, the softmax's share
 //! grows to matter: an online-softmax kernel removes the 90 MB and the two
 //! dispatches and keeps every other operation as it is.
+//!
+//! # Dense prediction (DPT) operations
+//!
+//! The DPT head of Depth Anything V2 is these operations, with
+//! [`OpKind::Relu`] and [`OpKind::Add`]. As for the vision transformer, how
+//! each fuses and splits follows from rules 2 and 6, and the table says what
+//! that comes to.
+//!
+//! | Operation | Fuses into the kernel before it | Takes epilogues | Splits along |
+//! |---|---|---|---|
+//! | [`Conv2d3x3`], any stride, bias or none | no: heavy | yes, and a ReLU [prologue](Prologue) | output pixels |
+//! | [`Conv2d1x1`] | no: heavy, a [`MatMul`] of the pixels | yes | pixels, in tile rows |
+//! | [`ConvTranspose2d`] | no: heavy | yes | output pixels |
+//! | [`ResizeBilinear`] | no: its output index is not its input's | yes | output pixels |
+//! | [`OpKind::Relu`] whose input has another consumer, before a [`Conv2d3x3`] | no, so it becomes that convolution's prologue | — | — |
+//!
+//! None of them declares workgroup memory but the 1x1 convolution, which is
+//! the matrix multiply's 2 KiB. Their tensors fit the baseline's 128 MiB per
+//! binding (rule 3 of the [memory plan](crate::memory#rules)): the largest of
+//! Depth Anything V2 Small at 518 pixels are the head's two `518 x 518 x 32`
+//! maps, 34 345 472 bytes each, and the last fusion layer's `296 x 296 x 64`,
+//! 22 429 696 bytes.
+//!
+//! ## ReLU before a convolution: a prologue
+//!
+//! The DPT head's residual unit is pre-activation,
+//! `x + conv2(relu(conv1(relu(x))))`. The inner ReLU folds into `conv1` as an
+//! epilogue by rule 2. The outer one cannot: its input `x` is also the
+//! residual, so it has a second consumer, and folding backwards never crosses
+//! such a tensor. Left alone it is a kernel of its own that reads `x` and
+//! writes `relu(x)` for `conv1` and nothing else. Depth Anything V2 has seven
+//! such units, two in each fusion layer but the deepest, which has one, at up
+//! to `148 x 148 x 64` (5.6 MB).
+//!
+//! The choice was between that standalone kernel and applying the ReLU as
+//! `conv1` loads its input. The prologue was chosen: it removes one dispatch
+//! per unit, which is where the host's encode time and the frame's CPU-side
+//! variance go (the concurrency model in the `beatlm` crate documentation),
+//! and the write and read of a tensor of `x`'s size and its place in the
+//! memory plan, for a `max` on every value the convolution loads. That is far
+//! more `max`es than a standalone kernel's one per element, because the
+//! convolution loads each input value once per tap and output channel, 9 x 64
+//! times at the head's width; the measurement below is what says whether they
+//! cost anything. The ReLU is exact, so no result changes (rule 3).
+//!
+//! What it comes to was measured with Depth Anything V2 Small's real weights
+//! at 518 pixels by the `beatlm` crate's test
+//! `the_whole_model_on_the_gpu_matches_the_reference_depth`, which runs the
+//! model fused and unfused, on an Apple M1 Pro, Metal, on 2026-10-21 (two
+//! invocations, five runs each). The prologues take the fused decoder from 44
+//! kernels to 37. In the unfused program the seven standalone ReLUs took 155
+//! and 151 microseconds of GPU time in all, by per-kernel median (7 to 51
+//! each, the most at 148 x 148), while the decoder's 21 convolutions took
+//! 128.7 ms fused, seven of them with a prologue, and 128.0 ms unfused: both
+//! differences are within the spread of the whole model's time between runs
+//! (862 to 878 ms fused). So the prologue costs and saves no GPU time these
+//! runs can see; it is chosen for the seven dispatches.
+//!
+//! The same runs put the decoder's 37 kernels at 145.6 and 146.0 ms of GPU
+//! time per run, by summed per-kernel medians, against the encoder's 715 and
+//! 718 ms. Of the
+//! decoder's, the 3x3 convolutions took 129 ms (the one-invocation-per-output
+//! kernel, nine taps times the input channels per element, at up to 518 x
+//! 518), the 1x1 convolutions 15 ms, the transposed convolutions 1.2 ms and
+//! the resamplings 0.8 ms.
+//!
+//! It is no wider than this case: one step, ReLU, into one main operation,
+//! the 3x3 convolution, because that is the case the model has. A prologue
+//! on another main operation is a change to its template, and a step that
+//! reads a tensor, such as an add, would bind one more; each waits for a model
+//! that needs it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
@@ -328,15 +412,76 @@ impl TensorRole {
     }
 }
 
-/// A 3x3 convolution, stride 1, zero padding of 1, of one NHWC image.
+/// A 3x3 convolution with zero padding of 1 and stride `stride`, of one NHWC
+/// image.
 ///
 /// Reads `input` (`[height][width][cin]`), `weights` (`[3][3][cin][cout]`)
-/// and, when present, `bias` (`[cout]`); writes `[height][width][cout]`.
+/// and, when present, `bias` (`[cout]`); writes
+/// `[out_height][out_width][cout]`. Output pixel `(y, x)` is centred on input
+/// pixel `(y * stride, x * stride)`, so the output has
+/// `(height - 1) / stride + 1` rows ([`out_height`](Self::out_height)), which
+/// is PyTorch's `floor((height + 2 * 1 - 3) / stride) + 1`: a stride of one
+/// keeps the size, a stride of two takes 37 rows to 19.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Conv2d3x3 {
     /// The image.
     pub input: TensorId,
     /// The HWIO weights.
+    pub weights: TensorId,
+    /// One value per output channel added to every pixel, or none.
+    pub bias: Option<TensorId>,
+    /// Input height in pixels.
+    pub height: u32,
+    /// Input width in pixels.
+    pub width: u32,
+    /// Input channels.
+    pub cin: u32,
+    /// Output channels.
+    pub cout: u32,
+    /// Step between the input pixels two neighbouring outputs are centred
+    /// on, in both directions; at least one.
+    pub stride: u32,
+}
+
+impl Conv2d3x3 {
+    /// Rows of the output; the graph refuses a stride of zero.
+    #[must_use]
+    pub const fn out_height(&self) -> u32 {
+        strided(self.height, self.stride)
+    }
+
+    /// Columns of the output; the graph refuses a stride of zero.
+    #[must_use]
+    pub const fn out_width(&self) -> u32 {
+        strided(self.width, self.stride)
+    }
+}
+
+/// The output extent of a 3x3 window with padding 1 over `extent` at
+/// `stride`; zero for a zero extent or stride, which the graph refuses.
+const fn strided(extent: u32, stride: u32) -> u32 {
+    if extent == 0 || stride == 0 {
+        0
+    } else {
+        (extent - 1) / stride + 1
+    }
+}
+
+/// A 1x1 convolution of one NHWC image: every pixel's channels times one
+/// `[cin][cout]` matrix, plus `bias` per output channel when present.
+///
+/// Reads `input` (`[height][width][cin]`), `weights` (`[1][1][cin][cout]`,
+/// HWIO, which is `[cin][cout]`) and `bias` (`[cout]`); writes
+/// `[height][width][cout]`. In NHWC that is exactly the matrix product of the
+/// `[height * width][cin]` pixels and the weights, in the same layouts, so it
+/// lowers to a [`MainOp::MatMul`] of `height * width` rows: the tiled kernel
+/// runs it and it splits along pixels in tile rows, with nothing of its own to
+/// generate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Conv2d1x1 {
+    /// The image.
+    pub input: TensorId,
+    /// The weights, `[cin][cout]`.
     pub weights: TensorId,
     /// One value per output channel added to every pixel, or none.
     pub bias: Option<TensorId>,
@@ -348,6 +493,113 @@ pub struct Conv2d3x3 {
     pub cin: u32,
     /// Output channels.
     pub cout: u32,
+}
+
+impl Conv2d1x1 {
+    /// The matrix multiply the convolution is. The graph bounds the output,
+    /// so `height * width` fits a `u32`.
+    const fn as_matmul(&self) -> MatMul {
+        MatMul {
+            a: self.input,
+            b: self.weights,
+            bias: self.bias,
+            m: self.height.saturating_mul(self.width),
+            k: self.cin,
+            n: self.cout,
+        }
+    }
+}
+
+/// A transposed convolution of one NHWC image whose kernel and stride are both
+/// `factor`, without padding: it enlarges the image `factor` times.
+///
+/// Reads `input` (`[height][width][cin]`), `weights`
+/// (`[factor][factor][cin][cout]`, HWIO like the IR's other convolutions;
+/// PyTorch stores a transposed convolution's as `[cin][cout][kh][kw]`) and,
+/// when present, `bias` (`[cout]`); writes
+/// `[height * factor][width * factor][cout]`, with
+///
+/// ```text
+/// out[y * factor + ky][x * factor + kx][co]
+///     = bias[co] + sum over ci of in[y][x][ci] * w[ky][kx][ci][co]
+/// ```
+///
+/// Because the stride is the kernel size, the windows of two input pixels do
+/// not overlap: each input pixel writes its own `factor x factor` block, and
+/// every output element is a sum over the channels of one input pixel. A
+/// kernel therefore computes each output element by itself, as a gather, with
+/// no accumulation across input pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ConvTranspose2d {
+    /// The image.
+    pub input: TensorId,
+    /// The HWIO weights.
+    pub weights: TensorId,
+    /// One value per output channel added to every pixel, or none.
+    pub bias: Option<TensorId>,
+    /// Input height in pixels.
+    pub height: u32,
+    /// Input width in pixels.
+    pub width: u32,
+    /// Input channels.
+    pub cin: u32,
+    /// Output channels.
+    pub cout: u32,
+    /// The kernel size and the stride: how many times larger the output is in
+    /// each direction.
+    pub factor: u32,
+}
+
+/// Bilinear resampling of one NHWC map to another size, with the corners
+/// aligned: PyTorch's `interpolate(mode="bilinear", align_corners=True)`.
+///
+/// Reads `input` (`[in_height][in_width][channels]`); writes
+/// `[out_height][out_width][channels]`. Output row `oy` reads input row
+/// `oy * (in_height - 1) / (out_height - 1)` (zero when `out_height` is one),
+/// so the first and last rows of the two maps coincide, and interpolates
+/// linearly between the two input rows around it; columns likewise. Every
+/// element is a weighted sum of at most four input elements of its channel.
+/// Upsampling by a factor is this with the output size the factor gives:
+/// with aligned corners PyTorch derives the sampling ratio from the two sizes
+/// alone, also when it was given a scale factor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResizeBilinear {
+    /// The map.
+    pub input: TensorId,
+    /// Rows of the input.
+    pub in_height: u32,
+    /// Columns of the input.
+    pub in_width: u32,
+    /// Rows of the output.
+    pub out_height: u32,
+    /// Columns of the output.
+    pub out_width: u32,
+    /// Channels of both.
+    pub channels: u32,
+}
+
+impl ResizeBilinear {
+    /// The step in input rows between two output rows, and in input columns
+    /// between two output columns, in `f32` as PyTorch computes it:
+    /// `(in - 1) / (out - 1)` rounded once, and zero for an output of one.
+    /// A kernel that uses this value samples the points PyTorch does.
+    #[must_use]
+    pub fn ratios(&self) -> (f32, f32) {
+        let ratio = |input: u32, output: u32| {
+            if output > 1 {
+                // As PyTorch does: each size converted to `f32`, which is
+                // exact below 2^24 (every map of Depth Anything V2) and rounds
+                // as PyTorch's conversion does past it, then one division.
+                (input.saturating_sub(1)) as f32 / (output - 1) as f32
+            } else {
+                0.0
+            }
+        };
+        (
+            ratio(self.in_height, self.out_height),
+            ratio(self.in_width, self.out_width),
+        )
+    }
 }
 
 /// Layer normalisation over the last dimension:
@@ -517,6 +769,12 @@ pub struct MatMul {
 pub enum OpKind {
     /// A 3x3 convolution.
     Conv2d3x3(Conv2d3x3),
+    /// A 1x1 convolution, run as a matrix multiply.
+    Conv2d1x1(Conv2d1x1),
+    /// A transposed convolution whose kernel is its stride.
+    ConvTranspose2d(ConvTranspose2d),
+    /// Bilinear resampling with aligned corners.
+    ResizeBilinear(ResizeBilinear),
     /// A layer norm over channels.
     LayerNorm(LayerNorm),
     /// A matrix multiply.
@@ -616,6 +874,25 @@ impl OpKind {
                 r.extend(c.bias.map(|b| (b, u64::from(c.cout))));
                 r
             }
+            Self::Conv2d1x1(c) => {
+                let mut r = vec![
+                    (c.input, mul(&[c.height, c.width, c.cin])),
+                    (c.weights, mul(&[c.cin, c.cout])),
+                ];
+                r.extend(c.bias.map(|b| (b, u64::from(c.cout))));
+                r
+            }
+            Self::ConvTranspose2d(c) => {
+                let mut r = vec![
+                    (c.input, mul(&[c.height, c.width, c.cin])),
+                    (c.weights, mul(&[c.factor, c.factor, c.cin, c.cout])),
+                ];
+                r.extend(c.bias.map(|b| (b, u64::from(c.cout))));
+                r
+            }
+            Self::ResizeBilinear(r) => {
+                vec![(r.input, mul(&[r.in_height, r.in_width, r.channels]))]
+            }
             Self::LayerNorm(l) => vec![
                 (l.input, mul(&[l.rows, l.channels])),
                 (l.gamma, u64::from(l.channels)),
@@ -672,7 +949,10 @@ impl OpKind {
     #[must_use]
     pub fn output_elements(&self) -> u64 {
         match *self {
-            Self::Conv2d3x3(c) => product(&[c.height, c.width, c.cout]),
+            Self::Conv2d3x3(c) => product(&[c.out_height(), c.out_width(), c.cout]),
+            Self::Conv2d1x1(c) => product(&[c.height, c.width, c.cout]),
+            Self::ConvTranspose2d(c) => product(&[c.height, c.factor, c.width, c.factor, c.cout]),
+            Self::ResizeBilinear(r) => product(&[r.out_height, r.out_width, r.channels]),
             Self::LayerNorm(l) => product(&[l.rows, l.channels]),
             Self::MatMul(mm) => product(&[mm.m, mm.n]),
             Self::PatchEmbed(p) => product(&[p.grid_h, p.grid_w, p.cout]),
@@ -695,7 +975,17 @@ impl OpKind {
     /// Whether any dimension of the operation is zero.
     fn has_zero_dimension(&self) -> bool {
         match *self {
-            Self::Conv2d3x3(c) => [c.height, c.width, c.cin, c.cout].contains(&0),
+            Self::Conv2d3x3(c) => [c.height, c.width, c.cin, c.cout, c.stride].contains(&0),
+            Self::Conv2d1x1(c) => [c.height, c.width, c.cin, c.cout].contains(&0),
+            Self::ConvTranspose2d(c) => [c.height, c.width, c.cin, c.cout, c.factor].contains(&0),
+            Self::ResizeBilinear(r) => [
+                r.in_height,
+                r.in_width,
+                r.out_height,
+                r.out_width,
+                r.channels,
+            ]
+            .contains(&0),
             Self::LayerNorm(l) => l.rows == 0 || l.channels == 0,
             Self::MatMul(mm) => [mm.m, mm.k, mm.n].contains(&0),
             Self::PatchEmbed(p) => [p.grid_h, p.grid_w, p.patch, p.cin, p.cout].contains(&0),
@@ -728,6 +1018,9 @@ impl OpKind {
         let map = |input, elements| MainOp::Map { input, elements };
         match *self {
             Self::Conv2d3x3(c) => (MainOp::Conv2d3x3(c), Vec::new()),
+            Self::Conv2d1x1(c) => (MainOp::MatMul(c.as_matmul()), Vec::new()),
+            Self::ConvTranspose2d(c) => (MainOp::ConvTranspose2d(c), Vec::new()),
+            Self::ResizeBilinear(r) => (MainOp::ResizeBilinear(r), Vec::new()),
             Self::LayerNorm(l) => (MainOp::LayerNorm(l), Vec::new()),
             Self::MatMul(mm) => (MainOp::MatMul(mm), Vec::new()),
             Self::PatchEmbed(p) => (MainOp::PatchEmbed(p), Vec::new()),
@@ -978,6 +1271,9 @@ impl Graph {
         }
 
         let mut kernels: Vec<KernelSpec> = Vec::new();
+        // The ReLU the next kernel applies as its prologue: its operation and
+        // the convolution after it, reading the ReLU's input.
+        let mut deferred: Option<(usize, Conv2d3x3)> = None;
         for (index, op) in self.ops.iter().enumerate() {
             if fusion == Fusion::On {
                 if let Some(last) = kernels.last_mut() {
@@ -986,13 +1282,25 @@ impl Graph {
                         continue;
                     }
                 }
+                if let Some(conv) = self.relu_prologue(index, &consumers) {
+                    deferred = Some((index, conv));
+                    continue;
+                }
             }
-            let (main, epilogue) = op.kind.standalone();
+            let (mut main, epilogue) = op.kind.standalone();
+            let mut prologue = Vec::new();
+            let mut start = index;
+            if let Some((relu, conv)) = deferred.take() {
+                main = MainOp::Conv2d3x3(conv);
+                prologue.push(Prologue::Relu);
+                start = relu;
+            }
             kernels.push(KernelSpec::whole_of(
                 main,
+                prologue,
                 epilogue,
                 op.output,
-                index..index + 1,
+                start..index + 1,
             ));
         }
         for spec in &kernels {
@@ -1032,6 +1340,33 @@ impl Graph {
         *kernel = fused;
         true
     }
+
+    /// When operation `index` is a ReLU that rule 2 of the module
+    /// documentation folds into the 3x3 convolution after it as a prologue,
+    /// that convolution reading the ReLU's input instead of its output.
+    ///
+    /// It is, when the next operation is a [`Conv2d3x3`] whose image is the
+    /// ReLU's output, that output is an activation and the convolution reads
+    /// it once and nothing else reads it. The convolution then binds the
+    /// ReLU's input in place of its output, so its bindings are as many as
+    /// before.
+    fn relu_prologue(
+        &self,
+        index: usize,
+        consumers: &BTreeMap<TensorId, usize>,
+    ) -> Option<Conv2d3x3> {
+        let OpKind::Relu { input, .. } = self.ops.get(index)?.kind else {
+            return None;
+        };
+        let relu = self.ops[index].output;
+        let OpKind::Conv2d3x3(conv) = self.ops.get(index + 1)?.kind else {
+            return None;
+        };
+        let alone = self.role(relu) == Some(TensorRole::Activation)
+            && consumers.get(&relu).copied() == Some(1)
+            && conv.input == relu;
+        alone.then_some(Conv2d3x3 { input, ..conv })
+    }
 }
 
 /// The heavy part of a kernel: what it computes before its epilogue.
@@ -1039,6 +1374,11 @@ impl Graph {
 pub enum MainOp {
     /// A 3x3 convolution, one invocation per output element.
     Conv2d3x3(Conv2d3x3),
+    /// A transposed convolution whose kernel is its stride, one invocation per
+    /// output element, each reading the one input pixel whose block it is in.
+    ConvTranspose2d(ConvTranspose2d),
+    /// Bilinear resampling, one invocation per output element.
+    ResizeBilinear(ResizeBilinear),
     /// A layer norm, one workgroup per row.
     LayerNorm(LayerNorm),
     /// A tiled matrix multiply, one workgroup per output tile.
@@ -1077,6 +1417,11 @@ impl MainOp {
                 .into_iter()
                 .flatten()
                 .collect(),
+            Self::ConvTranspose2d(c) => [Some(c.input), Some(c.weights), c.bias]
+                .into_iter()
+                .flatten()
+                .collect(),
+            Self::ResizeBilinear(r) => vec![r.input],
             Self::LayerNorm(l) => vec![l.input, l.gamma, l.beta],
             Self::MatMul(mm) => [Some(mm.a), Some(mm.b), mm.bias]
                 .into_iter()
@@ -1100,6 +1445,8 @@ impl MainOp {
     fn output_elements(&self) -> u64 {
         match *self {
             Self::Conv2d3x3(c) => OpKind::Conv2d3x3(c).output_elements(),
+            Self::ConvTranspose2d(c) => OpKind::ConvTranspose2d(c).output_elements(),
+            Self::ResizeBilinear(r) => OpKind::ResizeBilinear(r).output_elements(),
             Self::LayerNorm(l) => OpKind::LayerNorm(l).output_elements(),
             Self::MatMul(mm) => OpKind::MatMul(mm).output_elements(),
             Self::PatchEmbed(p) => OpKind::PatchEmbed(p).output_elements(),
@@ -1112,10 +1459,14 @@ impl MainOp {
         }
     }
 
-    /// A short name for labels and file names.
-    const fn name(&self) -> &'static str {
+    /// A short name for labels and file names: the kind of kernel, without
+    /// its prologue and epilogue, so a host can group measured times by kind.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
         match self {
             Self::Conv2d3x3(_) => "conv2d3x3",
+            Self::ConvTranspose2d(_) => "conv_transpose2d",
+            Self::ResizeBilinear(_) => "resize_bilinear",
             Self::LayerNorm(_) => "layernorm",
             Self::MatMul(_) => "matmul",
             Self::PatchEmbed(_) => "patch_embed",
@@ -1134,7 +1485,9 @@ impl MainOp {
     fn split_extent(&self) -> u32 {
         let narrow = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
         match *self {
-            Self::Conv2d3x3(c) => narrow(product(&[c.height, c.width])),
+            Self::Conv2d3x3(c) => narrow(product(&[c.out_height(), c.out_width()])),
+            Self::ConvTranspose2d(c) => narrow(product(&[c.height, c.factor, c.width, c.factor])),
+            Self::ResizeBilinear(r) => narrow(product(&[r.out_height, r.out_width])),
             Self::LayerNorm(l) => l.rows,
             Self::MatMul(mm) => mm.m,
             Self::PatchEmbed(p) => narrow(product(&[p.grid_h, p.grid_w])),
@@ -1170,6 +1523,8 @@ impl MainOp {
     fn elements_per_unit(&self) -> u64 {
         match *self {
             Self::Conv2d3x3(c) => c.cout.into(),
+            Self::ConvTranspose2d(c) => c.cout.into(),
+            Self::ResizeBilinear(r) => r.channels.into(),
             Self::LayerNorm(l) => l.channels.into(),
             Self::MatMul(mm) => mm.n.into(),
             Self::PatchEmbed(p) => p.cout.into(),
@@ -1243,6 +1598,28 @@ impl Epilogue {
     }
 }
 
+/// One element-wise step applied to every element of a kernel's main input as
+/// it is loaded, before the main operation uses it.
+///
+/// Only a [`MainOp::Conv2d3x3`] takes one, and only [`Prologue::Relu`] exists:
+/// the [DPT section](self#relu-before-a-convolution-a-prologue) says why the
+/// pre-activation residual unit needs it and why it is no wider. A step here
+/// reads no tensor, so a prologue binds nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Prologue {
+    /// `max(v, 0)`, as [`OpKind::Relu`].
+    Relu,
+}
+
+impl Prologue {
+    /// A short name for labels and file names.
+    const fn name(&self) -> &'static str {
+        match self {
+            Self::Relu => "relu",
+        }
+    }
+}
+
 /// One way of running a kernel, with what it needs from a device.
 ///
 /// Variants that need an optional feature are listed before the baseline in
@@ -1296,7 +1673,8 @@ pub enum Limit {
 /// `count`, covering `range` of the kernel's split dimension.
 ///
 /// The split dimension is the one the kernel's grid walks in output order: the
-/// output pixels of a convolution, the rows of a layer norm or a softmax, the
+/// output pixels of a convolution, a transposed convolution and a bilinear
+/// resampling, the rows of a layer norm or a softmax, the
 /// output rows of a matrix multiply, the patches of a patch embedding, the
 /// query rows of the attention scores and of the weighted sum of the values,
 /// and the elements of a standalone element-wise kernel and of the token
@@ -1346,6 +1724,7 @@ impl Part {
 #[derive(Debug, Clone, PartialEq)]
 pub struct KernelSpec {
     main: MainOp,
+    prologue: Vec<Prologue>,
     epilogue: Vec<Epilogue>,
     output: TensorId,
     ops: Range<usize>,
@@ -1356,6 +1735,7 @@ impl KernelSpec {
     /// A spec running `main` whole.
     fn whole_of(
         main: MainOp,
+        prologue: Vec<Prologue>,
         epilogue: Vec<Epilogue>,
         output: TensorId,
         ops: Range<usize>,
@@ -1367,6 +1747,7 @@ impl KernelSpec {
         };
         Self {
             main,
+            prologue,
             epilogue,
             output,
             ops,
@@ -1386,6 +1767,7 @@ impl KernelSpec {
     pub fn whole(&self) -> Self {
         Self::whole_of(
             self.main,
+            self.prologue.clone(),
             self.epilogue.clone(),
             self.output,
             self.ops.clone(),
@@ -1478,6 +1860,13 @@ impl KernelSpec {
         &self.main
     }
 
+    /// The element-wise steps applied to the main input as it is loaded, in
+    /// order; empty for every kernel but a convolution a ReLU was folded into.
+    #[must_use]
+    pub fn prologue(&self) -> &[Prologue] {
+        &self.prologue
+    }
+
     /// The element-wise steps applied before the result is stored, in order.
     #[must_use]
     pub fn epilogue(&self) -> &[Epilogue] {
@@ -1522,11 +1911,17 @@ impl KernelSpec {
         out
     }
 
-    /// A short name naming the main operation and the epilogue, such as
-    /// `matmul+add+scale`, for labels and file names.
+    /// A short name naming the prologue, the main operation and the epilogue,
+    /// such as `matmul+add+scale`, or `relu-conv2d3x3+relu` for a convolution
+    /// that applies a ReLU to its input, for labels and file names.
     #[must_use]
     pub fn name(&self) -> String {
-        let mut name = String::from(self.main.name());
+        let mut name = String::new();
+        for step in &self.prologue {
+            name.push_str(step.name());
+            name.push('-');
+        }
+        name.push_str(self.main.name());
         for step in &self.epilogue {
             name.push('+');
             name.push_str(step.name());
@@ -1544,6 +1939,8 @@ impl KernelSpec {
         let units = self.part.range.end - self.part.range.start;
         let (workgroup_size, workgroups, workgroup_storage_bytes) = match self.main {
             MainOp::Conv2d3x3(_)
+            | MainOp::ConvTranspose2d(_)
+            | MainOp::ResizeBilinear(_)
             | MainOp::PrependToken(_)
             | MainOp::TokensToMap(_)
             | MainOp::Map { .. } => {
@@ -2326,6 +2723,7 @@ mod tests {
                     width: 9,
                     cin: 3,
                     cout: 5,
+                    stride: 1,
                 }),
                 A,
             ),
@@ -2439,7 +2837,14 @@ mod tests {
     /// of a single unit and ones no tile or workgroup divides.
     fn shapes() -> Vec<OpKind> {
         let mut kinds = Vec::new();
-        for (height, width, cin, cout) in [(1, 1, 1, 1), (7, 9, 3, 5), (3, 17, 2, 4)] {
+        for (height, width, cin, cout, stride) in [
+            (1, 1, 1, 1, 1),
+            (7, 9, 3, 5, 1),
+            (3, 17, 2, 4, 1),
+            (1, 1, 1, 1, 2),
+            (7, 9, 3, 5, 2),
+            (8, 3, 2, 3, 3),
+        ] {
             kinds.push(OpKind::Conv2d3x3(Conv2d3x3 {
                 input: X,
                 weights: W,
@@ -2448,6 +2853,7 @@ mod tests {
                 width,
                 cin,
                 cout,
+                stride,
             }));
         }
         for (rows, channels) in [(1, 1), (63, 5), (100, 3)] {
@@ -2475,6 +2881,57 @@ mod tests {
             kinds.push(OpKind::GeluErf { input: X, elements });
         }
         kinds.extend(encoder_shapes());
+        kinds.extend(decoder_shapes());
+        kinds
+    }
+
+    /// One operation of each DPT kind, at a single unit, at shapes no
+    /// workgroup or tile divides, and at shapes of Depth Anything V2 Small at
+    /// 518 pixels whose part counts stay small enough to try every count up
+    /// to them (the 37 x 37 grid, its first fusion layer's resampling; the
+    /// larger maps split by the same arithmetic).
+    fn decoder_shapes() -> Vec<OpKind> {
+        let mut kinds = Vec::new();
+        for (height, width, cin, cout) in [(1, 1, 1, 1), (5, 7, 3, 19), (37, 37, 384, 48)] {
+            kinds.push(OpKind::Conv2d1x1(Conv2d1x1 {
+                input: X,
+                weights: W,
+                bias: Some(BIAS),
+                height,
+                width,
+                cin,
+                cout,
+            }));
+        }
+        for (height, width, cin, cout, factor) in
+            [(1, 1, 1, 1, 1), (3, 5, 2, 7, 3), (10, 9, 48, 48, 4)]
+        {
+            kinds.push(OpKind::ConvTranspose2d(ConvTranspose2d {
+                input: X,
+                weights: W,
+                bias: Some(BIAS),
+                height,
+                width,
+                cin,
+                cout,
+                factor,
+            }));
+        }
+        for (in_height, in_width, out_height, out_width, channels) in [
+            (1, 1, 1, 1, 1),
+            (3, 5, 7, 2, 3),
+            (19, 19, 37, 37, 64),
+            (37, 37, 74, 74, 64),
+        ] {
+            kinds.push(OpKind::ResizeBilinear(ResizeBilinear {
+                input: X,
+                in_height,
+                in_width,
+                out_height,
+                out_width,
+                channels,
+            }));
+        }
         kinds
     }
 
@@ -2618,6 +3075,8 @@ mod tests {
                         groups * u64::from(r.workgroup_size[0]) * u64::from(r.workgroup_size[1]);
                     match spec.main() {
                         MainOp::Conv2d3x3(_)
+                        | MainOp::ConvTranspose2d(_)
+                        | MainOp::ResizeBilinear(_)
                         | MainOp::PrependToken(_)
                         | MainOp::TokensToMap(_)
                         | MainOp::Map { .. } => {
@@ -3241,6 +3700,358 @@ mod tests {
         )
         .unwrap();
         assert_eq!(g.lower(Fusion::On).unwrap().kernels().len(), 2);
+    }
+
+    /// A 3x3 convolution of a `4 x 5 x 2` map to two channels, bias `BIAS`
+    /// (two elements), weights `W`.
+    fn conv(input: TensorId) -> OpKind {
+        OpKind::Conv2d3x3(Conv2d3x3 {
+            input,
+            weights: W,
+            bias: Some(BIAS),
+            height: 4,
+            width: 5,
+            cin: 2,
+            cout: 2,
+            stride: 1,
+        })
+    }
+
+    /// A graph for the residual-unit tests: `X` the input, `W` and `BIAS` the
+    /// convolution's weights, every other tensor `4 x 5 x 2`.
+    fn unit_graph(activations: &[TensorId], output: TensorRole) -> Graph {
+        let mut g = Graph::new();
+        g.tensor(X, TensorRole::Input, 40).unwrap();
+        g.tensor(W, TensorRole::Weight, 9 * 2 * 2).unwrap();
+        g.tensor(BIAS, TensorRole::Weight, 2).unwrap();
+        for &t in activations {
+            g.tensor(t, TensorRole::Activation, 40).unwrap();
+        }
+        g.tensor(Y, output, 40).unwrap();
+        g
+    }
+
+    fn relu40(input: TensorId) -> OpKind {
+        OpKind::Relu {
+            input,
+            elements: 40,
+        }
+    }
+
+    fn names(p: &Program) -> Vec<String> {
+        p.kernels().iter().map(KernelSpec::name).collect()
+    }
+
+    #[test]
+    fn a_relu_whose_input_is_also_the_residual_becomes_the_next_convolutions_prologue() {
+        // A = conv(X); Y = conv(relu(A)) + A: the residual unit's shape. A has
+        // two consumers, so the ReLU cannot join A's kernel and joins the
+        // convolution after it instead.
+        let mut g = unit_graph(&[A, B, C], TensorRole::Output);
+        push(&mut g, (conv(X), A));
+        push(&mut g, (relu40(A), B));
+        push(&mut g, (conv(B), C));
+        push(
+            &mut g,
+            (
+                OpKind::Add {
+                    a: C,
+                    b: A,
+                    elements: 40,
+                },
+                Y,
+            ),
+        );
+        let p = g.lower(Fusion::On).unwrap();
+        assert_eq!(names(&p), vec!["conv2d3x3", "relu-conv2d3x3+add"]);
+        let k = &p.kernels()[1];
+        assert_eq!(k.prologue(), &[Prologue::Relu]);
+        assert_eq!(k.ops(), 1..4);
+        let MainOp::Conv2d3x3(c) = k.main() else {
+            panic!("{:?}", k.main());
+        };
+        // The convolution reads the ReLU's input, which the add reads too, so
+        // it is bound once.
+        assert_eq!(c.input, A);
+        assert_eq!(k.bindings(), vec![A, W, BIAS, Y]);
+        assert_eq!(lifetime(&p, B), None, "the ReLU's output is fused away");
+        assert_eq!(lifetime(&p, C), None);
+        assert_eq!(lifetime(&p, A), Some((0, 1)));
+
+        // Fusion off: one kernel per operation, the ReLU standalone.
+        let off = g.lower(Fusion::Off).unwrap();
+        assert_eq!(
+            names(&off),
+            vec!["conv2d3x3", "map+relu", "conv2d3x3", "map+add"]
+        );
+        assert!(off.kernels().iter().all(|k| k.prologue().is_empty()));
+    }
+
+    #[test]
+    fn a_relu_that_folds_into_the_kernel_before_it_is_not_a_prologue() {
+        let mut g = unit_graph(&[A, B], TensorRole::Output);
+        push(&mut g, (conv(X), A));
+        push(&mut g, (relu40(A), B));
+        push(&mut g, (conv(B), Y));
+        assert_eq!(
+            names(&g.lower(Fusion::On).unwrap()),
+            vec!["conv2d3x3+relu", "conv2d3x3"]
+        );
+        // With nothing before it, a ReLU of an input folds forwards.
+        let mut g = unit_graph(&[B], TensorRole::Output);
+        push(&mut g, (relu40(X), B));
+        push(&mut g, (conv(B), Y));
+        let p = g.lower(Fusion::On).unwrap();
+        assert_eq!(names(&p), vec!["relu-conv2d3x3"]);
+        assert_eq!(p.kernels()[0].bindings(), vec![X, W, BIAS, Y]);
+    }
+
+    #[test]
+    fn a_relu_is_a_prologue_only_of_a_convolution_right_after_it_that_alone_reads_it() {
+        // The ReLU's output is also read by an add.
+        let mut g = unit_graph(&[A, B, C, SUM], TensorRole::Output);
+        push(&mut g, (conv(X), A));
+        push(&mut g, (relu40(X), B));
+        push(&mut g, (conv(B), C));
+        push(
+            &mut g,
+            (
+                OpKind::Add {
+                    a: B,
+                    b: C,
+                    elements: 40,
+                },
+                SUM,
+            ),
+        );
+        push(
+            &mut g,
+            (
+                OpKind::Add {
+                    a: SUM,
+                    b: A,
+                    elements: 40,
+                },
+                Y,
+            ),
+        );
+        assert_eq!(
+            names(&g.lower(Fusion::On).unwrap()),
+            vec!["conv2d3x3", "map+relu", "conv2d3x3+add+add"]
+        );
+
+        // Something else comes between the ReLU and the convolution.
+        let mut g = unit_graph(&[A, B, C], TensorRole::Output);
+        push(&mut g, (relu40(X), B));
+        push(&mut g, (conv(X), A));
+        push(&mut g, (conv(B), C));
+        push(
+            &mut g,
+            (
+                OpKind::Add {
+                    a: A,
+                    b: C,
+                    elements: 40,
+                },
+                Y,
+            ),
+        );
+        assert_eq!(
+            names(&g.lower(Fusion::On).unwrap()),
+            vec!["map+relu", "conv2d3x3", "conv2d3x3+add"]
+        );
+
+        // The ReLU's output is a graph output.
+        let mut g = unit_graph(&[], TensorRole::Output);
+        g.tensor(id(32), TensorRole::Output, 40).unwrap();
+        push(&mut g, (relu40(X), Y));
+        push(&mut g, (conv(Y), id(32)));
+        assert_eq!(
+            names(&g.lower(Fusion::On).unwrap()),
+            vec!["map+relu", "conv2d3x3"]
+        );
+
+        // The operation after the ReLU is not a 3x3 convolution.
+        let mut g = Graph::new();
+        g.tensor(X, TensorRole::Input, 32).unwrap();
+        g.tensor(A, TensorRole::Activation, 32).unwrap();
+        g.tensor(W, TensorRole::Weight, 32).unwrap();
+        g.tensor(BIAS, TensorRole::Weight, 4).unwrap();
+        g.tensor(Y, TensorRole::Output, 16).unwrap();
+        push(
+            &mut g,
+            (
+                OpKind::Relu {
+                    input: X,
+                    elements: 32,
+                },
+                A,
+            ),
+        );
+        push(
+            &mut g,
+            (
+                OpKind::MatMul(MatMul {
+                    a: A,
+                    b: W,
+                    bias: Some(BIAS),
+                    m: 4,
+                    k: 8,
+                    n: 4,
+                }),
+                Y,
+            ),
+        );
+        assert_eq!(
+            names(&g.lower(Fusion::On).unwrap()),
+            vec!["map+relu", "matmul"]
+        );
+    }
+
+    /// An activation of the residual-unit tests.
+    const SUM: TensorId = TensorId::new(7);
+
+    #[test]
+    fn a_1x1_convolution_is_a_matrix_multiply_of_its_pixels() {
+        let op = OpKind::Conv2d1x1(Conv2d1x1 {
+            input: X,
+            weights: W,
+            bias: None,
+            height: 37,
+            width: 37,
+            cin: 384,
+            cout: 96,
+        });
+        assert_eq!(op.output_elements(), 37 * 37 * 96);
+        let p = single(op).lower(Fusion::On).unwrap();
+        let k = &p.kernels()[0];
+        assert_eq!(
+            *k.main(),
+            MainOp::MatMul(MatMul {
+                a: X,
+                b: W,
+                bias: None,
+                m: 37 * 37,
+                k: 384,
+                n: 96,
+            })
+        );
+        assert_eq!(k.name(), "matmul");
+        assert_eq!(k.max_parts(), (37 * 37_u32).div_ceil(MATMUL_TILE));
+    }
+
+    #[test]
+    fn strided_and_transposed_convolutions_and_resampling_have_the_sizes_pytorch_gives() {
+        let strided = |height, stride| {
+            Conv2d3x3 {
+                input: X,
+                weights: W,
+                bias: None,
+                height,
+                width: height,
+                cin: 1,
+                cout: 1,
+                stride,
+            }
+            .out_height()
+        };
+        // floor((h + 2 - 3) / s) + 1.
+        for (h, s, out) in [
+            (37, 2, 19),
+            (518, 1, 518),
+            (1, 2, 1),
+            (2, 2, 1),
+            (3, 2, 2),
+            (8, 3, 3),
+        ] {
+            assert_eq!(strided(h, s), out, "{h} at stride {s}");
+        }
+        let up = OpKind::ConvTranspose2d(ConvTranspose2d {
+            input: X,
+            weights: W,
+            bias: Some(BIAS),
+            height: 37,
+            width: 37,
+            cin: 48,
+            cout: 48,
+            factor: 4,
+        });
+        assert_eq!(up.output_elements(), 148 * 148 * 48);
+        let resize = ResizeBilinear {
+            input: X,
+            in_height: 37,
+            in_width: 148,
+            out_height: 74,
+            out_width: 296,
+            channels: 64,
+        };
+        assert_eq!(
+            OpKind::ResizeBilinear(resize).output_elements(),
+            74 * 296 * 64
+        );
+        assert_eq!(resize.ratios(), (36.0 / 73.0, 147.0 / 295.0));
+        let one = ResizeBilinear {
+            out_height: 1,
+            ..resize
+        };
+        assert_eq!(one.ratios().0, 0.0);
+    }
+
+    #[test]
+    fn malformed_dpt_operations_are_errors() {
+        let mut g = Graph::new();
+        g.tensor(X, TensorRole::Input, 16).unwrap();
+        g.tensor(W, TensorRole::Weight, 9).unwrap();
+        g.tensor(Y, TensorRole::Output, 16).unwrap();
+        let conv = Conv2d3x3 {
+            input: X,
+            weights: W,
+            bias: None,
+            height: 4,
+            width: 4,
+            cin: 1,
+            cout: 1,
+            stride: 0,
+        };
+        assert_eq!(
+            g.push(OpKind::Conv2d3x3(conv), Y),
+            Err(KernelError::ZeroDimension { op: 0 })
+        );
+        // At stride two the output is 2 x 2, not the 4 x 4 declared.
+        assert!(matches!(
+            g.push(OpKind::Conv2d3x3(Conv2d3x3 { stride: 2, ..conv }), Y),
+            Err(KernelError::ElementCount {
+                expected: 4,
+                declared: 16,
+                ..
+            })
+        ));
+        let up = ConvTranspose2d {
+            input: X,
+            weights: W,
+            bias: None,
+            height: 2,
+            width: 2,
+            cin: 1,
+            cout: 1,
+            factor: 0,
+        };
+        assert_eq!(
+            g.push(OpKind::ConvTranspose2d(up), Y),
+            Err(KernelError::ZeroDimension { op: 0 })
+        );
+        let resize = ResizeBilinear {
+            input: X,
+            in_height: 4,
+            in_width: 4,
+            out_height: 0,
+            out_width: 4,
+            channels: 1,
+        };
+        assert_eq!(
+            g.push(OpKind::ResizeBilinear(resize), Y),
+            Err(KernelError::ZeroDimension { op: 0 })
+        );
     }
 
     #[test]

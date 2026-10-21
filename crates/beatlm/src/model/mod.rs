@@ -9,6 +9,11 @@
 //! shares; one module per model writes the model's structure with it:
 //! [`depth_anything_v2`] for Depth Anything V2.
 //!
+//! Its graph is built in program order, and lowering fuses only neighbouring
+//! operations ([`kernel`](beatlm_core::kernel#rules), rule 2), so a model
+//! module pushes each operation right before the one that consumes it where
+//! the two are meant to share a kernel.
+//!
 //! # Rules
 //!
 //! - **A weight is asked for by role, never by name.** A [`Source`] lists
@@ -58,6 +63,15 @@ pub enum ModelError {
         field: &'static str,
         /// Its value.
         value: usize,
+    },
+    /// A decoder was given another number of feature maps than its
+    /// configuration has stages.
+    #[error("the decoder has {expected} stages and was given {given} feature maps")]
+    FeatureCount {
+        /// The stages, one per entry of `out_indices`.
+        expected: usize,
+        /// The feature maps given.
+        given: usize,
     },
     /// A weight's source names a role the inventory does not list.
     #[error("the inventory lists no tensor for role {role}")]
@@ -118,6 +132,11 @@ pub enum Convert {
     /// A convolution's weight, `[out][in][kh][kw]` in the file, as HWIO,
     /// `[kh][kw][in][out]`.
     Conv,
+    /// A transposed convolution's weight, which PyTorch stores the other way
+    /// round, `[in][out][kh][kw]`, as HWIO, `[kh][kw][in][out]`. A square
+    /// weight has the same shape either way, so only this conversion, not the
+    /// shape, says which dimension is which.
+    ConvTranspose,
 }
 
 /// Where a weight's numbers come from: the tensors of these roles, each
@@ -247,11 +266,25 @@ fn convert(values: Vec<f32>, shape: &[usize], how: Convert) -> Option<(Vec<f32>,
             }
             (t, out)
         }
+        (Convert::ConvTranspose, &[inp, out, kh, kw]) => {
+            let mut t = vec![0.0; values.len()];
+            for i in 0..inp {
+                for o in 0..out {
+                    for y in 0..kh {
+                        for x in 0..kw {
+                            t[((y * kw + x) * inp + i) * out + o] =
+                                values[((i * out + o) * kh + y) * kw + x];
+                        }
+                    }
+                }
+            }
+            (t, out)
+        }
         (Convert::AsStored, _) => {
             let cols = shape.last().copied().unwrap_or(1);
             (values, cols)
         }
-        (Convert::Linear | Convert::Conv, _) => return None,
+        (Convert::Linear | Convert::Conv | Convert::ConvTranspose, _) => return None,
     })
 }
 
@@ -387,6 +420,21 @@ mod tests {
         let (t, cols) = convert(vec![0.0, 1.0, 10.0, 11.0], &[2, 1, 2, 1], Convert::Conv).unwrap();
         // HWIO [2][1][1][2]: element (y, 0, 0, o).
         assert_eq!((t, cols), (vec![0.0, 10.0, 1.0, 11.0], 2));
+        // A transposed convolution's [in 2][out 3][1][2]: element (i, o, 0, x)
+        // = 100 i + 10 o + x. HWIO [1][2][2][3]: element (0, x, i, o).
+        let stored: Vec<f32> = (0..2)
+            .flat_map(|i| {
+                (0..3).flat_map(move |o| (0..2).map(move |x| (100 * i + 10 * o + x) as f32))
+            })
+            .collect();
+        let (t, cols) = convert(stored, &[2, 3, 1, 2], Convert::ConvTranspose).unwrap();
+        let hwio: Vec<f32> = (0..2)
+            .flat_map(|x| {
+                (0..2).flat_map(move |i| (0..3).map(move |o| (100 * i + 10 * o + x) as f32))
+            })
+            .collect();
+        assert_eq!((t, cols), (hwio, 3));
+        assert_eq!(convert(vec![1.0; 6], &[2, 3], Convert::ConvTranspose), None);
         let (t, cols) = convert(vec![1.0, 2.0], &[1, 1, 2], Convert::AsStored).unwrap();
         assert_eq!((t, cols), (vec![1.0, 2.0], 2));
         // A linear weight of another rank is refused, not read untransposed.

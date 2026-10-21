@@ -3,8 +3,9 @@
 //!
 //! Every template computes one value per output element and stores it as
 //! `out[i] = epilogue(value, i)`; [`epilogue`] writes that function from the
-//! spec's steps, so the templates know nothing about fusion. Layouts are the
-//! ones [`beatlm_core::kernel`] documents.
+//! spec's steps, so the templates know nothing about fusion. The convolution
+//! template reads its input through `prologue(value)` the same way
+//! ([`prologue`]). Layouts are the ones [`beatlm_core::kernel`] documents.
 //!
 //! Every template also walks only its part's range of the output, read from
 //! the constants [`part_constants`] names, so the text is the whole kernel's
@@ -21,9 +22,9 @@
 use std::fmt::Write as _;
 
 use beatlm_core::kernel::{
-    AttentionScores, AttentionValues, Conv2d3x3, Epilogue, GELU_ERF_A, GELU_ERF_P, KernelSpec,
-    LayerNorm, MainOp, MatMul, PatchEmbed, PrependToken, Requirements, Softmax, TokensToMap,
-    Variant,
+    AttentionScores, AttentionValues, Conv2d3x3, ConvTranspose2d, Epilogue, GELU_ERF_A, GELU_ERF_P,
+    KernelSpec, LayerNorm, MainOp, MatMul, PatchEmbed, PrependToken, Prologue, Requirements,
+    ResizeBilinear, Softmax, TokensToMap, Variant,
 };
 use beatlm_core::memory::TensorId;
 
@@ -52,8 +53,18 @@ pub(super) fn text(spec: &KernelSpec, variant: Variant) -> String {
     overrides(&mut out, spec, variant);
     epilogue(&mut out, spec.epilogue(), &names);
     let y = names.of(spec.output());
+    debug_assert!(
+        matches!(spec.main(), MainOp::Conv2d3x3(_)) || spec.prologue().is_empty(),
+        "only the convolution template applies a prologue: {}",
+        spec.name()
+    );
     match *spec.main() {
-        MainOp::Conv2d3x3(c) => conv(&mut out, &c, &req, &names, &y),
+        MainOp::Conv2d3x3(c) => {
+            prologue(&mut out, spec.prologue());
+            conv(&mut out, &c, &req, &names, &y);
+        }
+        MainOp::ConvTranspose2d(c) => conv_transpose(&mut out, &c, &req, &names, &y),
+        MainOp::ResizeBilinear(r) => resize_bilinear(&mut out, &r, &req, &names, &y),
         MainOp::LayerNorm(l) => layer_norm(&mut out, &l, &req, &names, &y),
         MainOp::MatMul(mm) => tiled(&mut out, &matmul(&mm, &names), &req, &y),
         MainOp::PatchEmbed(p) => tiled(&mut out, &patch_embed(&p, &names), &req, &y),
@@ -73,6 +84,8 @@ const fn by_element(main: &MainOp) -> bool {
     matches!(
         main,
         MainOp::Conv2d3x3(_)
+            | MainOp::ConvTranspose2d(_)
+            | MainOp::ResizeBilinear(_)
             | MainOp::PrependToken(_)
             | MainOp::TokensToMap(_)
             | MainOp::Map { .. }
@@ -170,6 +183,14 @@ fn header(
                 role(b, "convolution bias");
             }
         }
+        MainOp::ConvTranspose2d(c) => {
+            role(c.input, "transposed convolution input");
+            role(c.weights, "transposed convolution weights");
+            if let Some(b) = c.bias {
+                role(b, "transposed convolution bias");
+            }
+        }
+        MainOp::ResizeBilinear(r) => role(r.input, "map to resample"),
         MainOp::LayerNorm(l) => {
             role(l.input, "layer norm input");
             role(l.gamma, "layer norm gamma");
@@ -319,9 +340,28 @@ fn entry(req: &Requirements) -> String {
     format!("@compute @workgroup_size({x}, {y}, {z})\nfn {ENTRY_POINT}(")
 }
 
+/// The hook the convolution template loads every input value through: the
+/// spec's prologue steps, in order. An empty prologue returns the value as it
+/// is, so a convolution without one has the same function and the same text
+/// shape.
+fn prologue(out: &mut String, steps: &[Prologue]) {
+    out.push_str(
+        "// The steps applied to every input value as it is loaded, before it is multiplied.\n\
+         fn prologue(value: f32) -> f32 {\n    var v = value;\n",
+    );
+    for step in steps {
+        match step {
+            Prologue::Relu => out.push_str("    v = max(v, 0.0);\n"),
+        }
+    }
+    out.push_str("    return v;\n}\n\n");
+}
+
 /// One invocation per output element of the part, numbered in memory order
 /// (channel fastest) from the part's first element over a grid of rows
-/// `PART_GRID_ROW` workgroups wide.
+/// `PART_GRID_ROW` workgroups wide. Output pixel `(y, x)` is centred on input
+/// pixel `(y * STRIDE, x * STRIDE)`; every input value goes through
+/// `prologue`, which [`prologue`] writes.
 fn conv(out: &mut String, c: &Conv2d3x3, req: &Requirements, names: &Names, y: &str) {
     let bias = c.bias.map_or(String::new(), |b| {
         format!("    acc = acc + {}[co];\n", names.of(b))
@@ -331,11 +371,14 @@ fn conv(out: &mut String, c: &Conv2d3x3, req: &Requirements, names: &Names, y: &
         "\
 const H: u32 = {h}u;
 const W: u32 = {w}u;
+const OW: u32 = {ow}u;
+const STRIDE: u32 = {stride}u;
 const CIN: u32 = {cin}u;
 const COUT: u32 = {cout}u;
 const GROUP: u32 = {group}u;
 
-// 3x3 convolution, stride 1, zero padding of 1: NHWC input, HWIO weights.
+// 3x3 convolution, zero padding of 1, stride STRIDE: NHWC input of H x W, output
+// rows OW wide, HWIO weights.
 {entry}
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_index) lane: u32,
@@ -346,8 +389,8 @@ const GROUP: u32 = {group}u;
     }}
     let co = element % COUT;
     let pixel = element / COUT;
-    let py = i32(pixel / W);
-    let px = i32(pixel % W);
+    let py = i32((pixel / OW) * STRIDE);
+    let px = i32((pixel % OW) * STRIDE);
     var acc = 0.0;
     for (var ky = 0; ky < 3; ky = ky + 1) {{
         let iy = py + ky - 1;
@@ -362,7 +405,7 @@ const GROUP: u32 = {group}u;
             let src = (u32(iy) * W + u32(ix)) * CIN;
             let tap = u32(ky * 3 + kx) * CIN * COUT + co;
             for (var ci = 0u; ci < CIN; ci = ci + 1u) {{
-                acc = acc + {x}[src + ci] * {wt}[tap + ci * COUT];
+                acc = acc + prologue({x}[src + ci]) * {wt}[tap + ci * COUT];
             }}
         }}
     }}
@@ -371,12 +414,111 @@ const GROUP: u32 = {group}u;
 ",
         h = c.height,
         w = c.width,
+        ow = c.out_width(),
+        stride = c.stride,
         cin = c.cin,
         cout = c.cout,
         group = req.workgroup_size[0],
         entry = entry(req),
         x = names.of(c.input),
         wt = names.of(c.weights),
+    );
+}
+
+/// One invocation per output element of the part, numbered as for [`conv`]:
+/// output pixel `(oy, ox)` lies in the block input pixel
+/// `(oy / F, ox / F)` writes, at tap `(oy % F, ox % F)` of the kernel, so the
+/// element is that pixel's channels times that tap's weights, plus the bias.
+fn conv_transpose(
+    out: &mut String,
+    c: &ConvTranspose2d,
+    req: &Requirements,
+    names: &Names,
+    y: &str,
+) {
+    per_element(
+        out,
+        &[
+            ("W", c.width),
+            ("F", c.factor),
+            ("OW", c.width * c.factor),
+            ("CIN", c.cin),
+            ("COUT", c.cout),
+        ],
+        "Transposed convolution, kernel and stride F, no padding: each NHWC input pixel\n\
+         // writes its own F x F block of the output, through HWIO weights [F][F][CIN][COUT].",
+        req,
+    );
+    let bias = c.bias.map_or(String::new(), |b| {
+        format!("    acc = acc + {}[co];\n", names.of(b))
+    });
+    let _ = write!(
+        out,
+        "\
+    let co = element % COUT;
+    let pixel = element / COUT;
+    let oy = pixel / OW;
+    let ox = pixel % OW;
+    let src = ((oy / F) * W + ox / F) * CIN;
+    let tap = ((oy % F) * F + ox % F) * CIN * COUT + co;
+    var acc = 0.0;
+    for (var ci = 0u; ci < CIN; ci = ci + 1u) {{
+        acc = acc + {x}[src + ci] * {wt}[tap + ci * COUT];
+    }}
+{bias}    {y}[element] = epilogue(acc, element);
+}}
+",
+        x = names.of(c.input),
+        wt = names.of(c.weights),
+    );
+}
+
+/// One invocation per output element of the part, numbered as for [`conv`].
+/// The sampling ratios are the core's ([`ResizeBilinear::ratios`]), written
+/// exactly, and the source position is `ratio * index` in `f32`, as PyTorch
+/// computes it; the two input rows and columns around it are the one it
+/// truncates to and the next, clamped to the last, weighted by the fraction.
+fn resize_bilinear(
+    out: &mut String,
+    r: &ResizeBilinear,
+    req: &Requirements,
+    names: &Names,
+    y: &str,
+) {
+    per_element(
+        out,
+        &[
+            ("IH", r.in_height),
+            ("IW", r.in_width),
+            ("OW", r.out_width),
+            ("C", r.channels),
+        ],
+        "Bilinear resampling with the corners aligned, NHWC: output row oy samples input\n\
+         // row oy * (IH - 1) / (OH - 1), columns likewise.",
+        req,
+    );
+    let (ratio_y, ratio_x) = r.ratios();
+    let _ = write!(
+        out,
+        "\
+    let c = element % C;
+    let pixel = element / C;
+    let sy = {ratio_y} * f32(pixel / OW);
+    let sx = {ratio_x} * f32(pixel % OW);
+    let y0 = min(u32(sy), IH - 1u);
+    let x0 = min(u32(sx), IW - 1u);
+    let y1 = min(y0 + 1u, IH - 1u);
+    let x1 = min(x0 + 1u, IW - 1u);
+    let ly = clamp(sy - f32(y0), 0.0, 1.0);
+    let lx = clamp(sx - f32(x0), 0.0, 1.0);
+    let top = (1.0 - lx) * {x}[(y0 * IW + x0) * C + c] + lx * {x}[(y0 * IW + x1) * C + c];
+    let bottom = (1.0 - lx) * {x}[(y1 * IW + x0) * C + c] + lx * {x}[(y1 * IW + x1) * C + c];
+    {y}[element] = epilogue((1.0 - ly) * top + ly * bottom, element);
+}}
+",
+        ratio_y = exact(ratio_y),
+        ratio_x = exact(ratio_x),
+        x = names.of(r.input),
     );
 }
 

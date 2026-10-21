@@ -303,6 +303,7 @@ pub fn graph(s: &Shape) -> Result<Graph> {
             width: s.width,
             cin,
             cout,
+            stride: 1,
         })
     };
     let norm = |input, gamma, beta, channels| {
@@ -733,6 +734,7 @@ mod tests {
                 width: SMALL_W,
                 cin,
                 cout,
+                stride: 1,
             });
             assert_kernels_match(
                 &format!("conv3x3, bias {with_bias}"),

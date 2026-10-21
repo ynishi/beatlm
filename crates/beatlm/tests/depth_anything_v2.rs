@@ -19,15 +19,15 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use beatlm::beatlm_core::device::DeviceProfile;
-use beatlm::beatlm_core::kernel::{Fusion, TensorRole};
+use beatlm::beatlm_core::kernel::{Fusion, Graph, Program, TensorRole};
 use beatlm::beatlm_core::memory::{MemoryPlan, TensorId};
-use beatlm::beatlm_core::time::{FrameIndex, Micros};
+use beatlm::beatlm_core::time::FrameIndex;
 use beatlm::codegen::Kernels;
 use beatlm::gpu::{Arenas, SliceTimer};
-use beatlm::load::depth_anything_v2::{Config, inventory};
-use beatlm::load::{Archive, read_file};
+use beatlm::load::depth_anything_v2::{Config, Role, inventory};
+use beatlm::load::{Archive, Inventory, read_file};
 use beatlm::model::Builder;
-use beatlm::model::depth_anything_v2::encoder;
+use beatlm::model::depth_anything_v2::{encoder, model};
 
 /// The parameter count the model is published with.
 const PUBLISHED_PARAMETERS: u64 = 24_785_089;
@@ -182,30 +182,237 @@ fn floats(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// Copies `count` floats from `offset` of `buffer` and waits for them.
-fn read_back(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    buffer: &wgpu::Buffer,
-    offset: u64,
-    count: usize,
-) -> Vec<f32> {
-    let bytes = (count * 4) as u64;
-    let staging = device.create_buffer(&wgpu::BufferDescriptor {
-        label: None,
-        size: bytes,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-    encoder.copy_buffer_to_buffer(buffer, offset, &staging, 0, bytes);
-    queue.submit([encoder.finish()]);
-    staging
-        .slice(..)
-        .map_async(wgpu::MapMode::Read, |r| r.unwrap());
-    device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-    let mapped = staging.slice(..).get_mapped_range().unwrap();
-    floats(&mapped)
+/// The checked weights file, its inventory, and the reference input as the
+/// graph's NHWC image. The input is stored NCHW.
+struct Files {
+    weights: Vec<u8>,
+    inventory: Inventory<Role>,
+    image: Vec<f32>,
+}
+
+impl Files {
+    fn read(config: &Config) -> Self {
+        let dir = model_dir();
+        let weights = read_or_explain(&dir.join("model.safetensors"), "setup-depth-anything");
+        let inventory = inventory(config).expect("the small configuration is valid");
+        let report = inventory.check(&Archive::parse(&weights).expect("a safetensors file"));
+        assert!(report.is_exact(), "{report}");
+        let nchw = floats(&read_or_explain(
+            &dir.join("reference/input.f32"),
+            "reference-depth-anything",
+        ));
+        assert_eq!(nchw.len(), 3 * SIDE * SIDE);
+        let mut image = vec![0.0; nchw.len()];
+        for c in 0..3 {
+            for p in 0..SIDE * SIDE {
+                image[p * 3 + c] = nchw[c * SIDE * SIDE + p];
+            }
+        }
+        Self {
+            weights,
+            inventory,
+            image,
+        }
+    }
+
+    /// Every weight of a builder's graph with its numbers, and `image` with
+    /// the reference input.
+    fn uploads(&self, b: Builder<Role>, image: TensorId) -> (Graph, Vec<(TensorId, Vec<f32>)>) {
+        let archive = Archive::parse(&self.weights).expect("a safetensors file");
+        let (graph, weights) = b.finish();
+        let mut uploads: Vec<(TensorId, Vec<f32>)> = weights
+            .iter()
+            .map(|w| {
+                let numbers = w.numbers(&self.inventory, &archive);
+                (w.id, numbers.expect("the weight reads"))
+            })
+            .collect();
+        uploads.push((image, self.image.clone()));
+        (graph, uploads)
+    }
+}
+
+/// The adapter's device, with timestamp queries when the adapter has them.
+struct Gpu {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    info: wgpu::AdapterInfo,
+    timed: bool,
+}
+
+impl Gpu {
+    fn new() -> Self {
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            ..Default::default()
+        }))
+        .expect("a GPU adapter");
+        let info = adapter.get_info();
+        let timed = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_features: if timed {
+                wgpu::Features::TIMESTAMP_QUERY
+            } else {
+                wgpu::Features::empty()
+            },
+            ..Default::default()
+        }))
+        .expect("a device");
+        Self {
+            device,
+            queue,
+            info,
+            timed,
+        }
+    }
+
+    /// Copies `count` floats from `offset` of `buffer` and waits for them.
+    fn read_back(&self, buffer: &wgpu::Buffer, offset: u64, count: usize) -> Vec<f32> {
+        let bytes = (count * 4) as u64;
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        encoder.copy_buffer_to_buffer(buffer, offset, &staging, 0, bytes);
+        self.queue.submit([encoder.finish()]);
+        staging
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, |r| r.unwrap());
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
+        let mapped = staging.slice(..).get_mapped_range().unwrap();
+        floats(&mapped)
+    }
+}
+
+/// A graph lowered with one fusion setting, planned on the baseline, its
+/// inputs and weights written and its kernels built: ready to run.
+struct Loaded<'g> {
+    gpu: &'g Gpu,
+    program: Program,
+    plan: MemoryPlan,
+    arenas: Arenas,
+    kernels: Kernels,
+}
+
+impl<'g> Loaded<'g> {
+    fn new(gpu: &'g Gpu, graph: &Graph, fusion: Fusion, uploads: &[(TensorId, Vec<f32>)]) -> Self {
+        let program = graph.lower(fusion).expect("the graph lowers");
+        let plan = MemoryPlan::new(program.tensors(), &DeviceProfile::webgpu_baseline())
+            .expect("the graph plans on the baseline");
+        let arenas = Arenas::new(&gpu.device, &plan).expect("the arenas");
+        for (id, numbers) in uploads {
+            let p = plan.placement(*id).expect("a placement");
+            let data: Vec<u8> = numbers.iter().flat_map(|v| v.to_le_bytes()).collect();
+            assert_eq!(data.len() as u64, p.size, "tensor {}", id.get());
+            gpu.queue
+                .write_buffer(arenas.buffer(p.arena).unwrap(), p.offset, &data);
+        }
+        let kernels = Kernels::new(&gpu.device, &plan, &arenas, program.kernels(), &[])
+            .expect("the kernels build");
+        Self {
+            gpu,
+            program,
+            plan,
+            arenas,
+            kernels,
+        }
+    }
+
+    /// Encodes every kernel once, in one submission, timed when `timer` is
+    /// given, and waits for it.
+    fn run(&self, timer: Option<&mut SliceTimer<usize>>, frame: u64) {
+        let device = &self.gpu.device;
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        match timer {
+            Some(timer) => {
+                let mut stamps = timer.begin_frame(FrameIndex::new(frame));
+                for k in 0..self.kernels.len() {
+                    let writes = stamps.compute_pass(k).unwrap();
+                    self.kernels.encode(&mut encoder, k, 0, writes).unwrap();
+                }
+                stamps.resolve(&mut encoder);
+                self.gpu.queue.submit([encoder.finish()]);
+                timer.start_readback();
+            }
+            None => {
+                for k in 0..self.kernels.len() {
+                    self.kernels.encode(&mut encoder, k, 0, None).unwrap();
+                }
+                self.gpu.queue.submit([encoder.finish()]);
+            }
+        }
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+    }
+
+    /// The numbers of tensor `id` after a run.
+    fn read(&self, id: TensorId) -> Vec<f32> {
+        let p = self.plan.placement(id).expect("a placement");
+        let elements = self
+            .program
+            .tensors()
+            .iter()
+            .find(|t| t.id == id)
+            .expect("a tensor of the program")
+            .elements;
+        let buffer = self.arenas.buffer(p.arena).unwrap();
+        self.gpu.read_back(buffer, p.offset, elements as usize)
+    }
+
+    /// With timestamp queries, five timed runs: the GPU time of each run, the
+    /// sum of its kernels' timestamp pairs, sorted, and each kernel's median
+    /// over the runs, in microseconds. `None` without timestamp queries.
+    fn timings(&self) -> Option<(Vec<u64>, Vec<u64>)> {
+        if !self.gpu.timed {
+            return None;
+        }
+        let count = u32::try_from(self.kernels.len()).unwrap();
+        let mut timer = SliceTimer::new(&self.gpu.device, &self.gpu.queue, count).expect("a timer");
+        let mut totals = Vec::new();
+        let mut per_kernel: Vec<Vec<u64>> = vec![Vec::new(); self.kernels.len()];
+        for frame in 1..=5 {
+            self.run(Some(&mut timer), frame);
+            for timing in timer.collect_ready() {
+                totals.push(timing.compute.iter().map(|(_, d)| d.get()).sum());
+                for (k, d) in timing.compute {
+                    per_kernel[k].push(d.get());
+                }
+            }
+        }
+        totals.sort_unstable();
+        let medians = per_kernel
+            .into_iter()
+            .map(|mut ds| {
+                ds.sort_unstable();
+                ds.get(ds.len() / 2).copied().unwrap_or(0)
+            })
+            .collect();
+        Some((totals, medians))
+    }
+
+    /// The adapter and the memory plan, for the report.
+    fn describe(&self) -> String {
+        format!(
+            "adapter {} ({:?}, {:?}); {} kernels, {} tensors; {} arenas of {:?} bytes, {} in all, \
+             {} bytes live at most",
+            self.gpu.info.name,
+            self.gpu.info.backend,
+            self.gpu.info.device_type,
+            self.kernels.len(),
+            self.program.tensors().len(),
+            self.plan.arenas().len(),
+            self.plan.arenas(),
+            self.plan.total_bytes(),
+            self.plan.peak_live_bytes()
+        )
+    }
 }
 
 /// The encoder of Depth Anything V2 Small, built from the real weights by
@@ -224,110 +431,24 @@ fn read_back(
 #[ignore = "needs `just setup-depth-anything` and `just reference-depth-anything`"]
 fn the_encoder_on_the_gpu_matches_the_reference_features() {
     let dir = model_dir();
-    let bytes = read_or_explain(&dir.join("model.safetensors"), "setup-depth-anything");
-    let archive = Archive::parse(&bytes).expect("the downloaded file is a safetensors file");
     let config = Config::small();
-    let inv = inventory(&config).expect("the small configuration is valid");
-    let report = inv.check(&archive);
-    assert!(report.is_exact(), "{report}");
-
+    let files = Files::read(&config);
     let mut builder = Builder::new();
     let enc = encoder(&mut builder, &config, TensorRole::Output).expect("the encoder builds");
-    let (graph, weights) = builder.finish();
-    let mut uploads: Vec<(TensorId, Vec<f32>)> = weights
-        .iter()
-        .map(|w| (w.id, w.numbers(&inv, &archive).expect("the weight reads")))
-        .collect();
+    let (graph, uploads) = files.uploads(builder, enc.image);
 
-    let nchw = floats(&read_or_explain(
-        &dir.join("reference/input.f32"),
-        "reference-depth-anything",
-    ));
-    assert_eq!(nchw.len(), 3 * SIDE * SIDE);
-    let mut nhwc = vec![0.0; nchw.len()];
-    for c in 0..3 {
-        for p in 0..SIDE * SIDE {
-            nhwc[p * 3 + c] = nchw[c * SIDE * SIDE + p];
-        }
-    }
-    uploads.push((enc.image, nhwc));
+    let gpu = Gpu::new();
+    let loaded = Loaded::new(&gpu, &graph, Fusion::On, &uploads);
+    loaded.run(None, 0);
+    println!("{}", loaded.describe());
 
-    let instance = wgpu::Instance::default();
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
-        ..Default::default()
-    }))
-    .expect("a GPU adapter");
-    let info = adapter.get_info();
-    let timed = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
-    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-        required_features: if timed {
-            wgpu::Features::TIMESTAMP_QUERY
-        } else {
-            wgpu::Features::empty()
-        },
-        ..Default::default()
-    }))
-    .expect("a device");
-
-    let program = graph.lower(Fusion::On).expect("the encoder lowers");
-    let plan = MemoryPlan::new(program.tensors(), &DeviceProfile::webgpu_baseline())
-        .expect("the encoder plans on the baseline");
-    let arenas = Arenas::new(&device, &plan).expect("the arenas");
-    for (id, numbers) in &uploads {
-        let p = plan.placement(*id).expect("a placement");
-        let data: Vec<u8> = numbers.iter().flat_map(|v| v.to_le_bytes()).collect();
-        assert_eq!(data.len() as u64, p.size, "tensor {}", id.get());
-        queue.write_buffer(arenas.buffer(p.arena).unwrap(), p.offset, &data);
-    }
-    let kernels =
-        Kernels::new(&device, &plan, &arenas, program.kernels(), &[]).expect("the kernels build");
-    let run = |timer: Option<&mut SliceTimer<usize>>, frame: u64| {
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        match timer {
-            Some(timer) => {
-                let mut stamps = timer.begin_frame(FrameIndex::new(frame));
-                for k in 0..kernels.len() {
-                    let writes = stamps.compute_pass(k).unwrap();
-                    kernels.encode(&mut encoder, k, 0, writes).unwrap();
-                }
-                stamps.resolve(&mut encoder);
-                queue.submit([encoder.finish()]);
-                timer.start_readback();
-            }
-            None => {
-                for k in 0..kernels.len() {
-                    kernels.encode(&mut encoder, k, 0, None).unwrap();
-                }
-                queue.submit([encoder.finish()]);
-            }
-        }
-        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-    };
-    run(None, 0);
-
-    println!(
-        "adapter {} ({:?}, {:?}); {} kernels, {} arenas of {:?} bytes",
-        info.name,
-        info.backend,
-        info.device_type,
-        kernels.len(),
-        plan.arenas().len(),
-        plan.arenas()
-    );
     // The reference recorded `reference/encoder_stage_{n}.f32` for each layer
     // `n` of the checkpoint's `out_indices`, which are the encoder's features.
     assert_eq!(enc.features.len(), config.out_indices.len());
     let mut failures = Vec::new();
     for (&stage, &feature) in config.out_indices.iter().zip(&enc.features) {
-        let p = plan.placement(feature).unwrap();
-        let got = read_back(
-            &device,
-            &queue,
-            arenas.buffer(p.arena).unwrap(),
-            p.offset,
-            GRID * GRID * HIDDEN,
-        );
+        let got = loaded.read(feature);
+        assert_eq!(got.len(), GRID * GRID * HIDDEN);
         let name = format!("reference/encoder_stage_{stage}.f32");
         let want = floats(&read_or_explain(
             &dir.join(&name),
@@ -351,33 +472,16 @@ fn the_encoder_on_the_gpu_matches_the_reference_features() {
         }
     }
 
-    if timed {
-        let mut timer = SliceTimer::new(&device, &queue, u32::try_from(kernels.len()).unwrap())
-            .expect("a timer");
-        let mut totals = Vec::new();
-        let mut per_kernel: BTreeMap<usize, Vec<Micros>> = BTreeMap::new();
-        for frame in 1..=5 {
-            run(Some(&mut timer), frame);
-            for timing in timer.collect_ready() {
-                let total: u64 = timing.compute.iter().map(|(_, d)| d.get()).sum();
-                totals.push(total);
-                for (k, d) in timing.compute {
-                    per_kernel.entry(k).or_default().push(d);
-                }
-            }
-        }
-        totals.sort_unstable();
+    if let Some((totals, medians)) = loaded.timings() {
         println!(
             "GPU time of the encoder, summed over its {} kernels' timestamp pairs, per run \
              (sorted, microseconds): {totals:?}",
-            kernels.len()
+            loaded.kernels.len()
         );
         let mut by_name: BTreeMap<String, u64> = BTreeMap::new();
-        for (k, mut ds) in per_kernel {
-            ds.sort_unstable();
-            let median = ds[ds.len() / 2].get();
+        for (k, median) in medians.into_iter().enumerate() {
             *by_name
-                .entry(kernels.label(k).unwrap_or("?").to_owned())
+                .entry(loaded.kernels.label(k).unwrap_or("?").to_owned())
                 .or_default() += median;
         }
         println!("median GPU time per kernel name, summed over the encoder (microseconds):");
@@ -388,5 +492,213 @@ fn the_encoder_on_the_gpu_matches_the_reference_features() {
     assert!(
         failures.is_empty(),
         "stages {failures:?} exceed max {FEATURE_MAX_ERROR} or mean {FEATURE_MEAN_ERROR}"
+    );
+}
+
+/// The shape the reference's manifest records for tensor `name`.
+///
+/// The manifest is the JSON `scripts/reference/depth_anything_v2.py` writes,
+/// one object per tensor with its `name`, `file` and `shape`; this reads the
+/// first `[...]` after the name's entry, which is that tensor's shape, rather
+/// than take a JSON parser as a dependency for one array of integers.
+fn manifest_shape(manifest: &str, name: &str) -> Vec<usize> {
+    let entry = format!("\"name\": \"{name}\"");
+    let at = manifest
+        .find(&entry)
+        .unwrap_or_else(|| panic!("the manifest lists no {name}"));
+    let rest = &manifest[at..];
+    let shape = rest.find("\"shape\"").expect("the entry has a shape");
+    let open = rest[shape..].find('[').unwrap() + shape;
+    let close = rest[open..].find(']').unwrap() + open;
+    rest[open + 1..close]
+        .split(',')
+        .map(|d| d.trim().parse().expect("a dimension"))
+        .collect()
+}
+
+/// The tolerance on the largest absolute difference of the depth.
+///
+/// The depth inherits the encoder's differences from the reference (see
+/// [`FEATURE_MAX_ERROR`]) and adds the head's own, of convolutions summing in
+/// another order than PyTorch's. Set against what the test measured on an
+/// Apple M1 Pro, Metal, on 2026-10-21, in two invocations, identical in both:
+/// a largest difference of 5.96e-6 fused and 6.68e-6 unfused, a mean of
+/// 1.02e-6 and 1.01e-6, and a largest relative difference of 2.05e-6 and
+/// 2.12e-6, on a reference depth from 1.48 to 3.64. The tolerances leave room
+/// for an encoder at the edge of its own, three times what it measured, and
+/// as much again for the head on another adapter.
+const DEPTH_MAX_ERROR: f32 = 5e-5;
+
+/// The tolerance on the mean absolute difference of the depth; see
+/// [`DEPTH_MAX_ERROR`].
+const DEPTH_MEAN_ERROR: f32 = 1e-5;
+
+/// The tolerance on the largest relative difference of the depth, measured
+/// over the pixels whose reference depth is at least [`RELATIVE_FLOOR`] of
+/// its largest; see [`DEPTH_MAX_ERROR`].
+const DEPTH_MAX_RELATIVE_ERROR: f32 = 2e-5;
+
+/// The share of the largest reference depth below which a pixel's relative
+/// error is not counted: the final ReLU clips depth to zero, and near zero a
+/// difference of rounding size is a large ratio that says nothing about the
+/// port.
+const RELATIVE_FLOOR: f64 = 0.01;
+
+/// What a [`Loaded`] model's depth differs from the reference by.
+struct DepthError {
+    max: f64,
+    mean: f64,
+    max_relative: f64,
+    /// The reference's largest depth.
+    scale: f64,
+}
+
+impl DepthError {
+    fn of(got: &[f32], want: &[f32]) -> Self {
+        assert_eq!(got.len(), want.len());
+        let scale = want.iter().map(|w| f64::from(w.abs())).fold(0.0, f64::max);
+        let (mut max, mut sum, mut max_relative) = (0.0_f64, 0.0_f64, 0.0_f64);
+        for (&g, &w) in got.iter().zip(want) {
+            let d = f64::from(g - w).abs();
+            max = max.max(d);
+            sum += d;
+            let w = f64::from(w).abs();
+            if w >= RELATIVE_FLOOR * scale {
+                max_relative = max_relative.max(d / w);
+            }
+        }
+        Self {
+            max,
+            mean: sum / got.len() as f64,
+            max_relative,
+            scale,
+        }
+    }
+
+    fn within_tolerance(&self) -> bool {
+        self.max <= f64::from(DEPTH_MAX_ERROR)
+            && self.mean <= f64::from(DEPTH_MEAN_ERROR)
+            && self.max_relative <= f64::from(DEPTH_MAX_RELATIVE_ERROR)
+    }
+}
+
+/// The whole of Depth Anything V2 Small, the encoder and the DPT head built
+/// from the real weights by `beatlm::model::depth_anything_v2::model`, run on
+/// the GPU on the reference input, fused and unfused, against the depth the
+/// original implementation predicted.
+///
+/// The reference depth is `[1][518][518]`, the shape the manifest records;
+/// the graph's is `[518][518][1]`, the same numbers in the same order.
+///
+/// With timestamp queries on the device, it reports the GPU time of the whole
+/// model per run, by kind of kernel for the encoder and the decoder apart, and
+/// for the unfused program what the standalone ReLUs that the fused program
+/// takes as prologues took.
+#[test]
+#[ignore = "needs `just setup-depth-anything` and `just reference-depth-anything`"]
+fn the_whole_model_on_the_gpu_matches_the_reference_depth() {
+    let dir = model_dir();
+    let config = Config::small();
+    let files = Files::read(&config);
+    let manifest = String::from_utf8(read_or_explain(
+        &dir.join("reference/manifest.json"),
+        "reference-depth-anything",
+    ))
+    .expect("the manifest is text");
+    let shape = manifest_shape(&manifest, "predicted_depth");
+    assert_eq!(shape, [1, SIDE, SIDE]);
+    let want = floats(&read_or_explain(
+        &dir.join("reference/predicted_depth.f32"),
+        "reference-depth-anything",
+    ));
+    assert_eq!(want.len(), shape.iter().product::<usize>());
+    let (low, high) = want
+        .iter()
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(l, h), &v| {
+            (l.min(v), h.max(v))
+        });
+    let mean = want.iter().map(|&v| f64::from(v)).sum::<f64>() / want.len() as f64;
+    println!("reference depth: from {low:.4} to {high:.4}, mean {mean:.4}");
+
+    // The encoder's operations come first in the model's graph, so a kernel
+    // whose operations start past them is the decoder's.
+    let encoder_ops = {
+        let mut b = Builder::new();
+        encoder(&mut b, &config, TensorRole::Activation).expect("the encoder builds");
+        b.graph().ops().len()
+    };
+    let mut builder = Builder::new();
+    let m = model(&mut builder, &config).expect("the model builds");
+    let (graph, uploads) = files.uploads(builder, m.image);
+
+    let gpu = Gpu::new();
+    let mut failures = Vec::new();
+    // The graph operations the fused program applies as convolution
+    // prologues: in the unfused program, which has one kernel per operation,
+    // they are the kernels of those indices.
+    let mut prologue_ops: Vec<usize> = Vec::new();
+    for fusion in [Fusion::On, Fusion::Off] {
+        let loaded = Loaded::new(&gpu, &graph, fusion, &uploads);
+        loaded.run(None, 0);
+        println!("{fusion:?}: {}", loaded.describe());
+        let error = DepthError::of(&loaded.read(m.depth), &want);
+        println!(
+            "{fusion:?}: depth max abs error {:.3e}, mean abs error {:.3e}, max relative error \
+             {:.3e} (over pixels at least {RELATIVE_FLOOR} of the largest reference depth, {:.4})",
+            error.max, error.mean, error.max_relative, error.scale
+        );
+        if !error.within_tolerance() {
+            failures.push(fusion);
+        }
+        let kernels = loaded.program.kernels();
+        if fusion == Fusion::On {
+            prologue_ops = kernels
+                .iter()
+                .filter(|k| !k.prologue().is_empty())
+                .map(|k| k.ops().start)
+                .collect();
+        }
+
+        let Some((totals, medians)) = loaded.timings() else {
+            continue;
+        };
+        println!(
+            "{fusion:?}: GPU time of the model, summed over its {} kernels' timestamp pairs, per \
+             run (sorted, microseconds): {totals:?}",
+            kernels.len()
+        );
+        // Kind of kernel, by encoder or decoder: count and summed medians.
+        let mut by_kind: BTreeMap<(&str, &str), (usize, u64)> = BTreeMap::new();
+        for (spec, &median) in kernels.iter().zip(&medians) {
+            let part = if spec.ops().start < encoder_ops {
+                "encoder"
+            } else {
+                "decoder"
+            };
+            let entry = by_kind.entry((part, spec.main().name())).or_default();
+            entry.0 += 1;
+            entry.1 += median;
+        }
+        let mut per_part: BTreeMap<&str, u64> = BTreeMap::new();
+        println!("{fusion:?}: median GPU time per kind of kernel (microseconds):");
+        for ((part, kind), (count, us)) in &by_kind {
+            *per_part.entry(part).or_default() += us;
+            println!("  {part:8} {kind:18} {count:4} kernels {us:8}");
+        }
+        println!("{fusion:?}: summed medians by part (microseconds): {per_part:?}");
+        if fusion == Fusion::Off {
+            let relus: Vec<u64> = prologue_ops.iter().map(|&op| medians[op]).collect();
+            println!(
+                "Off: the {} standalone ReLUs the fused program takes as prologues took {} \
+                 microseconds in all (medians, each {relus:?})",
+                relus.len(),
+                relus.iter().sum::<u64>()
+            );
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{failures:?} exceed max {DEPTH_MAX_ERROR}, mean {DEPTH_MEAN_ERROR} or relative \
+         {DEPTH_MAX_RELATIVE_ERROR}"
     );
 }

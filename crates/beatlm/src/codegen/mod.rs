@@ -6,14 +6,18 @@
 //! place a shader language is spoken. It owns these rules:
 //!
 //! - **WGSL text is the interface.** A spec becomes text through one template
-//!   per kind of main operation (convolution; layer norm; softmax; one tiled
-//!   matrix multiply serving the matrix multiply, the patch embedding and the
-//!   two attention products; the token copies; and a map for a standalone
+//!   per kind of main operation (convolution; transposed convolution;
+//!   bilinear resampling; layer norm; softmax; one tiled matrix multiply
+//!   serving the matrix multiply, the 1x1 convolution, the patch embedding and
+//!   the two attention products; the token copies; and a map for a standalone
 //!   element-wise kernel), each of which stores every output
 //!   value through one `epilogue(value, index)` function generated from the
 //!   spec's [`Epilogue`](beatlm_core::kernel::Epilogue) steps. That function is
 //!   how fusion reaches the shader: a fused kernel is the heavy template with a
-//!   longer epilogue. naga IR is never built directly; the crate
+//!   longer epilogue. The convolution also loads every input value through a
+//!   `prologue(value)` function generated from the spec's
+//!   [`Prologue`](beatlm_core::kernel::Prologue) steps, which is how a ReLU
+//!   fused forwards reaches it. naga IR is never built directly; the crate
 //!   documentation says why.
 //! - **Nothing reaches the device unvalidated.** [`generate`] parses the text
 //!   with `naga::front::wgsl::parse_str` and validates the module with
@@ -367,8 +371,9 @@ fn capabilities(features: DeviceFeatures) -> naga::valid::Capabilities {
 mod tests {
     use super::*;
     use beatlm_core::kernel::{
-        AttentionScores, AttentionValues, Conv2d3x3, Fusion, Graph, LAYER_NORM_EPSILON, LayerNorm,
-        MatMul, OpKind, PatchEmbed, PrependToken, Program, Softmax, TensorRole, TokensToMap,
+        AttentionScores, AttentionValues, Conv2d1x1, Conv2d3x3, ConvTranspose2d, Fusion, Graph,
+        LAYER_NORM_EPSILON, LayerNorm, MatMul, OpKind, PatchEmbed, PrependToken, Program,
+        ResizeBilinear, Softmax, TensorRole, TokensToMap,
     };
 
     const X: TensorId = TensorId::new(0);
@@ -435,6 +440,22 @@ mod tests {
     fn program(
         inputs: &[(TensorId, u64)],
         heavy: OpKind,
+        out: (u64, u32),
+        steps: &[OpKind],
+        fusion: Fusion,
+    ) -> Program {
+        program_from(inputs, false, heavy, out, steps, fusion)
+    }
+
+    /// The ReLU of `X` a prologue test puts before its convolution.
+    const RELU: TensorId = TensorId::new(30);
+
+    /// [`program`], with a ReLU of `X` into `RELU` before `heavy` when
+    /// `relu_first`; `heavy` then reads `RELU`.
+    fn program_from(
+        inputs: &[(TensorId, u64)],
+        relu_first: bool,
+        heavy: OpKind,
         (out, channels): (u64, u32),
         steps: &[OpKind],
         fusion: Fusion,
@@ -442,6 +463,18 @@ mod tests {
         let mut g = Graph::new();
         for &(id, elements) in inputs {
             g.tensor(id, TensorRole::Weight, elements).unwrap();
+        }
+        if relu_first {
+            let elements = inputs.iter().find(|(id, _)| *id == X).unwrap().1;
+            g.tensor(RELU, TensorRole::Activation, elements).unwrap();
+            g.push(
+                OpKind::Relu {
+                    input: X,
+                    elements: u32::try_from(elements).unwrap(),
+                },
+                RELU,
+            )
+            .unwrap();
         }
         g.tensor(R, TensorRole::Input, out).unwrap();
         g.tensor(S, TensorRole::Weight, channels.into()).unwrap();
@@ -475,6 +508,7 @@ mod tests {
                 width: w,
                 cin,
                 cout,
+                stride: 1,
             })
         };
         let conv_out = (u64::from(h * w * cout), cout);
@@ -529,7 +563,92 @@ mod tests {
             ),
         ];
         all.extend(encoder_heavies());
+        all.extend(decoder_heavies());
         all
+    }
+
+    /// The DPT head's heavy ops, at odd shapes: a strided convolution with and
+    /// without bias, a 1x1 convolution, a transposed convolution and a
+    /// bilinear resampling.
+    fn decoder_heavies() -> Vec<Heavy> {
+        let (h, w, cin, cout) = (7, 9, 3, 5);
+        let strided = |bias| {
+            OpKind::Conv2d3x3(Conv2d3x3 {
+                input: X,
+                weights: W,
+                bias,
+                height: h,
+                width: w,
+                cin,
+                cout,
+                stride: 2,
+            })
+        };
+        // 7 x 9 at stride 2 is 4 x 5.
+        let strided_out = (u64::from(4 * 5 * cout), cout);
+        let image = u64::from(h * w * cin);
+        let factor = 3;
+        let up = |bias| {
+            OpKind::ConvTranspose2d(ConvTranspose2d {
+                input: X,
+                weights: W,
+                bias,
+                height: h,
+                width: w,
+                cin,
+                cout,
+                factor,
+            })
+        };
+        let up_out = (u64::from(h * factor * w * factor * cout), cout);
+        let up_weights = u64::from(factor * factor * cin * cout);
+        vec![
+            (
+                vec![(X, image), (W, u64::from(9 * cin * cout))],
+                strided(None),
+                strided_out,
+            ),
+            (
+                vec![
+                    (X, image),
+                    (W, u64::from(9 * cin * cout)),
+                    (P, u64::from(cout)),
+                ],
+                strided(Some(P)),
+                strided_out,
+            ),
+            (
+                vec![(X, image), (W, u64::from(cin * cout)), (P, u64::from(cout))],
+                OpKind::Conv2d1x1(Conv2d1x1 {
+                    input: X,
+                    weights: W,
+                    bias: Some(P),
+                    height: h,
+                    width: w,
+                    cin,
+                    cout,
+                }),
+                (u64::from(h * w * cout), cout),
+            ),
+            (vec![(X, image), (W, up_weights)], up(None), up_out),
+            (
+                vec![(X, image), (W, up_weights), (P, u64::from(cout))],
+                up(Some(P)),
+                up_out,
+            ),
+            (
+                vec![(X, image)],
+                OpKind::ResizeBilinear(ResizeBilinear {
+                    input: X,
+                    in_height: h,
+                    in_width: w,
+                    out_height: 11,
+                    out_width: 4,
+                    channels: cin,
+                }),
+                (u64::from(11 * 4 * cin), cin),
+            ),
+        ]
     }
 
     /// The vision transformer's heavy ops, at odd shapes.
@@ -666,8 +785,67 @@ mod tests {
             "map+scale",
             "map+channel_scale",
             "map+add",
+            "conv_transpose2d",
+            "conv_transpose2d+add+relu+gelu+scale",
+            "resize_bilinear+channel_scale+add+gelu_erf+scale",
         ] {
             assert!(names.contains(name), "{name} in {names:?}");
+        }
+    }
+
+    #[test]
+    fn a_convolution_with_a_relu_prologue_validates_whole_and_split_with_every_epilogue() {
+        for (stride, (oh, ow)) in [(1, (7, 9)), (2, (4, 5))] {
+            for bias in [None, Some(P)] {
+                let (cin, cout) = (3, 5);
+                let heavy = OpKind::Conv2d3x3(Conv2d3x3 {
+                    input: RELU,
+                    weights: W,
+                    bias,
+                    height: 7,
+                    width: 9,
+                    cin,
+                    cout,
+                    stride,
+                });
+                let mut inputs = vec![(X, 7 * 9 * 3), (W, 9 * 3 * 5)];
+                if bias.is_some() {
+                    inputs.push((P, 5));
+                }
+                let out = (u64::from(oh * ow * cout), cout);
+                for steps in epilogues(oh * ow * cout, cout) {
+                    let fused = program_from(&inputs, true, heavy, out, &steps, Fusion::On);
+                    assert_eq!(fused.kernels().len(), 1);
+                    let spec = &fused.kernels()[0];
+                    assert!(spec.name().starts_with("relu-conv2d3x3"), "{}", spec.name());
+                    let text = generate(spec, Variant::Baseline).unwrap_or_else(|e| panic!("{e}"));
+                    assert!(
+                        text.contains(
+                            "fn prologue(value: f32) -> f32 {\n    var v = value;\n    \
+                             v = max(v, 0.0);\n    return v;"
+                        ),
+                        "{text}"
+                    );
+                    for count in [2, 3, 7, 64] {
+                        let split = fused.split(&[count]).unwrap();
+                        for part in split.kernels() {
+                            assert_eq!(
+                                generate(part, Variant::Baseline).unwrap_or_else(|e| panic!("{e}")),
+                                text
+                            );
+                        }
+                    }
+                    // Unfused, the ReLU is a map of its own and the
+                    // convolution's prologue returns what it loads.
+                    let unfused = program_from(&inputs, true, heavy, out, &steps, Fusion::Off);
+                    assert_eq!(unfused.kernels()[0].name(), "map+relu");
+                    let conv = generate(&unfused.kernels()[1], Variant::Baseline).unwrap();
+                    assert!(!conv.contains("max(v, 0.0)"), "{conv}");
+                    for spec in unfused.kernels() {
+                        generate(spec, Variant::Baseline).unwrap_or_else(|e| panic!("{e}"));
+                    }
+                }
+            }
         }
     }
 
