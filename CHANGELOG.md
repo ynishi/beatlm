@@ -42,6 +42,11 @@ and this project adheres to
   a program created once.
 - `beatlm-bench --fusion on|off` and `--dump-wgsl`, and the
   `dispatches_per_job`, `dispatches_per_frame` and `kernels` report lines.
+- Kernel splitting: `kernel::Part`, `Program::split` and
+  `Program::parts_within`, with per-part ranges as WGSL override constants.
+- `beatlm-bench --max-dispatch-us` and `--split on|off`, a paced calibration
+  before the loop, and the `longest_dispatch_us` and `kernel_parts` report
+  lines.
 
 ### Changed
 
