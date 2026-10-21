@@ -98,6 +98,12 @@ pub struct Outcome {
     pub encode_us: Vec<u64>,
     /// Time inside `queue.submit`, in microseconds.
     pub submit_us: Vec<u64>,
+    /// Compute dispatches encoded in each frame: one per slice the plan
+    /// handed out.
+    pub dispatches_per_frame: Vec<u64>,
+    /// Compute dispatches encoded for each delivered job, over every frame
+    /// that ran one of its slices.
+    pub dispatches_per_job: Vec<u64>,
     /// How long after its period's boundary each frame actually began, in
     /// microseconds; nonzero when the previous frame overran or the sleep
     /// overshot.
@@ -146,6 +152,8 @@ pub struct NetReport {
     pub tensors: usize,
     /// Input and output slots: the jobs the network keeps apart.
     pub slots: u32,
+    /// The name of each kernel of a job, in dispatch order.
+    pub kernels: Vec<String>,
     /// wgpu's object counters across the loop.
     pub counters: counters::Report,
 }
@@ -167,6 +175,9 @@ pub struct Engine<'g> {
     slices: Vec<SliceId>,
     margin: Micros,
     latency: u32,
+    /// Dispatches encoded so far for each job that is not yet delivered or
+    /// missed, by submission index.
+    job_dispatches: BTreeMap<u64, u64>,
     outcome: Outcome,
 }
 
@@ -193,11 +204,28 @@ impl<'g> Engine<'g> {
                     .max_in_flight()
                     .context("the policy does not bound the jobs in flight")?;
                 Some(
-                    Net::new(&gpu.device, &gpu.queue, &net::DEFAULT_SHAPE, slots)
-                        .context("cannot build the planned network")?,
+                    Net::new(
+                        &gpu.device,
+                        &gpu.queue,
+                        &net::DEFAULT_SHAPE,
+                        slots,
+                        args.fusion,
+                    )
+                    .context("cannot build the planned network")?,
                 )
             }
         };
+        // The job's slices are the network's kernels; `args` counted them from
+        // its own lowering, so check they agree before a slice names no kernel.
+        if let Some(net) = &net {
+            if net.kernel_count() != args.slices {
+                anyhow::bail!(
+                    "--slices is {} but the network has {} kernels",
+                    args.slices,
+                    net.kernel_count()
+                );
+            }
+        }
         // A frame can run slices of every job still pending, not only its own: a
         // job lives `latency` frames past its submission, so `latency + 1` jobs
         // of `slices` slices each can be pending at once.
@@ -225,6 +253,7 @@ impl<'g> Engine<'g> {
             slices: (0..args.slices).map(SliceId::new).collect(),
             margin: Micros::new(args.margin_us),
             latency: args.latency,
+            job_dispatches: BTreeMap::new(),
             outcome: Outcome::default(),
         };
         engine.warm_up()?;
@@ -348,6 +377,15 @@ impl<'g> Engine<'g> {
             .submit_us
             .push(micros_between(submitting, submitted));
         self.outcome
+            .dispatches_per_frame
+            .push(plan.runs.len() as u64);
+        // Counted after the timed intervals, so the bookkeeping is not charged
+        // to the encode time it is compared with. Every slice is one compute
+        // pass with one dispatch, in either workload.
+        for run in &plan.runs {
+            *self.job_dispatches.entry(run.job.get()).or_default() += 1;
+        }
+        self.outcome
             .cpu_us
             .push(micros_between(tick.began, submitted));
         Ok(plan)
@@ -362,6 +400,11 @@ impl<'g> Engine<'g> {
             if latency != u64::from(self.latency) {
                 self.outcome.violations += 1;
             }
+            let dispatches = self.job_dispatches.remove(&delivery.job.get()).unwrap_or(0);
+            self.outcome.dispatches_per_job.push(dispatches);
+        }
+        for missed in &plan.missed {
+            self.job_dispatches.remove(&missed.job.get());
         }
         self.outcome.missed += plan.missed.len() as u64;
     }
@@ -413,6 +456,7 @@ impl<'g> Engine<'g> {
                 unshared_bytes: plan.placements().map(|(_, p)| p.size).sum(),
                 tensors: plan.placements().count(),
                 slots: net.slots(),
+                kernels: net.program().kernels().iter().map(|k| k.name()).collect(),
                 counters,
             });
         }
@@ -436,7 +480,7 @@ impl<'g> Engine<'g> {
         match &self.net {
             Some(net) => {
                 for slot in 0..net.slots() {
-                    for slice in 0..net::OPS {
+                    for slice in 0..net.kernel_count() {
                         net.encode(&mut encoder, slot, SliceId::new(slice), None)?;
                     }
                 }

@@ -1,7 +1,7 @@
 //! What the core knows about an adapter: its limits and features as plain
 //! values.
 //!
-//! The memory plan and, later, kernel generation decide from numbers an adapter
+//! The memory plan and kernel variant selection decide from numbers an adapter
 //! reports: how large a storage binding may be, how finely an offset must be
 //! aligned, how much workgroup memory a kernel may use. Those numbers arrive
 //! here as a [`DeviceProfile`] and nothing in the core names the API that
@@ -39,6 +39,18 @@ pub struct DeviceFeatures {
     pub subgroups: bool,
     /// Timestamp queries inside passes, which the slice timer needs.
     pub timestamp_query: bool,
+}
+
+impl DeviceFeatures {
+    /// Whether every feature `needed` asks for is in `self`: the check a
+    /// kernel variant's features pass on a device before the variant is used
+    /// there.
+    #[must_use]
+    pub const fn contains(self, needed: Self) -> bool {
+        (self.shader_f16 || !needed.shader_f16)
+            && (self.subgroups || !needed.subgroups)
+            && (self.timestamp_query || !needed.timestamp_query)
+    }
 }
 
 /// An adapter's limits and enabled features, as plain values.
@@ -138,6 +150,23 @@ mod tests {
         assert_eq!(b.max_storage_buffers_per_shader_stage, 8);
         assert_eq!(b.features, DeviceFeatures::default());
         assert_eq!(DeviceProfile::default(), b);
+    }
+
+    #[test]
+    fn features_contain_exactly_their_subsets() {
+        let none = DeviceFeatures::default();
+        let f16 = DeviceFeatures {
+            shader_f16: true,
+            ..none
+        };
+        let both = DeviceFeatures {
+            subgroups: true,
+            ..f16
+        };
+        assert!(none.contains(none));
+        assert!(f16.contains(none) && f16.contains(f16));
+        assert!(!none.contains(f16));
+        assert!(both.contains(f16) && !f16.contains(both));
     }
 
     #[test]

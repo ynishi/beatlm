@@ -1,7 +1,10 @@
 //! Command-line options, parsed by hand: they are a handful of numbers, and a
 //! parser dependency would outweigh the code it replaces.
 
+use std::path::PathBuf;
+
 use anyhow::{Context, Result, bail};
+use beatlm_core::kernel::Fusion;
 
 /// The usage text, printed for `--help` and after a bad option.
 pub const USAGE: &str = "\
@@ -14,6 +17,10 @@ usage: beatlm-bench [options]
   --render-iters N  loop iterations per pixel of the render pass
   --margin-us N     safety margin in the frame budget, us  (default 2000)
   --workload W      synthetic or net                        (default synthetic)
+  --fusion F        net only: fuse element-wise operations into the kernel
+                    before them, on or off                  (default on)
+  --dump-wgsl DIR   net only: write each generated kernel's WGSL into DIR
+                    before the run
   --mode M          concurrency candidate: sync, thread or async (default sync)
   --runs N          repeat the whole run N times on one device (default 1)
   --estimator E     cost estimate: mean-sigmas, quantile or capped
@@ -89,10 +96,18 @@ impl Mode {
 pub enum WorkloadKind {
     /// The busy-loop kernel standing in for a slice (`workload.rs`).
     Synthetic,
-    /// The planned network of hand-written kernels (`net.rs`): one slice per
-    /// operation, so the job has [`crate::net::OPS`] slices and `--slices` and
-    /// `--slice-iters` do not apply.
+    /// The planned network of generated kernels (`net.rs`): one slice per
+    /// kernel, so the job has [`crate::net::kernel_count`] slices for the
+    /// `--fusion` setting and `--slices` and `--slice-iters` do not apply.
     Net,
+}
+
+/// The spelling `--fusion` accepts and the report prints.
+pub const fn fusion_name(fusion: Fusion) -> &'static str {
+    match fusion {
+        Fusion::On => "on",
+        Fusion::Off => "off",
+    }
 }
 
 impl WorkloadKind {
@@ -122,6 +137,10 @@ pub struct Args {
     pub margin_us: u64,
     /// The load the slices run.
     pub workload: WorkloadKind,
+    /// Whether the network's element-wise operations are fused; `net` only.
+    pub fusion: Fusion,
+    /// Where to write the network's generated WGSL before the run; `net` only.
+    pub dump_wgsl: Option<PathBuf>,
     /// The concurrency candidate that drives the frame.
     pub mode: Mode,
     /// How many times the whole run is repeated in one process.
@@ -145,6 +164,8 @@ impl Default for Args {
             render_iters: DEFAULT_RENDER_ITERS,
             margin_us: 2_000,
             workload: WorkloadKind::Synthetic,
+            fusion: Fusion::On,
+            dump_wgsl: None,
             mode: Mode::Sync,
             runs: 1,
             estimator: EstimatorKind::Quantile,
@@ -169,8 +190,9 @@ pub enum Command {
 ///
 /// # Errors
 ///
-/// An unknown option, a missing or malformed value, or a value out of range
-/// (zero frames, zero slices or zero runs).
+/// An unknown option, a missing or malformed value, a value out of range
+/// (zero frames, zero slices or zero runs), or a `net` option without
+/// `--workload net`.
 pub fn parse<I>(args: I) -> Result<Command>
 where
     I: IntoIterator<Item = String>,
@@ -178,6 +200,7 @@ where
     let mut out = Args::default();
     let mut slices_given = false;
     let mut background_iters_given = false;
+    let mut fusion_given = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let (name, inline) = match arg.split_once('=') {
@@ -204,6 +227,11 @@ where
             "--render-iters" => out.render_iters = number(&name, &value()?)?,
             "--margin-us" => out.margin_us = number(&name, &value()?)?,
             "--workload" => out.workload = workload(&value()?)?,
+            "--fusion" => {
+                out.fusion = fusion(&value()?)?;
+                fusion_given = true;
+            }
+            "--dump-wgsl" => out.dump_wgsl = Some(PathBuf::from(value()?)),
             "--mode" => out.mode = mode(&value()?)?,
             "--runs" => out.runs = number(&name, &value()?)?,
             "--estimator" => out.estimator = estimator(&value()?)?,
@@ -231,16 +259,32 @@ where
         bail!("--background-iters has no effect without --background-load");
     }
     if out.workload == WorkloadKind::Net {
-        // The network's operations are its slices.
-        if slices_given && out.slices != crate::net::OPS {
+        // The network's kernels are its slices.
+        let kernels = crate::net::kernel_count(out.fusion)?;
+        if slices_given && out.slices != kernels {
             bail!(
-                "--slices is {} for --workload net: one slice per operation",
-                crate::net::OPS
+                "--slices is {kernels} for --workload net with --fusion {}: one slice per kernel",
+                fusion_name(out.fusion)
             );
         }
-        out.slices = crate::net::OPS;
+        out.slices = kernels;
+    } else {
+        if fusion_given {
+            bail!("--fusion has no effect without --workload net");
+        }
+        if out.dump_wgsl.is_some() {
+            bail!("--dump-wgsl has no effect without --workload net");
+        }
     }
     Ok(Command::Run(out))
+}
+
+/// Parses the value of `--fusion`.
+fn fusion(text: &str) -> Result<Fusion> {
+    [Fusion::On, Fusion::Off]
+        .into_iter()
+        .find(|&f| fusion_name(f) == text)
+        .with_context(|| format!("--fusion: {text:?} is not one of on, off"))
 }
 
 /// Parses the value of `--workload`.
@@ -345,15 +389,38 @@ mod tests {
     }
 
     #[test]
-    fn the_net_workload_has_one_slice_per_operation() {
+    fn the_net_workload_has_one_slice_per_kernel() {
         let Command::Run(a) = parse_strs(&["--workload=net"]).unwrap() else {
             panic!("expected a run");
         };
-        assert_eq!((a.workload, a.slices), (WorkloadKind::Net, crate::net::OPS));
-        let ops = crate::net::OPS.to_string();
-        assert!(parse_strs(&["--workload", "net", "--slices", &ops]).is_ok());
+        let fused = crate::net::kernel_count(Fusion::On).unwrap();
+        assert_eq!(
+            (a.workload, a.fusion, a.slices),
+            (WorkloadKind::Net, Fusion::On, fused)
+        );
+        let Command::Run(a) = parse_strs(&["--workload=net", "--fusion", "off"]).unwrap() else {
+            panic!("expected a run");
+        };
+        let unfused = crate::net::kernel_count(Fusion::Off).unwrap();
+        assert_eq!((a.fusion, a.slices), (Fusion::Off, unfused));
+        assert!(fused < unfused);
+        let kernels = fused.to_string();
+        assert!(parse_strs(&["--workload", "net", "--slices", &kernels]).is_ok());
         assert!(parse_strs(&["--workload", "net", "--slices", "3"]).is_err());
         assert!(parse_strs(&["--workload", "gpt"]).is_err());
+        assert!(parse_strs(&["--workload", "net", "--fusion", "maybe"]).is_err());
+    }
+
+    #[test]
+    fn the_net_options_need_the_net_workload() {
+        assert!(parse_strs(&["--fusion", "off"]).is_err());
+        assert!(parse_strs(&["--dump-wgsl", "kernels"]).is_err());
+        let Command::Run(a) = parse_strs(&["--workload", "net", "--dump-wgsl=kernels"]).unwrap()
+        else {
+            panic!("expected a run");
+        };
+        assert_eq!(a.dump_wgsl, Some(PathBuf::from("kernels")));
+        assert_eq!(Args::default().dump_wgsl, None);
     }
 
     #[test]
