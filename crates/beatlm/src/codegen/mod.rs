@@ -6,8 +6,10 @@
 //! place a shader language is spoken. It owns these rules:
 //!
 //! - **WGSL text is the interface.** A spec becomes text through one template
-//!   per main operation (convolution, layer norm, matrix multiply, and a map
-//!   for a standalone element-wise kernel), each of which stores every output
+//!   per kind of main operation (convolution; layer norm; softmax; one tiled
+//!   matrix multiply serving the matrix multiply, the patch embedding and the
+//!   two attention products; the token copies; and a map for a standalone
+//!   element-wise kernel), each of which stores every output
 //!   value through one `epilogue(value, index)` function generated from the
 //!   spec's [`Epilogue`](beatlm_core::kernel::Epilogue) steps. That function is
 //!   how fusion reaches the shader: a fused kernel is the heavy template with a
@@ -365,7 +367,8 @@ fn capabilities(features: DeviceFeatures) -> naga::valid::Capabilities {
 mod tests {
     use super::*;
     use beatlm_core::kernel::{
-        Conv2d3x3, Fusion, Graph, LayerNorm, MatMul, OpKind, Program, TensorRole,
+        AttentionScores, AttentionValues, Conv2d3x3, Fusion, Graph, LAYER_NORM_EPSILON, LayerNorm,
+        MatMul, OpKind, PatchEmbed, PrependToken, Program, Softmax, TensorRole, TokensToMap,
     };
 
     const X: TensorId = TensorId::new(0);
@@ -373,6 +376,8 @@ mod tests {
     const P: TensorId = TensorId::new(2);
     const Q: TensorId = TensorId::new(3);
     const R: TensorId = TensorId::new(4);
+    /// The per-channel multipliers of a LayerScale step.
+    const S: TensorId = TensorId::new(5);
     const H: TensorId = TensorId::new(10);
     const Y: TensorId = TensorId::new(20);
     /// Activations of the epilogue chain.
@@ -384,10 +389,17 @@ mod tests {
     ];
 
     /// The epilogues every heavy op is generated with: none, each step alone,
-    /// and all four in a chain.
-    fn epilogues(elements: u32) -> Vec<Vec<OpKind>> {
+    /// and chains of four. `channels` is the output's last dimension.
+    fn epilogues(elements: u32, channels: u32) -> Vec<Vec<OpKind>> {
         let relu = |input| OpKind::Relu { input, elements };
         let gelu = |input| OpKind::Gelu { input, elements };
+        let gelu_erf = |input| OpKind::GeluErf { input, elements };
+        let layer_scale = |input| OpKind::ChannelScale {
+            input,
+            scale: S,
+            rows: elements / channels,
+            channels,
+        };
         let scale = |input| OpKind::Scale {
             input,
             factor: -0.75,
@@ -404,17 +416,26 @@ mod tests {
             vec![gelu(H)],
             vec![scale(H)],
             vec![add(H)],
+            vec![gelu_erf(H)],
+            vec![layer_scale(H)],
             vec![add(H), relu(CHAIN[0]), gelu(CHAIN[1]), scale(CHAIN[2])],
+            vec![
+                layer_scale(H),
+                add(CHAIN[0]),
+                gelu_erf(CHAIN[1]),
+                scale(CHAIN[2]),
+            ],
         ]
     }
 
     /// `heavy` writing `H`, then `steps`, the last writing `Y`, lowered with
     /// `fusion`. `inputs` are declared with their element counts; `R`, the
-    /// addend, has as many elements as the output.
+    /// addend, has as many elements as the output, and `S`, the multipliers,
+    /// one per channel of it.
     fn program(
         inputs: &[(TensorId, u64)],
         heavy: OpKind,
-        out: u64,
+        (out, channels): (u64, u32),
         steps: &[OpKind],
         fusion: Fusion,
     ) -> Program {
@@ -423,6 +444,7 @@ mod tests {
             g.tensor(id, TensorRole::Weight, elements).unwrap();
         }
         g.tensor(R, TensorRole::Input, out).unwrap();
+        g.tensor(S, TensorRole::Weight, channels.into()).unwrap();
         let outputs: Vec<TensorId> = std::iter::once(H).chain(CHAIN).take(steps.len()).collect();
         for &t in &outputs {
             g.tensor(t, TensorRole::Activation, out).unwrap();
@@ -437,8 +459,8 @@ mod tests {
     }
 
     /// A heavy op with the tensors it reads and their element counts, and the
-    /// element count of its output.
-    type Heavy = (Vec<(TensorId, u64)>, OpKind, u64);
+    /// element count of its output and of the output's last dimension.
+    type Heavy = (Vec<(TensorId, u64)>, OpKind, (u64, u32));
 
     /// Every heavy op of the tests: odd shapes, so no dimension is a multiple
     /// of a tile.
@@ -455,7 +477,7 @@ mod tests {
                 cout,
             })
         };
-        let conv_out = u64::from(h * w * cout);
+        let conv_out = (u64::from(h * w * cout), cout);
         let (m, k, n) = (37, 21, 19);
         let mm = |bias| {
             OpKind::MatMul(MatMul {
@@ -468,7 +490,7 @@ mod tests {
             })
         };
         let (rows, c) = (11, 150);
-        vec![
+        let mut all = vec![
             (
                 vec![(X, u64::from(h * w * cin)), (W, u64::from(9 * cin * cout))],
                 conv(None),
@@ -491,18 +513,106 @@ mod tests {
                     beta: P,
                     rows,
                     channels: c,
+                    epsilon: LAYER_NORM_EPSILON,
                 }),
-                u64::from(rows * c),
+                (u64::from(rows * c), c),
             ),
             (
                 vec![(X, u64::from(m * k)), (W, u64::from(k * n))],
                 mm(None),
-                u64::from(m * n),
+                (u64::from(m * n), n),
             ),
             (
                 vec![(X, u64::from(m * k)), (W, u64::from(k * n)), (P, n.into())],
                 mm(Some(P)),
-                u64::from(m * n),
+                (u64::from(m * n), n),
+            ),
+        ];
+        all.extend(encoder_heavies());
+        all
+    }
+
+    /// The vision transformer's heavy ops, at odd shapes.
+    fn encoder_heavies() -> Vec<Heavy> {
+        let (gh, gw, patch, cin, cout) = (3, 4, 3, 2, 19);
+        let patch_embed = |bias| {
+            OpKind::PatchEmbed(PatchEmbed {
+                input: X,
+                weights: W,
+                bias,
+                grid_h: gh,
+                grid_w: gw,
+                patch,
+                cin,
+                cout,
+            })
+        };
+        let image = u64::from(gh * patch * gw * patch * cin);
+        let kernel = u64::from(patch * patch * cin * cout);
+        let (tokens, heads, head_dim) = (17, 2, 5);
+        let qkv = u64::from(tokens * 3 * heads * head_dim);
+        let scores = u64::from(tokens * heads * tokens);
+        let (seq, width) = (7, 5);
+        vec![
+            (
+                vec![(X, image), (W, kernel)],
+                patch_embed(None),
+                (u64::from(gh * gw * cout), cout),
+            ),
+            (
+                vec![(X, image), (W, kernel), (P, cout.into())],
+                patch_embed(Some(P)),
+                (u64::from(gh * gw * cout), cout),
+            ),
+            (
+                vec![(W, width.into()), (X, u64::from(seq * width))],
+                OpKind::PrependToken(PrependToken {
+                    token: W,
+                    tokens: X,
+                    rows: seq,
+                    channels: width,
+                }),
+                (u64::from((seq + 1) * width), width),
+            ),
+            (
+                vec![(X, u64::from((1 + gh * gw) * width))],
+                OpKind::TokensToMap(TokensToMap {
+                    input: X,
+                    height: gh,
+                    width: gw,
+                    channels: width,
+                }),
+                (u64::from(gh * gw * width), width),
+            ),
+            (
+                vec![(X, qkv)],
+                OpKind::AttentionScores(AttentionScores {
+                    qkv: X,
+                    tokens,
+                    heads,
+                    head_dim,
+                }),
+                (scores, tokens),
+            ),
+            (
+                vec![(X, 19 * 300_u64)],
+                OpKind::Softmax(Softmax {
+                    input: X,
+                    rows: 19,
+                    cols: 300,
+                }),
+                (19 * 300_u64, 300),
+            ),
+            (
+                vec![(W, scores), (X, qkv)],
+                OpKind::AttentionValues(AttentionValues {
+                    probs: W,
+                    qkv: X,
+                    tokens,
+                    heads,
+                    head_dim,
+                }),
+                (u64::from(tokens * heads * head_dim), heads * head_dim),
             ),
         ]
     }
@@ -511,8 +621,8 @@ mod tests {
     fn every_generated_kernel_parses_and_validates_with_and_without_epilogues() {
         let mut names = std::collections::BTreeSet::new();
         for (inputs, heavy, out) in heavies() {
-            let elements = u32::try_from(out).unwrap();
-            for steps in epilogues(elements) {
+            let elements = u32::try_from(out.0).unwrap();
+            for steps in epilogues(elements, out.1) {
                 for fusion in [Fusion::On, Fusion::Off] {
                     let p = program(&inputs, heavy, out, &steps, fusion);
                     let expected = if fusion == Fusion::On {
@@ -543,9 +653,18 @@ mod tests {
             "layernorm+gelu",
             "matmul+scale",
             "matmul+add+relu+gelu+scale",
+            "matmul+channel_scale+add+gelu_erf+scale",
+            "patch_embed+gelu_erf",
+            "prepend_token+add",
+            "tokens_to_map+channel_scale",
+            "attention_scores+scale",
+            "softmax+add+relu+gelu+scale",
+            "attention_values+channel_scale+add+gelu_erf+scale",
             "map+relu",
             "map+gelu",
+            "map+gelu_erf",
             "map+scale",
+            "map+channel_scale",
             "map+add",
         ] {
             assert!(names.contains(name), "{name} in {names:?}");
@@ -555,12 +674,13 @@ mod tests {
     #[test]
     fn every_part_of_every_split_kernel_validates_and_shares_its_kernels_text() {
         for (inputs, heavy, out) in heavies() {
-            let elements = u32::try_from(out).unwrap();
-            for steps in epilogues(elements) {
+            let elements = u32::try_from(out.0).unwrap();
+            for steps in epilogues(elements, out.1) {
                 for fusion in [Fusion::On, Fusion::Off] {
                     let whole = program(&inputs, heavy, out, &steps, fusion);
-                    // 64 is more parts than the convolution, the layer norm
-                    // and the matrix multiply allow, so it is clamped.
+                    // 64 is more parts than the convolution, the layer norm,
+                    // the tiled kernels and the softmax allow, so it is
+                    // clamped.
                     for count in [2, 3, 7, 64] {
                         let split = whole.split(&vec![count; whole.kernels().len()]).unwrap();
                         for part in split.kernels() {
@@ -599,7 +719,7 @@ mod tests {
             &inputs,
             heavy,
             out,
-            &epilogues(u32::try_from(out).unwrap())[1],
+            &epilogues(u32::try_from(out.0).unwrap(), out.1)[1],
             Fusion::On,
         );
         generator
@@ -663,7 +783,7 @@ mod tests {
     #[test]
     fn the_text_is_a_function_of_the_spec() {
         let (inputs, heavy, out) = heavies().remove(4);
-        let steps = epilogues(u32::try_from(out).unwrap()).remove(5);
+        let steps = epilogues(u32::try_from(out.0).unwrap(), out.1).remove(7);
         let a = program(&inputs, heavy, out, &steps, Fusion::On);
         let b = program(&inputs, heavy, out, &steps, Fusion::On);
         assert_eq!(
@@ -673,6 +793,47 @@ mod tests {
         // The scale's factor reaches the text exactly, as its bit pattern.
         let bits = format!("0x{:08x}u", (-0.75_f32).to_bits());
         assert!(wgsl(&a.kernels()[0], Variant::Baseline).contains(&bits));
+    }
+
+    #[test]
+    fn the_erf_approximation_reaches_the_text_as_the_core_states_it() {
+        let (inputs, heavy, out) = heavies().remove(4);
+        let steps = epilogues(u32::try_from(out.0).unwrap(), out.1).remove(5);
+        let p = program(&inputs, heavy, out, &steps, Fusion::On);
+        let text = wgsl(&p.kernels()[0], Variant::Baseline);
+        for value in
+            std::iter::once(beatlm_core::kernel::GELU_ERF_P).chain(beatlm_core::kernel::GELU_ERF_A)
+        {
+            let bits = format!("0x{:08x}u", value.to_bits());
+            assert!(text.contains(&bits), "{value} in\n{text}");
+        }
+    }
+
+    #[test]
+    fn a_layer_norms_epsilon_reaches_the_text() {
+        let mut g = Graph::new();
+        g.tensor(X, TensorRole::Input, 8).unwrap();
+        g.tensor(Q, TensorRole::Weight, 4).unwrap();
+        g.tensor(P, TensorRole::Weight, 4).unwrap();
+        g.tensor(Y, TensorRole::Output, 8).unwrap();
+        g.push(
+            OpKind::LayerNorm(LayerNorm {
+                input: X,
+                gamma: Q,
+                beta: P,
+                rows: 2,
+                channels: 4,
+                epsilon: 1e-6,
+            }),
+            Y,
+        )
+        .unwrap();
+        let text = generate(
+            &g.lower(Fusion::On).unwrap().kernels()[0],
+            Variant::Baseline,
+        )
+        .unwrap();
+        assert!(text.contains(&format!("0x{:08x}u", 1e-6_f32.to_bits())));
     }
 
     #[test]

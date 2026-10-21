@@ -58,6 +58,11 @@ and this project adheres to
   setup that fetches the Apache-2.0 Small weights from a pinned commit and
   writes reference outputs from the transformers implementation; neither is
   part of the build or `just check`.
+- Kernel IR operations for a ViT encoder: patch embedding, class token,
+  attention scores, softmax and values, exact GELU, LayerScale, and tokens to
+  a feature map; layer norm takes its own epsilon.
+- `beatlm::model`: graph building from weights by role, and the Depth Anything
+  V2 Small encoder, checked against the transformers reference.
 
 ### Changed
 

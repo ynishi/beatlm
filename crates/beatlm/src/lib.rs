@@ -17,7 +17,7 @@
 //! |---|---|---|
 //! | wgpu adapter limits and features | a [`DeviceProfile`](beatlm_core::device::DeviceProfile) of plain values ([`gpu::profile`]) | the core plans memory and picks kernel variants from values, so it never depends on a wgpu version |
 //! | GPU timestamp queries | measured durations ([`gpu`]) | the core's cost model is fed measurements, and only measurements |
-//! | model files (safetensors first) | named, shaped tensors checked against what a model's graph needs ([`load`]), then a graph of tensors and operations | weight formats change and multiply; the graph does not |
+//! | model files (safetensors first) | named, shaped tensors checked against what a model's graph needs ([`load`]), then a graph of tensors and operations with each weight's numbers in the IR's layouts ([`model`]) | weight formats change and multiply; the graph does not |
 //! | [kernel IR](beatlm_core::kernel) | WGSL text, validated by naga ([`codegen`]) | browsers accept only WGSL, and generated text can be read, diffed and checked by naga's parser |
 //!
 //! Shaders are generated as WGSL text rather than built as naga IR. Building IR
@@ -108,5 +108,6 @@
 pub mod codegen;
 pub mod gpu;
 pub mod load;
+pub mod model;
 
 pub use beatlm_core;
