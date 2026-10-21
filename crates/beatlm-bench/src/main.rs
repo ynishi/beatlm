@@ -618,8 +618,9 @@
 //!   degrades to nothing and the map callbacks run from the event loop. The
 //!   blocking `wait_indefinitely` poll is used only by the warm-up and the final
 //!   drain, which a browser host would not call. Whether it then behaves in a
-//!   running browser as the native runs here do is unconfirmed: nothing was run
-//!   in one.
+//!   running browser as the native runs here do was not established by these
+//!   runs; `beatlm-web` is the browser host that runs this candidate, and its
+//!   crate documentation says what differs there.
 //! - **`async`: the tick, yes; the driver, no.** `tick_async` contains no
 //!   blocking call, so a browser can run it as a future. `pollster::block_on`
 //!   cannot drive it there: pollster 1.0.1 (`src/lib.rs`) waits for a pending
@@ -628,9 +629,9 @@
 //!   `std/src/sys/sync/thread_parking`), so a future that is truly pending would be polled again
 //!   in a loop that never returns control to the event loop. The awaited step
 //!   here never pends, so it would not hang, but the browser driver has to be
-//!   a task spawned on the event loop; that `wasm-bindgen-futures::spawn_local`
-//!   is the right one for this workspace is unconfirmed, as it is not a
-//!   dependency and was not built. With `target_feature = "atomics"` std parks
+//!   a task spawned on the event loop, such as one
+//!   `wasm-bindgen-futures::spawn_local` starts; no browser driver for this
+//!   candidate was built. With `target_feature = "atomics"` std parks
 //!   with a futex (`thread_parking/mod.rs`), and whether a browser allows that
 //!   wait on its main thread is unconfirmed from source: the rule is in the
 //!   JavaScript specification, which is not in the tree.

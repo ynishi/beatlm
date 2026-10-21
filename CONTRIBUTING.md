@@ -58,8 +58,8 @@ remove the worktree once the branch is merged.
 ## Verification
 
 `just check` is the definition of green, and CI is where it runs. It formats,
-lints with warnings denied, tests, lints the umbrella crate for
-`wasm32-unknown-unknown`, and runs `cargo deny`. The browser build is part of
+lints with warnings denied, tests, lints the umbrella crate and the browser
+host for `wasm32-unknown-unknown`, and runs `cargo deny`. The browser build is part of
 green on every change: a target that is only checked when someone gets round to
 the demo is a target that is broken when they do.
 
@@ -112,6 +112,26 @@ hand without the files, fail with a message naming the recipe to run.
 This note is here, and not in the README, because the recipes are a
 contributor's workflow in this checkout: the README is also the crate's page on
 crates.io, where a `just` recipe means nothing.
+
+## Running in a browser
+
+The browser host, `beatlm-web`, runs the bench's synthetic workload from
+`requestAnimationFrame` on WebGPU and writes the bench's report into the page.
+In this order:
+
+```bash
+just setup-web    # once: wasm-bindgen-cli at the version Cargo.lock pins, into cargo's bin
+just build-web    # release wasm build, glue and index.html into target/beatlm-web/
+just serve-web    # serves it on http://127.0.0.1:8000 (python3's http.server)
+```
+
+Then open `http://127.0.0.1:8000/?frames=600&latency=2` in a browser with
+WebGPU. `build-web` refuses a `wasm-bindgen` command at any other version than
+the crate's, because the glue it generates must match the crate exactly. None
+of the three is part of `just check`, which lints the crate for
+`wasm32-unknown-unknown` without the command. The crate documentation
+(`cargo doc -p beatlm-web`) says what the page measures and what differs from
+a native run.
 
 ## Documentation
 

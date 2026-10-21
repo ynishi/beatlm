@@ -10,6 +10,9 @@ members = [
     # A headless host: drives the umbrella with a synthetic GPU load and reports
     # what it measured. Not published.
     "crates/beatlm-bench",
+    # The browser host: the same synthetic load driven from
+    # requestAnimationFrame on WebGPU, reported into the page. Not published.
+    "crates/beatlm-web",
 ]
 
 [workspace.package]

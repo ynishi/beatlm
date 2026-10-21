@@ -6,6 +6,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use beatlm_core::kernel::Fusion;
 
+use crate::workload::{DEFAULT_RENDER_ITERS, DEFAULT_SLICE_ITERS};
+
 /// The usage text, printed for `--help` and after a bad option.
 pub const USAGE: &str = "\
 usage: beatlm-bench [options]
@@ -43,14 +45,6 @@ usage: beatlm-bench [options]
   --background-iters N  loop iterations per invocation of the competing load's
                     kernel                                  (default 4000)
   --help            print this text";
-
-/// Loop iterations per slice-kernel invocation that put one slice at 0.8 to
-/// 1.4 ms on an Apple M1 Pro (Metal); see the crate documentation.
-pub const DEFAULT_SLICE_ITERS: u32 = 500;
-
-/// Loop iterations per pixel that put the render pass at about 2 ms on an
-/// Apple M1 Pro (Metal); see the crate documentation.
-pub const DEFAULT_RENDER_ITERS: u32 = 50;
 
 /// Loop iterations per invocation of the competing load's kernel; see the
 /// crate documentation for what it did to the slices' measured times.

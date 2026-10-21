@@ -102,7 +102,8 @@ pub fn median(samples: &mut [u64]) -> Option<Micros> {
 
 /// Measures each kernel of `whole`, the network or model lowered and not
 /// split, realised with `numbers`, splits it so each part is expected within
-/// `settings.bound`, and measures the parts.
+/// `settings.bound`, and measures the parts, with `workload`'s render pass
+/// drawn into `target` after each job as the loop draws it.
 ///
 /// # Errors
 ///
@@ -113,6 +114,7 @@ pub fn median(samples: &mut [u64]) -> Option<Micros> {
 pub fn calibrate(
     gpu: &Gpu,
     workload: &Workload,
+    target: &wgpu::TextureView,
     numbers: &Numbers,
     whole: &Program,
     settings: &Settings,
@@ -140,7 +142,7 @@ pub fn calibrate(
     {
         let net = Net::new(&gpu.device, &gpu.queue, numbers, 1, whole.clone())
             .context("cannot build the network to calibrate")?;
-        measure(gpu, workload, &net, |frame, slice, duration| {
+        measure(gpu, workload, target, &net, |frame, slice, duration| {
             let list = usize::try_from(slice.get())
                 .ok()
                 .and_then(|i| samples.get_mut(i));
@@ -185,7 +187,7 @@ pub fn calibrate(
         // The same second half as pass 1: the first half is the GPU settling
         // into the paced load, and an estimator that keeps every sample would
         // otherwise start the loop from it.
-        measure(gpu, workload, &net, |frame, slice, duration| {
+        measure(gpu, workload, target, &net, |frame, slice, duration| {
             if frame > CALIBRATION_FRAMES / 2 {
                 cost.record(slice, duration);
             }
@@ -205,10 +207,10 @@ pub fn calibrate(
 }
 
 /// Runs [`CALIBRATION_FRAMES`] timed frames of one whole job on `net`'s slot 0
-/// followed by the render pass, paced, after one untimed frame, and hands
-/// `record` each kernel's measured duration with the number of its frame
-/// (counting from 1 for the first timed frame) and its slice, which is its
-/// index in `net`'s program.
+/// followed by the render pass into `target`, paced, after one untimed frame,
+/// and hands `record` each kernel's measured duration with the number of its
+/// frame (counting from 1 for the first timed frame) and its slice, which is
+/// its index in `net`'s program.
 ///
 /// # Errors
 ///
@@ -216,6 +218,7 @@ pub fn calibrate(
 fn measure(
     gpu: &Gpu,
     workload: &Workload,
+    target: &wgpu::TextureView,
     net: &Net,
     mut record: impl FnMut(u64, SliceId, Micros),
 ) -> Result<()> {
@@ -247,7 +250,7 @@ fn measure(
         } else {
             None
         };
-        workload.encode_render(&mut encoder, render);
+        workload.encode_render(&mut encoder, target, render);
         timestamps.resolve(&mut encoder);
         gpu.queue.submit([encoder.finish()]);
         timer.start_readback();

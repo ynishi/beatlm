@@ -82,7 +82,9 @@ impl Arenas {
     ///
     /// [`ArenaError::PlanNotValidOnDevice`] when the device's limits are below
     /// what the plan was made against, which a plan made against
-    /// [`DeviceProfile::webgpu_baseline`] never is.
+    /// [`DeviceProfile::webgpu_baseline`] never is. A device created with
+    /// [`required_limits`](super::required_limits) for the plan is never
+    /// below it.
     pub fn new(device: &wgpu::Device, plan: &MemoryPlan) -> Result<Self, ArenaError> {
         let device_profile = profile(&device.limits(), device.features());
         if !plan.valid_on(&device_profile) {

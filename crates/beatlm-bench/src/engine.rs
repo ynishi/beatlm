@@ -31,7 +31,7 @@ use crate::depth;
 use crate::device::Gpu;
 use crate::net::{self, Net, Numbers};
 use crate::pace::{FRAME_PERIOD, Tick, micros_between};
-use crate::workload::Workload;
+use crate::workload::{RENDER_HEIGHT, RENDER_WIDTH, TARGET_FORMAT, Workload};
 
 /// What a slice is assumed to cost until it has been measured.
 const SLICE_PRIOR: Micros = Micros::new(2_000);
@@ -224,6 +224,8 @@ pub struct KernelParts {
 pub struct Engine<'g> {
     gpu: &'g Gpu,
     workload: Workload,
+    /// The offscreen texture the render pass draws into.
+    target: wgpu::TextureView,
     net: Option<Net>,
     kernel_parts: Vec<KernelParts>,
     watch: Option<Watch>,
@@ -315,6 +317,7 @@ impl<'g> Engine<'g> {
     /// cannot be polled.
     pub fn new(gpu: &'g Gpu, args: &Args) -> Result<Self> {
         let workload = Workload::new(&gpu.device, args.slice_iters, args.render_iters);
+        let target = offscreen_target(&gpu.device);
         let policy = SyncPolicy::FixedLatency {
             frames: args.latency,
         };
@@ -354,6 +357,7 @@ impl<'g> Engine<'g> {
                         let calibration = calibrate(
                             gpu,
                             &workload,
+                            &target,
                             &numbers,
                             &whole,
                             &Settings {
@@ -419,6 +423,7 @@ impl<'g> Engine<'g> {
         let mut engine = Self {
             gpu,
             workload,
+            target,
             net,
             kernel_parts,
             watch: None,
@@ -563,7 +568,7 @@ impl<'g> Engine<'g> {
             }
         }
         self.workload
-            .encode_render(&mut encoder, timestamps.render_pass()?);
+            .encode_render(&mut encoder, &self.target, timestamps.render_pass()?);
         timestamps.resolve(&mut encoder);
         let commands = encoder.finish();
 
@@ -741,7 +746,8 @@ impl<'g> Engine<'g> {
             }
         }
         let mut render_encoder = encoder();
-        self.workload.encode_render(&mut render_encoder, None);
+        self.workload
+            .encode_render(&mut render_encoder, &self.target, None);
         submit_and_wait(render_encoder)?;
         // The network's uploads leave staging memory that wgpu releases on a
         // poll after the work completes, and the allocation counters are read
@@ -753,6 +759,27 @@ impl<'g> Engine<'g> {
         }
         Ok(())
     }
+}
+
+/// The texture the render pass draws into: the bench has no window, so an
+/// offscreen [`TARGET_FORMAT`] texture of [`RENDER_WIDTH`] by
+/// [`RENDER_HEIGHT`] pixels that nothing reads.
+pub fn offscreen_target(device: &wgpu::Device) -> wgpu::TextureView {
+    let target = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("beatlm-bench target"),
+        size: wgpu::Extent3d {
+            width: RENDER_WIDTH,
+            height: RENDER_HEIGHT,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: TARGET_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    target.create_view(&wgpu::TextureViewDescriptor::default())
 }
 
 /// The readback step of an async tick: gives the device its turn to run map
