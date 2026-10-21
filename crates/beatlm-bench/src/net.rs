@@ -633,7 +633,7 @@ mod tests {
     use super::*;
     use crate::reference;
     use beatlm_core::budget::Budget;
-    use beatlm_core::cost::CostModel;
+    use beatlm_core::cost::{CostModel, Estimator};
     use beatlm_core::schedule::Scheduler;
     use beatlm_core::sync::{MissPolicy, SyncPolicy};
     use beatlm_core::time::{FrameIndex, FrameInfo, Micros, TimePoint};
@@ -891,7 +891,14 @@ mod tests {
         let net = Net::new(&device, &queue, &shape, slots).unwrap();
         let weights = Data::generate(&shape);
 
-        let mut cost = CostModel::new(Micros::new(100), 1.0, 0.0).unwrap();
+        let mut cost = CostModel::new(
+            Micros::new(100),
+            Estimator::MeanPlusSigmas {
+                alpha: 1.0,
+                sigmas: 0.0,
+            },
+        )
+        .unwrap();
         cost.record(SliceId::new(0), Micros::new(40));
         let mut scheduler = Scheduler::new(policy, MissPolicy::Drop, None).unwrap();
         let all: Vec<SliceId> = (0..OPS).map(SliceId::new).collect();

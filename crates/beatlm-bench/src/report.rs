@@ -5,6 +5,7 @@ use std::fmt::Write as _;
 
 use crate::args::{Args, WorkloadKind};
 use crate::engine::{NetReport, Outcome};
+use crate::pace::FRAME_PERIOD;
 use crate::stats::{histogram, summarize};
 
 /// Where the run happened.
@@ -35,7 +36,7 @@ fn write_report(
     writeln!(out, "backend: {}", env.backend)?;
     write!(
         out,
-        "config: mode={} runs={} frames={} latency={} slices={} slice_iters={} render_iters={} margin_us={}",
+        "config: mode={} runs={} frames={} latency={} slices={} slice_iters={} render_iters={} margin_us={} estimator={} background_load={}",
         args.mode.name(),
         args.runs,
         args.frames,
@@ -43,10 +44,15 @@ fn write_report(
         args.slices,
         args.slice_iters,
         args.render_iters,
-        args.margin_us
+        args.margin_us,
+        args.estimator.name(),
+        if args.background_load { "on" } else { "off" }
     )?;
-    // Only the network adds to the line, so the synthetic workload's report is
-    // the one it always was.
+    if args.background_load {
+        write!(out, " background_iters={}", args.background_iters)?;
+    }
+    // Only the network adds a workload key to the line; the synthetic workload
+    // is the one without it.
     match args.workload {
         WorkloadKind::Synthetic => writeln!(out)?,
         WorkloadKind::Net => writeln!(out, " workload=net")?,
@@ -55,6 +61,10 @@ fn write_report(
     writeln!(out, "frames_dropped: {}", outcome.dropped)?;
     writeln!(out, "delivered: {}", outcome.delivered)?;
     writeln!(out, "missed: {}", outcome.missed)?;
+    match delivery_rate(outcome.delivered, outcome.missed) {
+        Some(rate) => writeln!(out, "delivery_rate: {rate:.4}")?,
+        None => writeln!(out, "delivery_rate: none")?,
+    }
     writeln!(out, "pending_at_end: {}", outcome.pending_at_end)?;
     writeln!(out, "latency_violations: {}", outcome.violations)?;
     writeln!(out, "timings_collected: {}", outcome.timer.frames_collected)?;
@@ -71,6 +81,15 @@ fn write_report(
     write_summary(out, "cpu_encode_us", &outcome.encode_us)?;
     write_summary(out, "cpu_queue_submit_us", &outcome.submit_us)?;
     write_summary(out, "gpu_frame_us", &outcome.gpu_frame_us)?;
+    let over = gpu_frames_over_period(&outcome.gpu_frame_us);
+    writeln!(
+        out,
+        "gpu_frames_over_period: {over} of {}",
+        outcome.gpu_frame_us.len()
+    )?;
+    if let Some(dispatches) = outcome.background_dispatches {
+        writeln!(out, "background_dispatches: {dispatches}")?;
+    }
     for (slice, estimate) in &outcome.estimates {
         let (sum, count) = outcome.measured.get(slice).copied().unwrap_or((0, 0));
         write!(
@@ -89,6 +108,23 @@ fn write_report(
         write_net(out, net)?;
     }
     Ok(())
+}
+
+/// Delivered over delivered plus missed: the share of deadlines that arrived
+/// with their result. `None` when no deadline arrived.
+#[allow(clippy::cast_precision_loss)]
+fn delivery_rate(delivered: u64, missed: u64) -> Option<f64> {
+    let total = delivered.saturating_add(missed);
+    (total > 0).then(|| delivered as f64 / total as f64)
+}
+
+/// Timed frames whose render plus slices took longer than the frame period: an
+/// overrun the estimates were supposed to prevent.
+fn gpu_frames_over_period(gpu_frame_us: &[u64]) -> usize {
+    gpu_frame_us
+        .iter()
+        .filter(|&&us| us > FRAME_PERIOD.get())
+        .count()
 }
 
 /// The memory plan and the allocation readings of the `net` workload.
@@ -155,5 +191,29 @@ fn write_summary(out: &mut String, name: &str, samples: &[u64]) -> std::fmt::Res
     match summarize(samples) {
         Some(s) => writeln!(out, "{name}: p50={} p99={} max={}", s.p50, s.p99, s.max),
         None => writeln!(out, "{name}: none"),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delivery_rate_is_the_delivered_share_of_the_deadlines_that_arrived() {
+        assert_eq!(delivery_rate(0, 0), None);
+        assert_eq!(delivery_rate(3, 1), Some(0.75));
+        assert_eq!(delivery_rate(0, 5), Some(0.0));
+        assert_eq!(delivery_rate(5, 0), Some(1.0));
+    }
+
+    #[test]
+    fn a_frame_is_over_only_when_it_exceeds_the_period() {
+        let period = FRAME_PERIOD.get();
+        assert_eq!(gpu_frames_over_period(&[]), 0);
+        assert_eq!(
+            gpu_frames_over_period(&[period - 1, period, period + 1, period * 2]),
+            2
+        );
     }
 }

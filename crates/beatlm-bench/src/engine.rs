@@ -18,12 +18,12 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use beatlm::gpu::{FrameTiming, SliceTimer, TimerStats};
 use beatlm_core::budget::Budget;
-use beatlm_core::cost::{CostModel, SliceId};
+use beatlm_core::cost::{CostModel, Estimator, SliceId};
 use beatlm_core::schedule::{FramePlan, JobId, Scheduler};
 use beatlm_core::sync::{MissPolicy, SyncPolicy};
 use beatlm_core::time::{FrameIndex, FrameInfo, Micros, TimePoint};
 
-use crate::args::{Args, WorkloadKind};
+use crate::args::{Args, EstimatorKind, WorkloadKind};
 use crate::counters::{self, Watch};
 use crate::device::Gpu;
 use crate::net::{self, Net};
@@ -34,13 +34,40 @@ use crate::workload::Workload;
 const SLICE_PRIOR: Micros = Micros::new(2_000);
 /// What the render pass is assumed to cost until it has been measured.
 const RENDER_PRIOR: Micros = Micros::new(2_000);
-/// Weight of a new measurement in a slice's estimate.
+/// Weight of a new measurement in a slice's exponentially weighted mean.
 const COST_ALPHA: f64 = 0.2;
 /// Standard deviations added to a slice's mean when budgeting it.
 const COST_SIGMAS: f64 = 2.0;
+/// Measurements per slice the windowed quantile reads, about half a second of
+/// frames at 60 Hz.
+const COST_WINDOW: usize = 32;
+/// The quantile of the window the windowed estimate is.
+const COST_QUANTILE: f64 = 0.9;
+/// The most the capped estimate pads the mean, as a multiple of the mean.
+const COST_CAP: f64 = 0.5;
 /// How many times the final drain waits for the device before giving up on the
 /// timings still in flight.
 const DRAIN_ATTEMPTS: usize = 8;
+
+/// The cost model's statistic for the `--estimator` choice, with this
+/// harness's parameters.
+const fn estimator(kind: EstimatorKind) -> Estimator {
+    match kind {
+        EstimatorKind::MeanSigmas => Estimator::MeanPlusSigmas {
+            alpha: COST_ALPHA,
+            sigmas: COST_SIGMAS,
+        },
+        EstimatorKind::Quantile => Estimator::WindowedQuantile {
+            window: COST_WINDOW,
+            quantile: COST_QUANTILE,
+        },
+        EstimatorKind::Capped => Estimator::CappedDeviation {
+            alpha: COST_ALPHA,
+            sigmas: COST_SIGMAS,
+            cap: COST_CAP,
+        },
+    }
+}
 
 /// The label a timed slice carries from the scheduler to the cost model.
 type Tag = (JobId, SliceId);
@@ -96,6 +123,10 @@ pub struct Outcome {
     pub estimates: BTreeMap<SliceId, Micros>,
     /// What the timer could not measure.
     pub timer: TimerStats,
+    /// Dispatches the competing load submitted, from the one it completed
+    /// before the run's first frame to the last one queued when it was stopped
+    /// after the run; `None` when the run had no competing load.
+    pub background_dispatches: Option<u64>,
     /// The planned network's memory and allocation readings; `None` for the
     /// synthetic workload.
     pub net: Option<NetReport>,
@@ -180,7 +211,7 @@ impl<'g> Engine<'g> {
             })?;
         let scheduler = Scheduler::new(policy, MissPolicy::HoldPrevious, None)
             .context("cannot build the scheduler")?;
-        let cost = CostModel::new(SLICE_PRIOR, COST_ALPHA, COST_SIGMAS)
+        let cost = CostModel::new(SLICE_PRIOR, estimator(args.estimator))
             .context("cannot build the cost model")?;
         let mut engine = Self {
             gpu,
@@ -447,5 +478,26 @@ impl Future for ReadbackTurn<'_, '_> {
 
     fn poll(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
         Poll::Ready(self.get_mut().engine.read_back(wgpu::PollType::Poll))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_default_estimator_is_the_cores_default() {
+        assert_eq!(estimator(Args::default().estimator), Estimator::default());
+    }
+
+    #[test]
+    fn every_estimator_the_options_name_is_valid() {
+        for kind in [
+            EstimatorKind::MeanSigmas,
+            EstimatorKind::Quantile,
+            EstimatorKind::Capped,
+        ] {
+            assert!(CostModel::new(SLICE_PRIOR, estimator(kind)).is_ok());
+        }
     }
 }

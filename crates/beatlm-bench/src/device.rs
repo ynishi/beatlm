@@ -10,6 +10,8 @@ pub struct Gpu {
     pub queue: wgpu::Queue,
     /// Which adapter and backend were chosen, for the report.
     pub info: wgpu::AdapterInfo,
+    /// The adapter the device came from, so a second device can share it.
+    pub adapter: wgpu::Adapter,
 }
 
 impl Gpu {
@@ -43,6 +45,7 @@ impl Gpu {
             device,
             queue,
             info,
+            adapter,
         })
     }
 }

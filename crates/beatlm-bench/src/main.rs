@@ -20,6 +20,9 @@
 //! report. The only difference is where and how the frame's GPU work is decided,
 //! encoded and submitted.
 //!
+//! The cost model estimates each slice with the statistic `--estimator` names,
+//! and `--background-load` adds a competing GPU load; both are described below.
+//!
 //! Each frame it submits one job of `--slices` slices with an L1 promise of
 //! `--latency` frames, plans the frame against a budget of the period minus the
 //! last measured render time minus `--margin-us`, encodes one timed compute pass
@@ -96,10 +99,11 @@
 //!   operation took 0.85 to 1.35 ms repeated back to back on an idle queue,
 //!   while at 128x128, a quarter of the pixels, they measure 0.8 to 1.4 ms in the
 //!   loop, and a job whose summed estimates do not fit a frame's budget misses
-//!   its deadline (the run above delivered 384 jobs and missed 214; the
-//!   synthetic workload at its defaults, 300 frames, delivered 185 and missed
-//!   113 of 298). Jobs run in submission order and never interleave, so a job
-//!   the budget cannot finish is missed rather than overtaken.
+//!   its deadline (under the mean-plus-sigmas estimate, the run above delivered
+//!   384 jobs and missed 214; the synthetic workload at its defaults, 300
+//!   frames, delivered 185 and missed 113 of 298). Jobs run in submission
+//!   order and never interleave, so a job the budget cannot finish is missed
+//!   rather than overtaken.
 //!
 //! `loop_buffer_memory_bytes` and `loop_memory_allocations` read zero on this
 //! backend before and after: Metal does not set those two counters, so their
@@ -113,6 +117,7 @@
 //! ```text
 //! cargo run --release -p beatlm-bench -- --frames 300
 //! cargo run --release -p beatlm-bench -- --frames 600 --runs 3 --mode thread
+//! cargo run --release -p beatlm-bench -- --frames 600 --runs 2 --estimator capped --background-load
 //! ```
 //!
 //! Options are listed by `--help`. It needs an adapter with
@@ -131,10 +136,11 @@
 //! |---|---|
 //! | `run` | which run of `--runs` this is |
 //! | `adapter`, `backend` | what the numbers were measured on; quote them with any number |
-//! | `config` | the options the run used, `mode` included |
+//! | `config` | the options the run used, `mode`, `estimator` and `background_load` included (and `background_iters` when the load is on) |
 //! | `frames` | frames run |
 //! | `frames_dropped` | frame periods given up because a frame began a whole period late; the loop drops them as a display would, rather than running frames back to back to catch up |
 //! | `delivered`, `missed` | results delivered on their frame, and deadlines that arrived without a complete result |
+//! | `delivery_rate` | `delivered` over `delivered` plus `missed`: the share of deadlines that arrived with their result; `none` when no deadline arrived |
 //! | `pending_at_end` | jobs submitted whose deadline was after the last frame |
 //! | `latency_violations` | deliveries whose latency was not `--latency`; the L1 promise broke when this is not zero |
 //! | `timings_collected`, `timings_skipped`, `timings_failed` | frames whose GPU timing was read, was not taken because the readback ring was full, and was lost to a failed map |
@@ -147,6 +153,8 @@
 //! | `cpu_encode_us` | per frame, from creating the command encoder to finishing it, timestamp writes and the resolve included |
 //! | `cpu_queue_submit_us` | per frame, the time inside `queue.submit` |
 //! | `gpu_frame_us` | per timed frame, render plus every slice, on the GPU: p50, p99, max |
+//! | `gpu_frames_over_period` | timed frames whose render plus slices took longer than the frame period, of the timed frames: a real overrun that the estimates were supposed to prevent |
+//! | `background_dispatches` | dispatches the competing load submitted, from the one completed before the first frame to the last one queued when it was stopped; present only with `--background-load` |
 //! | `slice[i]` | the cost model's final estimate for slice `i` against the mean of its measured durations |
 //! | `workload` (in `config`) | present as `workload=net` only for the network; the synthetic report is unchanged |
 //! | `memory_plan_*` | `net` only: tensors, input/output slots, arenas and their bytes, the plan's total, the most bytes live at one operation, and the bytes with no sharing |
@@ -165,8 +173,44 @@
 //! whether the 99th-percentile variance of `cpu_start_to_submit_us` comes from
 //! this code (`cpu_plan_us`, `cpu_encode_us`) or from the driver and the OS
 //! (`cpu_queue_submit_us`, and `channel_handoff_us` in `thread` mode). A slice's
-//! estimate is what the scheduler budgets with, so it sits above the measured
-//! mean by the cost model's safety factor.
+//! estimate is what the scheduler budgets with, so how it compares with the
+//! measured mean depends on `--estimator`: the mean-plus-sigmas estimate sits
+//! above the mean by its safety factor, and a quantile of the recent
+//! measurements can sit on either side of it.
+//!
+//! # Choosing the cost estimate
+//!
+//! `--estimator` picks the statistic the cost model reads a slice's
+//! measurements with: `mean-sigmas`, `quantile` or `capped` (the parameters are
+//! constants in `engine.rs`). The default is the one the measurements recorded
+//! in `beatlm_core::cost` chose, with the table of every run.
+//!
+//! # The competing load
+//!
+//! `--background-load` opens a second device on the same adapter, with its own
+//! queue and no timestamp queries, and a thread (`load.rs`) that keeps one
+//! dispatch queued behind the one running. The kernel is `shaders.wgsl`'s slice
+//! kernel over 16 384 workgroups (1 048 576 invocations, sixteen times a
+//! slice's) at `--background-iters` loop iterations per invocation, default
+//! 4000. It starts, and has completed one dispatch, before the engine is built,
+//! and is stopped after the run's last timing is drained, once per run of
+//! `--runs`.
+//!
+//! The setting was chosen by a sweep with `--frames 300`, mean-plus-sigmas, on
+//! an Apple M1 Pro (Metal), on 2026-10-21. The aim was a load that raises the
+//! slices' measured means by 30 to 80 percent; that was not achieved, and the
+//! figures say what happened instead. Idle, the four slices' means were 1.3 to
+//! 1.6 ms (first slice of a job to last, 300 frames, one run). With the load at
+//! 500, 1000, 2000, 4000, 8000 and 16 000 iterations they were 0.3 to 0.8 ms,
+//! lower than idle at every setting. A load of 1024 workgroups at 500 or 2000
+//! iterations did the same. What the load added was spread: at 4000 iterations
+//! one 300-frame run ended with slice 0 estimated at 8.3 ms against a measured
+//! mean of 0.83 ms, and one 300-frame run at 2000 iterations delivered 58 of
+//! 298 with only 61 slice-0 timings collected, where three runs in a later
+//! process delivered 298, 281 and 288. The setting is therefore a stand-in for
+//! noisy measurements, not for a slower GPU; that the means fall is consistent
+//! with the GPU running faster when it is kept busy, which was not checked by
+//! reading a clock.
 //!
 //! # Which candidates can run in a browser
 //!
@@ -233,6 +277,7 @@ mod args;
 mod counters;
 mod device;
 mod engine;
+mod load;
 mod net;
 mod pace;
 #[cfg(test)]
@@ -267,10 +312,12 @@ fn real_main() -> Result<ExitCode> {
 
     let gpu = device::Gpu::open()?;
     eprintln!(
-        "running {} frames x {} runs, mode {}, on {} ({})",
+        "running {} frames x {} runs, mode {}, estimator {}, background load {}, on {} ({})",
         args.frames,
         args.runs,
         args.mode.name(),
+        args.estimator.name(),
+        if args.background_load { "on" } else { "off" },
         gpu.info.name,
         gpu.info.backend
     );
@@ -283,7 +330,19 @@ fn real_main() -> Result<ExitCode> {
         // Each run builds its own scheduler, cost model and timer on the same
         // device, so the difference between two reports is variance, not state
         // carried over.
-        let outcome = run::run(&gpu, &args)?;
+        //
+        // The competing load, when asked for, starts before the engine is built
+        // and stops after the last frame's timings are drained, so every
+        // measured frame ran under it.
+        let load = if args.background_load {
+            Some(load::BackgroundLoad::start(&gpu, args.background_iters)?)
+        } else {
+            None
+        };
+        let ran = run::run(&gpu, &args);
+        let dispatches = load.map(load::BackgroundLoad::stop).transpose();
+        let mut outcome = ran?;
+        outcome.background_dispatches = dispatches?;
         if number > 1 {
             println!();
         }
