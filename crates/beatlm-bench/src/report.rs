@@ -55,7 +55,13 @@ fn write_report(
     // is the one without it.
     match args.workload {
         WorkloadKind::Synthetic => writeln!(out)?,
-        WorkloadKind::Net => writeln!(out, " workload=net fusion={}", fusion_name(args.fusion))?,
+        WorkloadKind::Net => {
+            write!(out, " workload=net fusion={}", fusion_name(args.fusion))?;
+            match args.max_dispatch_us {
+                Some(us) => writeln!(out, " split=on max_dispatch_us={us}")?,
+                None => writeln!(out, " split=off")?,
+            }
+        }
     }
     writeln!(out, "frames: {}", outcome.cpu_us.len())?;
     writeln!(out, "frames_dropped: {}", outcome.dropped)?;
@@ -83,6 +89,7 @@ fn write_report(
     write_summary(out, "cpu_encode_us", &outcome.encode_us)?;
     write_summary(out, "cpu_queue_submit_us", &outcome.submit_us)?;
     write_summary(out, "gpu_frame_us", &outcome.gpu_frame_us)?;
+    write_summary(out, "longest_dispatch_us", &outcome.longest_dispatch_us)?;
     let over = gpu_frames_over_period(&outcome.gpu_frame_us);
     writeln!(
         out,
@@ -131,6 +138,17 @@ fn gpu_frames_over_period(gpu_frame_us: &[u64]) -> usize {
 
 /// The memory plan and the allocation readings of the `net` workload.
 fn write_net(out: &mut String, net: &NetReport) -> std::fmt::Result {
+    for (index, kernel) in net.kernel_parts.iter().enumerate() {
+        write!(
+            out,
+            "kernel_parts[{index}]: name={} parts={}",
+            kernel.name, kernel.parts
+        )?;
+        match kernel.calibrated {
+            Some(us) => writeln!(out, " calibrated_us={}", us.get())?,
+            None => writeln!(out, " calibrated_us=none")?,
+        }
+    }
     writeln!(out, "kernels: {}", net.kernels.join(" "))?;
     writeln!(out, "memory_plan_tensors: {}", net.tensors)?;
     writeln!(out, "memory_plan_io_slots: {}", net.slots)?;

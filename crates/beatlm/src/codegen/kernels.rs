@@ -7,11 +7,16 @@
 //! keeps several copies of an input or output, one per job in flight, passes
 //! one binding set per copy; a kernel that touches none of the substituted
 //! tensors shares one bind group between all sets.
+//!
+//! A spec that is one part of a split kernel is a kernel here like any other,
+//! with its own pipeline, bind groups and dispatch; the parts of one kernel
+//! share its shader module, since their text is the same and only the
+//! pipeline's [constants](super::constants) differ.
 
 use beatlm_core::kernel::KernelSpec;
 use beatlm_core::memory::{MemoryPlan, TensorId};
 
-use super::{CodegenError, ENTRY_POINT, generate};
+use super::{CodegenError, ENTRY_POINT, constants, generate};
 use crate::gpu::{Arenas, profile};
 
 /// A tensor of a spec and the tensor bound in its place: `(original,
@@ -65,27 +70,46 @@ impl Kernels {
         let identity = [Vec::new()];
         let sets = if sets.is_empty() { &identity[..] } else { sets };
         let placement = |id: TensorId| plan.placement(id).ok_or(CodegenError::MissingPlacement(id));
+        // Shader modules by text, so the parts of a kernel compile it once.
+        let mut modules: Vec<(String, wgpu::ShaderModule)> = Vec::new();
         let kernels = specs
             .iter()
             .map(|spec| {
-                let label = spec.name();
+                let name = spec.name();
+                let part = spec.part();
+                let label = if part.is_whole() {
+                    name.clone()
+                } else {
+                    format!("{name} part {}/{}", part.index() + 1, part.count())
+                };
                 let variant = spec.select_variant(&device_profile).map_err(|source| {
                     CodegenError::Kernel {
-                        kernel: label.clone(),
+                        kernel: name.clone(),
                         source,
                     }
                 })?;
                 let text = generate(spec, variant)?;
-                let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some(&label),
-                    source: wgpu::ShaderSource::Wgsl(text.into()),
-                });
+                let module = match modules.iter().position(|(t, _)| *t == text) {
+                    Some(index) => &modules[index].1,
+                    None => {
+                        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                            label: Some(&name),
+                            source: wgpu::ShaderSource::Wgsl(text.clone().into()),
+                        });
+                        modules.push((text, module));
+                        &modules[modules.len() - 1].1
+                    }
+                };
+                let values = constants(spec, variant);
                 let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some(&label),
                     layout: None,
-                    module: &module,
+                    module,
                     entry_point: Some(ENTRY_POINT),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    compilation_options: wgpu::PipelineCompilationOptions {
+                        constants: &values,
+                        ..wgpu::PipelineCompilationOptions::default()
+                    },
                     cache: None,
                 });
                 let layout = pipeline.get_bind_group_layout(0);
@@ -175,7 +199,8 @@ impl Kernels {
         self.sets
     }
 
-    /// The label of kernel `kernel`: its spec's name.
+    /// The label of kernel `kernel`: its spec's name, followed for a part of a
+    /// split kernel by `part i/n`, counting from one.
     #[must_use]
     pub fn label(&self, kernel: usize) -> Option<&str> {
         self.kernels.get(kernel).map(|k| k.label.as_str())

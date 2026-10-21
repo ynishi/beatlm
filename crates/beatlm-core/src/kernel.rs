@@ -33,6 +33,35 @@
 //! 21 785 120. The `beatlm-bench` crate documentation has the rest of the
 //! reports.
 //!
+//! # Why splitting
+//!
+//! A GPU cannot be preempted in the middle of a dispatch, so one long dispatch
+//! delays everything queued behind it, the frame's render pass included, and
+//! the scheduler can place work only at dispatch boundaries. Fusion makes
+//! dispatches larger; splitting is the other direction, and the two are
+//! traded against each other: every part is a dispatch the host encodes and
+//! submits.
+//!
+//! The rule that one dispatch stays within a bound is owned by
+//! [`Program::parts_within`], which turns what each kernel took into a part
+//! count, and carried out by [`Program::split`] (rule 6). The decision reads
+//! measurements, not shapes: a host measures each kernel run whole, picks a
+//! bound, and lowers again with the parts it was given.
+//!
+//! What it bought on one machine is measured by `beatlm-bench --workload net`
+//! with splitting on (a bound of 1 ms) and off; the table, with its adapter,
+//! configuration and date, and the sweep that chose the bound, live in that
+//! crate's documentation under "Splitting". In short, on an Apple M1 Pro,
+//! Metal, on 2026-10-21: calibration split the second matrix multiply, which
+//! took about 2.2 ms whole in the loop, into four parts of about 0.6 ms each,
+//! and the first convolution into three, so a job went from six dispatches to
+//! eleven or twelve. The longest dispatch per frame fell from about 2.1 ms to
+//! 1.2 to 1.4 ms at the median and from 3.5 to 4.1 ms to about 2.9 ms at the
+//! 99th percentile, but stayed above the bound at the median, so in these runs
+//! the bound held for the parts' means and not for every dispatch. The median
+//! encode time rose with the dispatch count; the GPU time per frame and the
+//! delivery rate did not move beyond the spread between two runs.
+//!
 //! # Rules
 //!
 //! This module owns these, and each has a test:
@@ -85,6 +114,23 @@
 //!    tensor read before it is written or written twice, a write to an input or
 //!    a weight, an activation or output nobody writes, a zero dimension and a
 //!    non-finite scale are each a [`KernelError`].
+//! 6. **A split kernel's parts cover its output exactly once, as consecutive
+//!    kernels.** [`Program::split`] replaces a kernel by `k` kernels, its
+//!    [`Part`]s, each computing a disjoint, contiguous range of the output
+//!    ([`KernelSpec::output_range`]) with the kernel's whole epilogue applied
+//!    to that range, and together every output element once. `k` is clamped
+//!    to `1..=`[`KernelSpec::max_parts`], so no part is empty. Every part binds
+//!    the tensors the kernel bound, and the parts take the kernel's place in
+//!    program order, one after another. What that does to lifetimes follows
+//!    from rule 1 with nothing added: a tensor the kernel read or wrote is live
+//!    across all `k` parts, so nothing shares its bytes while any part runs; a
+//!    tensor the parts write is first used by part 1, and every later reader
+//!    is a later kernel, so it reads only after all `k` parts. A tensor read
+//!    by the kernel and dying there now dies at its last part. The memory plan
+//!    of a split program is therefore planned by the same rules, over longer
+//!    lifetimes in more kernel indices. Splitting changes no result beyond
+//!    what rule 3 allows a shader compiler: each output element is computed by
+//!    the same operations, in the same order, as in the whole kernel.
 //!
 //! # Layouts
 //!
@@ -99,6 +145,7 @@ use thiserror::Error;
 
 use crate::device::{DeviceFeatures, DeviceProfile};
 use crate::memory::{DType, TensorDesc, TensorId};
+use crate::time::Micros;
 
 /// The epsilon a layer norm adds to the variance before the square root, so a
 /// constant row does not divide by zero.
@@ -566,12 +613,12 @@ impl Graph {
                 }
             }
             let (main, epilogue) = op.kind.standalone();
-            kernels.push(KernelSpec {
+            kernels.push(KernelSpec::whole_of(
                 main,
                 epilogue,
-                output: op.output,
-                ops: index..index + 1,
-            });
+                op.output,
+                index..index + 1,
+            ));
         }
         for spec in &kernels {
             spec.check(Variant::Baseline, &BASELINE)?;
@@ -669,6 +716,39 @@ impl MainOp {
             Self::Map { .. } => "map",
         }
     }
+
+    /// The size of the dimension a kernel is split along: output pixels,
+    /// rows, output rows or elements (see [`Part`]). Fits a `u32` because the
+    /// graph bounds the output by [`MAX_ELEMENTS`].
+    fn split_extent(&self) -> u32 {
+        match *self {
+            Self::Conv2d3x3(c) => {
+                u32::try_from(u64::from(c.height) * u64::from(c.width)).unwrap_or(u32::MAX)
+            }
+            Self::LayerNorm(l) => l.rows,
+            Self::MatMul(mm) => mm.m,
+            Self::Map { elements, .. } => elements,
+        }
+    }
+
+    /// Units of the split dimension a part boundary moves in: a tile's height
+    /// for a matrix multiply, one unit otherwise.
+    const fn split_grain(&self) -> u32 {
+        match self {
+            Self::MatMul(_) => MATMUL_TILE,
+            _ => 1,
+        }
+    }
+
+    /// Output elements per unit of the split dimension.
+    fn elements_per_unit(&self) -> u64 {
+        match *self {
+            Self::Conv2d3x3(c) => c.cout.into(),
+            Self::LayerNorm(l) => l.channels.into(),
+            Self::MatMul(mm) => mm.n.into(),
+            Self::Map { .. } => 1,
+        }
+    }
 }
 
 /// One element-wise step applied to a kernel's value before it is stored.
@@ -749,20 +829,182 @@ pub enum Limit {
     StorageBuffersPerShaderStage,
 }
 
-/// One kernel of a program: a main operation, its epilogue, and the tensors it
-/// binds.
+/// Which share of a kernel's output one dispatch computes: part `index` of
+/// `count`, covering `range` of the kernel's split dimension.
 ///
-/// Made only by [`Graph::lower`], so its operations, shapes and tensors are the
-/// graph's and already checked.
+/// The split dimension is the one the kernel's grid walks in output order: the
+/// output pixels of a convolution, the rows of a layer norm, the output rows of
+/// a matrix multiply and the elements of a standalone element-wise kernel.
+/// Because every layout is row-major with that dimension outermost, a range of
+/// it is a contiguous range of the output ([`KernelSpec::output_range`]).
+/// Rule 6 of the [module documentation](self#rules) says how a kernel's parts
+/// cover it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Part {
+    index: u32,
+    count: u32,
+    range: Range<u32>,
+}
+
+impl Part {
+    /// Which part this is, from zero.
+    #[must_use]
+    pub const fn index(&self) -> u32 {
+        self.index
+    }
+
+    /// How many parts the kernel was split into; one for a kernel run whole.
+    #[must_use]
+    pub const fn count(&self) -> u32 {
+        self.count
+    }
+
+    /// The units of the split dimension this part computes, never empty.
+    #[must_use]
+    pub fn range(&self) -> Range<u32> {
+        self.range.clone()
+    }
+
+    /// Whether the part is the whole kernel.
+    #[must_use]
+    pub const fn is_whole(&self) -> bool {
+        self.count == 1
+    }
+}
+
+/// One kernel of a program: a main operation, its epilogue, the tensors it
+/// binds, and the [`Part`] of its output one dispatch of it computes.
+///
+/// Made only by [`Graph::lower`] and [`Program::split`], so its operations,
+/// shapes and tensors are the graph's and already checked.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KernelSpec {
     main: MainOp,
     epilogue: Vec<Epilogue>,
     output: TensorId,
     ops: Range<usize>,
+    part: Part,
 }
 
 impl KernelSpec {
+    /// A spec running `main` whole.
+    fn whole_of(
+        main: MainOp,
+        epilogue: Vec<Epilogue>,
+        output: TensorId,
+        ops: Range<usize>,
+    ) -> Self {
+        let part = Part {
+            index: 0,
+            count: 1,
+            range: 0..main.split_extent(),
+        };
+        Self {
+            main,
+            epilogue,
+            output,
+            ops,
+            part,
+        }
+    }
+
+    /// The share of the output this spec's dispatch computes.
+    #[must_use]
+    pub const fn part(&self) -> &Part {
+        &self.part
+    }
+
+    /// The kernel this spec is a part of: the same spec over its whole output.
+    /// A spec that is whole is its own whole.
+    #[must_use]
+    pub fn whole(&self) -> Self {
+        Self::whole_of(
+            self.main,
+            self.epilogue.clone(),
+            self.output,
+            self.ops.clone(),
+        )
+    }
+
+    /// The most parts the kernel can be split into: one per unit of its split
+    /// dimension, except a matrix multiply, whose parts are whole rows of
+    /// output tiles. A boundary inside a tile would make both parts run that
+    /// tile's workgroups, each with some invocations idle, so the work would
+    /// grow with the part count.
+    #[must_use]
+    pub fn max_parts(&self) -> u32 {
+        self.main.split_extent().div_ceil(self.main.split_grain())
+    }
+
+    /// The output elements this spec's dispatch writes, a contiguous range of
+    /// the output tensor.
+    #[must_use]
+    pub fn output_range(&self) -> Range<u64> {
+        let per_unit = self.main.elements_per_unit();
+        u64::from(self.part.range.start).saturating_mul(per_unit)
+            ..u64::from(self.part.range.end).saturating_mul(per_unit)
+    }
+
+    /// The kernel, whole, as `count` parts in order, `count` clamped to
+    /// `1..=`[`max_parts`](Self::max_parts) (rule 6 of the
+    /// [module documentation](self#rules)).
+    ///
+    /// The split dimension is cut into blocks (one unit, or one tile row of a
+    /// matrix multiply), and part `i` takes blocks `i * B / count` up to
+    /// `(i + 1) * B / count` of the `B` there are, so no two parts differ by
+    /// more than one block and none is empty.
+    fn split(&self, count: u32) -> Vec<Self> {
+        let whole = self.whole();
+        let count = count.clamp(1, self.max_parts().max(1));
+        let extent = self.main.split_extent();
+        let grain = self.main.split_grain();
+        let blocks = u64::from(self.max_parts());
+        // At most `blocks * grain`, which is below `extent + grain`: it fits a
+        // u32 because the graph bounds every dimension by MAX_ELEMENTS.
+        let edge = |i: u32| {
+            let block = blocks * u64::from(i) / u64::from(count);
+            let unit = block.saturating_mul(u64::from(grain));
+            u32::try_from(unit).unwrap_or(u32::MAX).min(extent)
+        };
+        (0..count)
+            .map(|index| Self {
+                part: Part {
+                    index,
+                    count,
+                    range: edge(index)..edge(index + 1),
+                },
+                ..whole.clone()
+            })
+            .collect()
+    }
+
+    /// How many parts keep each part of this kernel within `bound`, given that
+    /// the whole kernel took `duration`: `ceil(duration / bound)`, at least
+    /// one and at most [`max_parts`](Self::max_parts).
+    ///
+    /// The duration is a measurement, or a [`CostModel`](crate::cost::CostModel)
+    /// estimate built from measurements, of the kernel run whole on the device
+    /// that will run its parts. The decision follows it rather than the
+    /// kernel's shape, so a kernel that is fast on one adapter is not split
+    /// there and pays no extra dispatches for another adapter's slowness. Parts
+    /// are equal shares of the output, so each is expected to take about
+    /// `duration / parts`; that holds only as far as a kernel's time is
+    /// proportional to its output, which is why what the parts took is
+    /// measured again (the `beatlm-bench` crate documentation, "Splitting").
+    ///
+    /// # Errors
+    ///
+    /// [`KernelError::ZeroBound`]: no dispatch fits a bound of zero.
+    pub fn parts_within(&self, duration: Micros, bound: Micros) -> Result<u32, KernelError> {
+        if bound == Micros::ZERO {
+            return Err(KernelError::ZeroBound);
+        }
+        let wanted = duration.get().div_ceil(bound.get()).max(1);
+        Ok(u32::try_from(wanted)
+            .unwrap_or(u32::MAX)
+            .min(self.max_parts().max(1)))
+    }
+
     /// The heavy part of the kernel.
     #[must_use]
     pub const fn main(&self) -> &MainOp {
@@ -827,25 +1069,31 @@ impl KernelSpec {
         name
     }
 
-    /// What `variant` of this kernel needs and how it is launched.
+    /// What `variant` of this kernel needs and how it is launched; the grid of
+    /// workgroups covers the spec's [`Part`], not the whole output.
     #[must_use]
     pub fn requirements(&self, variant: Variant) -> Requirements {
         let Variant::Baseline = variant;
         let storage_buffers = u32::try_from(self.bindings().len()).unwrap_or(u32::MAX);
+        // The grid covers the part, not the whole output.
+        let units = self.part.range.end - self.part.range.start;
         let (workgroup_size, workgroups, workgroup_storage_bytes) = match self.main {
-            MainOp::Conv2d3x3(_) | MainOp::Map { .. } => (
-                [ELEMENT_GROUP, 1, 1],
-                rows_of(self.output_elements().div_ceil(u64::from(ELEMENT_GROUP))),
-                0,
-            ),
-            MainOp::LayerNorm(l) => (
+            MainOp::Conv2d3x3(_) | MainOp::Map { .. } => {
+                let range = self.output_range();
+                (
+                    [ELEMENT_GROUP, 1, 1],
+                    rows_of((range.end - range.start).div_ceil(u64::from(ELEMENT_GROUP))),
+                    0,
+                )
+            }
+            MainOp::LayerNorm(_) => (
                 [LAYER_NORM_LANES, 1, 1],
-                rows_of(u64::from(l.rows)),
+                rows_of(u64::from(units)),
                 LAYER_NORM_LANES * F32_BYTES,
             ),
             MainOp::MatMul(mm) => (
                 [MATMUL_TILE, MATMUL_TILE, 1],
-                [mm.n.div_ceil(MATMUL_TILE), mm.m.div_ceil(MATMUL_TILE), 1],
+                [mm.n.div_ceil(MATMUL_TILE), units.div_ceil(MATMUL_TILE), 1],
                 2 * MATMUL_TILE * MATMUL_TILE * F32_BYTES,
             ),
         };
@@ -957,15 +1205,23 @@ fn rows_of(groups: u64) -> [u32; 3] {
 pub struct Program {
     kernels: Vec<KernelSpec>,
     tensors: Vec<TensorDesc>,
-    roles: BTreeMap<TensorId, TensorRole>,
+    /// The graph's knowledge of every tensor in `tensors`, kept so a split
+    /// derives lifetimes by the same rule as the lowering.
+    infos: BTreeMap<TensorId, TensorInfo>,
 }
 
 impl Program {
     /// Derives every tensor's lifetime from the kernels that use it (rule 1 of
     /// the [module documentation](self#rules)).
     fn new(kernels: Vec<KernelSpec>, graph: &Graph) -> Self {
-        // `push` bounds the operation count by `u32`, and there are no more
-        // kernels than operations.
+        Self::derive(kernels, &graph.tensors)
+    }
+
+    /// The program of `kernels` over the tensors `infos` describes: each
+    /// tensor a kernel binds, and each input, weight and output, with its
+    /// lifetime derived from the kernels' indices. The caller keeps the kernel
+    /// count within `u32`.
+    fn derive(kernels: Vec<KernelSpec>, infos: &BTreeMap<TensorId, TensorInfo>) -> Self {
         let index = |k: usize| u32::try_from(k).unwrap_or(u32::MAX);
         let last = index(kernels.len().saturating_sub(1));
         let mut uses: BTreeMap<TensorId, (u32, u32)> = BTreeMap::new();
@@ -981,8 +1237,8 @@ impl Program {
             }
         }
         let mut tensors = Vec::new();
-        let mut roles = BTreeMap::new();
-        for (&id, info) in &graph.tensors {
+        let mut kept = BTreeMap::new();
+        for (&id, info) in infos {
             let lifetime = if info.role.whole_program() {
                 Some((0, last))
             } else {
@@ -991,13 +1247,13 @@ impl Program {
             };
             if let Some((first, end)) = lifetime {
                 tensors.push(TensorDesc::new(id, DType::F32, info.elements, first, end));
-                roles.insert(id, info.role);
+                kept.insert(id, *info);
             }
         }
         Self {
             kernels,
             tensors,
-            roles,
+            infos: kept,
         }
     }
 
@@ -1006,6 +1262,74 @@ impl Program {
     #[must_use]
     pub fn kernels(&self) -> &[KernelSpec] {
         &self.kernels
+    }
+
+    /// How many parts keep each kernel within `bound`, given what each took:
+    /// [`KernelSpec::parts_within`] for kernel `i` and `durations[i]`, ready to
+    /// be passed to [`split`](Self::split).
+    ///
+    /// # Errors
+    ///
+    /// [`KernelError::PartCounts`] when `durations` does not have one entry
+    /// per kernel, [`KernelError::ZeroBound`] for a bound of zero.
+    pub fn parts_within(
+        &self,
+        durations: &[Micros],
+        bound: Micros,
+    ) -> Result<Vec<u32>, KernelError> {
+        if durations.len() != self.kernels.len() {
+            return Err(KernelError::PartCounts {
+                kernels: self.kernels.len(),
+                given: durations.len(),
+            });
+        }
+        self.kernels
+            .iter()
+            .zip(durations)
+            .map(|(spec, &duration)| spec.parts_within(duration, bound))
+            .collect()
+    }
+
+    /// The program with kernel `i` split into `parts[i]` parts (rule 6 of the
+    /// [module documentation](self#rules)), each a kernel of its own placed
+    /// where the kernel was, in order, so each can be its own slice of a plan
+    /// and the scheduler can hand them out in different frames. A count is
+    /// clamped to `1..=`[`KernelSpec::max_parts`], so a count past what a
+    /// kernel's shape allows, or of zero, is never an error.
+    ///
+    /// Lifetimes are derived again from the new kernel indices, by rule 1; the
+    /// memory plan of the result is a plan of its own.
+    ///
+    /// # Errors
+    ///
+    /// [`KernelError::PartCounts`] when `parts` does not have one entry per
+    /// kernel, [`KernelError::AlreadySplit`] when a kernel is already a part,
+    /// [`KernelError::TooManyOps`] when the parts would be more kernels than a
+    /// kernel index counts.
+    pub fn split(&self, parts: &[u32]) -> Result<Self, KernelError> {
+        if parts.len() != self.kernels.len() {
+            return Err(KernelError::PartCounts {
+                kernels: self.kernels.len(),
+                given: parts.len(),
+            });
+        }
+        let mut total: u64 = 0;
+        for (index, (spec, &count)) in self.kernels.iter().zip(parts).enumerate() {
+            if !spec.part.is_whole() {
+                return Err(KernelError::AlreadySplit { kernel: index });
+            }
+            total += u64::from(count.clamp(1, spec.max_parts().max(1)));
+        }
+        if u32::try_from(total).is_err() {
+            return Err(KernelError::TooManyOps);
+        }
+        let kernels = self
+            .kernels
+            .iter()
+            .zip(parts)
+            .flat_map(|(spec, &count)| spec.split(count))
+            .collect();
+        Ok(Self::derive(kernels, &self.infos))
     }
 
     /// Every tensor a kernel uses, and every input, weight and output, with
@@ -1020,7 +1344,7 @@ impl Program {
     /// the graph never declared.
     #[must_use]
     pub fn role(&self, id: TensorId) -> Option<TensorRole> {
-        self.roles.get(&id).copied()
+        self.infos.get(&id).map(|info| info.role)
     }
 
     /// Describes tensor `id` as a stand-in for the input or output `of`: the
@@ -1033,7 +1357,7 @@ impl Program {
     /// `of` is not an input or output of the program, or `id` is already one
     /// of its tensors.
     pub fn stand_in(&self, of: TensorId, id: TensorId) -> Result<TensorDesc, KernelError> {
-        if self.roles.contains_key(&id) {
+        if self.infos.contains_key(&id) {
             return Err(KernelError::DuplicateTensor(id));
         }
         match (self.role(of), self.tensors.iter().find(|t| t.id == of)) {
@@ -1141,6 +1465,24 @@ pub enum KernelError {
         /// What the device provides.
         available: u64,
     },
+    /// A list of part counts or durations that is not one per kernel.
+    #[error("{given} entries given for a program of {kernels} kernels")]
+    PartCounts {
+        /// The program's kernels.
+        kernels: usize,
+        /// The entries given.
+        given: usize,
+    },
+    /// A kernel that is already a part of a split is not split again: its
+    /// part counts would no longer describe the program it came from.
+    #[error("kernel {kernel} is already a part of a split kernel")]
+    AlreadySplit {
+        /// The kernel's index in the program.
+        kernel: usize,
+    },
+    /// No dispatch fits a bound of zero.
+    #[error("a dispatch bound of zero cannot be met")]
+    ZeroBound,
     /// A kernel needs features the device was not created with.
     #[error("the kernel needs features {needed:?}, the device has {available:?}")]
     MissingFeatures {
@@ -1585,6 +1927,354 @@ mod tests {
         assert_eq!(p.stand_in(A, id(97)), Err(KernelError::NotInputOrOutput(A)));
         assert_eq!(p.stand_in(W, id(97)), Err(KernelError::NotInputOrOutput(W)));
         assert_eq!(p.stand_in(Y, X), Err(KernelError::DuplicateTensor(X)));
+    }
+
+    /// A graph of one heavy or element-wise operation reading weights of the
+    /// sizes its shape needs and writing `Y`.
+    fn single(kind: OpKind) -> Graph {
+        let mut g = Graph::new();
+        for (t, elements) in kind.reads() {
+            if g.role(t).is_none() {
+                g.tensor(t, TensorRole::Weight, elements).unwrap();
+            }
+        }
+        g.tensor(Y, TensorRole::Output, kind.output_elements())
+            .unwrap();
+        g.push(kind, Y).unwrap();
+        g
+    }
+
+    /// One operation of each main-operation kind, at shapes that include ones
+    /// of a single unit and ones no tile or workgroup divides.
+    fn shapes() -> Vec<OpKind> {
+        let mut kinds = Vec::new();
+        for (height, width, cin, cout) in [(1, 1, 1, 1), (7, 9, 3, 5), (3, 17, 2, 4)] {
+            kinds.push(OpKind::Conv2d3x3(Conv2d3x3 {
+                input: X,
+                weights: W,
+                bias: Some(BIAS),
+                height,
+                width,
+                cin,
+                cout,
+            }));
+        }
+        for (rows, channels) in [(1, 1), (63, 5), (100, 3)] {
+            kinds.push(OpKind::LayerNorm(LayerNorm {
+                input: X,
+                gamma: W,
+                beta: BIAS,
+                rows,
+                channels,
+            }));
+        }
+        for (m, k, n) in [(1, 1, 1), (4, 8, 4), (16, 3, 2), (33, 5, 7), (37, 21, 19)] {
+            kinds.push(OpKind::MatMul(MatMul {
+                a: X,
+                b: W,
+                bias: Some(BIAS),
+                m,
+                k,
+                n,
+            }));
+        }
+        for elements in [1, 7, 257, 1000] {
+            kinds.push(OpKind::Gelu { input: X, elements });
+        }
+        kinds
+    }
+
+    /// Part counts to try against a kernel of `max` parts: every count up to
+    /// past `max` when that is small, otherwise counts that do and do not
+    /// divide it, `max` itself, and counts past it.
+    fn counts(max: u32) -> Vec<u32> {
+        if max <= 40 {
+            return (0..=max + 3).collect();
+        }
+        vec![
+            0,
+            1,
+            2,
+            3,
+            5,
+            7,
+            13,
+            max - 1,
+            max,
+            max + 1,
+            2 * max + 3,
+            u32::MAX,
+        ]
+    }
+
+    #[test]
+    fn a_split_kernels_parts_cover_its_output_exactly_once() {
+        let baseline = DeviceProfile::webgpu_baseline();
+        for kind in shapes() {
+            let whole = single(kind).lower(Fusion::On).unwrap();
+            let spec = &whole.kernels()[0];
+            let max = spec.max_parts();
+            let extent = spec.main().split_extent();
+            let grain = spec.main().split_grain();
+            assert_eq!(max, extent.div_ceil(grain), "{}", spec.name());
+            assert_eq!(spec.part().count(), 1);
+            assert_eq!(spec.output_range(), 0..spec.output_elements());
+            for count in counts(max) {
+                let split = whole.split(&[count]).unwrap();
+                let parts = split.kernels();
+                let what = format!("{} split {count} ways", spec.name());
+                assert_eq!(parts.len() as u32, count.clamp(1, max), "{what}");
+                let mut next_unit = 0;
+                let mut next_element = 0;
+                let mut sizes = Vec::new();
+                for (i, part) in parts.iter().enumerate() {
+                    assert_eq!(part.part().index(), i as u32, "{what}");
+                    assert_eq!(part.part().count(), parts.len() as u32, "{what}");
+                    assert_eq!(part.whole(), *spec, "{what}");
+                    // Same tensors, same epilogue, same operations.
+                    assert_eq!(part.bindings(), spec.bindings(), "{what}");
+                    assert_eq!(part.epilogue(), spec.epilogue(), "{what}");
+                    assert_eq!(part.ops(), spec.ops(), "{what}");
+                    let range = part.part().range();
+                    assert_eq!(range.start, next_unit, "{what}: contiguous units");
+                    assert!(range.end > range.start, "{what}: part {i} is empty");
+                    if range.end != extent {
+                        assert_eq!(range.end % grain, 0, "{what}: a boundary inside a tile");
+                    }
+                    next_unit = range.end;
+                    let out = part.output_range();
+                    assert_eq!(out.start, next_element, "{what}: contiguous output");
+                    next_element = out.end;
+                    sizes.push(u64::from(range.end - range.start));
+
+                    // The part's grid covers the part, and the part runs on the
+                    // baseline.
+                    let r = part.requirements(Variant::Baseline);
+                    let groups = u64::from(r.workgroups[0]) * u64::from(r.workgroups[1]);
+                    let covered =
+                        groups * u64::from(r.workgroup_size[0]) * u64::from(r.workgroup_size[1]);
+                    match spec.main() {
+                        MainOp::Conv2d3x3(_) | MainOp::Map { .. } => {
+                            assert!(covered >= out.end - out.start, "{what}");
+                        }
+                        MainOp::LayerNorm(_) => {
+                            assert!(groups >= u64::from(range.end - range.start), "{what}");
+                        }
+                        MainOp::MatMul(mm) => {
+                            assert!(r.workgroups[0] * MATMUL_TILE >= mm.n, "{what}");
+                            assert!(
+                                r.workgroups[1] * MATMUL_TILE >= range.end - range.start,
+                                "{what}"
+                            );
+                        }
+                    }
+                    assert_eq!(part.check(Variant::Baseline, &baseline), Ok(()), "{what}");
+                }
+                assert_eq!(next_unit, extent, "{what}: every unit");
+                assert_eq!(
+                    next_element,
+                    spec.output_elements(),
+                    "{what}: every element"
+                );
+                // Even: no two parts differ by more than one block (the last
+                // block of a matrix multiply can be short, which only makes
+                // its part smaller).
+                let (least, most) = (sizes.iter().min().unwrap(), sizes.iter().max().unwrap());
+                assert!(most - least <= 2 * u64::from(grain), "{what}: {sizes:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_part_count_is_the_duration_over_the_bound_rounded_up_and_clamped() {
+        let mut g = base(&[]);
+        push(&mut g, matmul(Y));
+        let p = g.lower(Fusion::On).unwrap();
+        // A 4-row matmul is one tile row, so it cannot be split at all.
+        let small = &p.kernels()[0];
+        assert_eq!(small.max_parts(), 1);
+        let us = Micros::new;
+        assert_eq!(small.parts_within(us(10_000), us(1_000)), Ok(1));
+
+        let big = single(OpKind::Relu {
+            input: X,
+            elements: 1000,
+        })
+        .lower(Fusion::On)
+        .unwrap();
+        let k = &big.kernels()[0];
+        assert_eq!(k.max_parts(), 1000);
+        for (duration, bound, parts) in [
+            (0, 1_000, 1),
+            (1, 1_000, 1),
+            (999, 1_000, 1),
+            (1_000, 1_000, 1),
+            (1_001, 1_000, 2),
+            (2_700, 1_000, 3),
+            (3_000, 1_000, 3),
+            (3_001, 1_000, 4),
+            (5_000_000, 1, 1000),
+            (u64::MAX, 1, 1000),
+        ] {
+            assert_eq!(
+                k.parts_within(us(duration), us(bound)),
+                Ok(parts),
+                "{duration} us within {bound} us"
+            );
+        }
+        assert_eq!(
+            k.parts_within(us(1), Micros::ZERO),
+            Err(KernelError::ZeroBound)
+        );
+        assert_eq!(big.parts_within(&[us(2_500)], us(1_000)), Ok(vec![3]));
+        assert_eq!(
+            big.parts_within(&[], us(1_000)),
+            Err(KernelError::PartCounts {
+                kernels: 1,
+                given: 0
+            })
+        );
+    }
+
+    /// Three kernels, with fusion off: a matmul, then two element-wise
+    /// kernels, one of which reads a tensor two kernels back.
+    fn three_kernels() -> Program {
+        let mut g = Graph::new();
+        g.tensor(X, TensorRole::Input, 40 * 8).unwrap();
+        g.tensor(W, TensorRole::Weight, 8 * 3).unwrap();
+        g.tensor(BIAS, TensorRole::Weight, 3).unwrap();
+        g.tensor(A, TensorRole::Activation, 120).unwrap();
+        g.tensor(B, TensorRole::Activation, 120).unwrap();
+        g.tensor(Y, TensorRole::Output, 120).unwrap();
+        push(
+            &mut g,
+            (
+                OpKind::MatMul(MatMul {
+                    a: X,
+                    b: W,
+                    bias: Some(BIAS),
+                    m: 40,
+                    k: 8,
+                    n: 3,
+                }),
+                A,
+            ),
+        );
+        push(
+            &mut g,
+            (
+                OpKind::Relu {
+                    input: A,
+                    elements: 120,
+                },
+                B,
+            ),
+        );
+        push(
+            &mut g,
+            (
+                OpKind::Add {
+                    a: B,
+                    b: A,
+                    elements: 120,
+                },
+                Y,
+            ),
+        );
+        g.lower(Fusion::Off).unwrap()
+    }
+
+    #[test]
+    fn splitting_stretches_lifetimes_over_the_parts_and_the_plan_still_holds() {
+        let whole = three_kernels();
+        assert_eq!(whole.kernels().len(), 3);
+        let baseline = DeviceProfile::webgpu_baseline();
+        // The matmul has three tile rows; the maps have 120 elements.
+        for parts in [[1, 1, 1], [2, 1, 1], [3, 2, 5], [9, 7, 1], [1, 4, 120]] {
+            let split = whole.split(&parts).unwrap();
+            let counts: Vec<u32> = parts
+                .iter()
+                .zip(whole.kernels())
+                .map(|(&n, k)| n.clamp(1, k.max_parts()))
+                .collect();
+            let first: Vec<u32> = counts
+                .iter()
+                .scan(0, |at, &n| {
+                    let here = *at;
+                    *at += n;
+                    Some(here)
+                })
+                .collect();
+            let last_of = |k: usize| first[k] + counts[k] - 1;
+            assert_eq!(split.kernels().len() as u32, counts.iter().sum::<u32>());
+
+            // Every tensor's lifetime is the whole program's, mapped: from the
+            // first part of its first kernel to the last part of its last.
+            for t in whole.tensors() {
+                let s = split.tensors().iter().find(|s| s.id == t.id).unwrap();
+                assert_eq!(
+                    (s.first_use, s.last_use),
+                    (first[t.first_use as usize], last_of(t.last_use as usize)),
+                    "tensor {} with parts {parts:?}",
+                    t.id.get()
+                );
+                assert_eq!(split.role(t.id), whole.role(t.id));
+            }
+            assert_eq!(split.tensors().len(), whole.tensors().len());
+
+            // A tensor is read only by kernels after every part that writes it.
+            for (j, kernel) in split.kernels().iter().enumerate() {
+                for t in kernel.bindings() {
+                    if t == kernel.output() {
+                        continue;
+                    }
+                    for (i, writer) in split.kernels().iter().enumerate() {
+                        if writer.output() == t {
+                            assert!(i < j, "kernel {j} reads {} before part {i}", t.get());
+                        }
+                    }
+                }
+            }
+
+            // The plan of the split program keeps every kernel's tensors apart.
+            let plan = MemoryPlan::new(split.tensors(), &baseline).unwrap();
+            for kernel in split.kernels() {
+                let bound = kernel.bindings();
+                for (i, &a) in bound.iter().enumerate() {
+                    for &b in &bound[i + 1..] {
+                        let (p, q) = (plan.placement(a).unwrap(), plan.placement(b).unwrap());
+                        assert!(
+                            p.arena != q.arena || p.end() <= q.offset || q.end() <= p.offset,
+                            "tensors {} and {} share bytes with parts {parts:?}",
+                            a.get(),
+                            b.get()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn splitting_a_whole_program_by_ones_changes_nothing_and_bad_counts_are_errors() {
+        let whole = three_kernels();
+        assert_eq!(whole.split(&[1, 1, 1]).unwrap(), whole);
+        // Zero is clamped to one.
+        assert_eq!(whole.split(&[0, 0, 0]).unwrap(), whole);
+        assert_eq!(
+            whole.split(&[1, 1]),
+            Err(KernelError::PartCounts {
+                kernels: 3,
+                given: 2
+            })
+        );
+        let split = whole.split(&[2, 1, 1]).unwrap();
+        assert_eq!(
+            split.split(&[1, 1, 1, 1]),
+            Err(KernelError::AlreadySplit { kernel: 0 })
+        );
+        // Splitting is deterministic.
+        assert_eq!(whole.split(&[3, 2, 5]), whole.split(&[3, 2, 5]));
     }
 
     #[test]

@@ -77,8 +77,16 @@
 //! whole network in planned memory, fused and unfused, against it. The
 //! scheduler, the timer and the frame loop are the ones the synthetic workload
 //! uses, and the job has one slice per kernel, so `--slices` is fixed at the
-//! kernel count and `--slice-iters` does not apply. The render pass is the
-//! synthetic one.
+//! kernel count before splitting and `--slice-iters` does not apply. The
+//! render pass is the synthetic one.
+//!
+//! Before the measured loop the network is calibrated and split
+//! (`calibrate.rs`, and "Splitting" below): each kernel is timed whole, paced
+//! as the loop is, and a kernel whose estimate exceeds `--max-dispatch-us`
+//! (default 1000) is lowered again as several parts, each its own slice. The
+//! parts' pipelines and bind groups are built once, after calibration and
+//! before the loop. `--max-dispatch-us 0` or `--split off` skips calibration
+//! and runs every kernel whole.
 //!
 //! It measures the rule that the steady-state loop allocates nothing. The
 //! network's memory is planned against the baseline WebGPU limits, realised as
@@ -87,7 +95,8 @@
 //! frame and after the last (`loop_*`, from `counters.rs`, which also says what
 //! a counter does and does not show). On an Apple M1 Pro (Metal), release
 //! build, `--frames 600 --runs 2` at the defaults, on 2026-10-21, with fusion
-//! on and off:
+//! on and off (these runs predate splitting, so they are runs with
+//! `--split off`; "Splitting" has the counts with it on):
 //!
 //! - with fusion the plan has 23 tensors in one arena of 21 785 120 bytes,
 //!   576 bytes above the most bytes live at one kernel
@@ -130,7 +139,7 @@
 //!
 //! Fusion exists to issue fewer dispatches (the `beatlm_core::kernel`
 //! documentation says why, and owns the rule). The runs above, `sync` mode,
-//! latency 2, the quantile estimator; times in microseconds:
+//! latency 2, the quantile estimator, no splitting; times in microseconds:
 //!
 //! | `--fusion`, run | `dispatches_per_job` | `dispatches_per_frame` p50 / p99 | `cpu_encode_us` p50 / p99 | `cpu_queue_submit_us` p50 / p99 | `cpu_start_to_submit_us` p50 / p99 | `gpu_frame_us` p50 / p99 | delivered / missed | `delivery_rate` |
 //! |---|---|---|---|---|---|---|---|---|
@@ -148,6 +157,87 @@
 //! deadline, and the largest final estimate in every run was the second matrix
 //! multiply's, fused or not.
 //!
+//! # Splitting
+//!
+//! Splitting exists to bound how long one dispatch holds the queue (the
+//! `beatlm_core::kernel` documentation says why, and the core owns the rule
+//! and the decision). Configuration of every run: `--workload net --frames 600
+//! --runs 2`, `sync` mode, latency 2, the quantile estimator, fusion on,
+//! margin 2 ms, release build, on an Apple M1 Pro, Metal, wgpu 30.0.1, on
+//! 2026-10-21, with `--max-dispatch-us 1000` (the default) and with `--split
+//! off`. Parts are per kernel in program order (`conv2d3x3+relu`,
+//! `layernorm`, `conv2d3x3`, `matmul+gelu`, `layernorm`, `matmul+add+scale`);
+//! times in microseconds; every run is one row and none was discarded.
+//!
+//! | `--split`, run | parts | `dispatches_per_job` | `longest_dispatch_us` p50 / p99 / max | `gpu_frame_us` p50 / p99 | `cpu_encode_us` p50 / p99 | delivered / missed | `delivery_rate` |
+//! |---|---|---|---|---|---|---|---|
+//! | on, 1 | 3 2 1 1 1 4 | 12 | 1223 / 2895 / 4432 | 7840 / 12570 | 745 / 3714 | 598 / 0 | 1.0000 |
+//! | on, 2 | 3 1 1 1 1 4 | 11 | 1371 / 2911 / 4122 | 7936 / 12972 | 820 / 3138 | 598 / 0 | 1.0000 |
+//! | off, 1 | 1 1 1 1 1 1 | 6 | 2086 / 4125 / 6514 | 7752 / 12622 | 407 / 4949 | 598 / 0 | 1.0000 |
+//! | off, 2 | 1 1 1 1 1 1 | 6 | 2087 / 3474 / 4271 | 8138 / 11937 | 492 / 4133 | 598 / 0 | 1.0000 |
+//!
+//! Calibration estimated the second matrix multiply at 3468 and 3472 us, and
+//! split it into four parts in both runs; the first convolution at 2427 and
+//! 2347 us (three parts), and the first layer norm at 1996 and 867 us, so it
+//! was split in one run and not the other. The decision follows what was
+//! measured in that process, which is the point of deciding from
+//! measurements, and two runs of one setting can differ in their parts.
+//! In the loop that followed, the second matrix multiply measured a mean of
+//! 2223 and 2187 us whole and 553 to 630 us per part split; its four parts
+//! summed to 2351 and 2481 us, a little more than the whole.
+//!
+//! What the numbers say, and what they do not:
+//!
+//! - **The longest dispatch per frame came down**: from 2086 and 2087 to 1223
+//!   and 1371 at the median, and from 3474 and 4125 to 2895 and 2911 at p99.
+//!   No slice's measured mean was above 803 us. The bound held for the means,
+//!   not for every dispatch: `longest_dispatch_us` stayed above 1000 at the
+//!   median. The slices with the heaviest tails were slices 1 to 4 (the later
+//!   parts of the first convolution and the kernels after them), whose final
+//!   estimates, the 0.9 quantile of their last 32 measurements, were 1077 to
+//!   1645 against means of 362 to 803, while the matrix multiply's parts' were
+//!   894 to 897. Why those slices, and not the parts of the longest kernel,
+//!   ran long was not established: which slice was the longest in each frame
+//!   was not recorded, and a pass's boundaries can include time it waited for
+//!   earlier work on the queue (the caveat above).
+//! - **It cost CPU encode time at the median and nothing measurable on the
+//!   GPU.** The job had 11 or 12 dispatches instead of 6, and the median encode
+//!   time was 745 and 820 us against 407 and 492; the 99th percentile spread
+//!   more between two runs of one setting than between the settings. The GPU
+//!   time per frame and the delivery rate did not move beyond the run-to-run
+//!   spread.
+//! - **The loop created nothing.** Buffers stayed at 10 at every frame
+//!   boundary in all four runs; bind groups (29 and 28) and compute pipelines
+//!   (15 and 14) did not change in the split runs, the parts' included,
+//!   because every part's pipeline and bind groups are created before the
+//!   first frame.
+//!
+//! The default bound was chosen from a sweep with `--frames 300 --runs 2` on
+//! the same machine and date (three runs at 1000). At 500 us the jobs had 23
+//! to 26 dispatches, `longest_dispatch_us` was 1007 to 1125 at the median and
+//! 1981 to 2181 at p99, and 0.9866 and 0.9933 of the deadlines were met; at
+//! 1000 us, 12 to 13 dispatches, 1156 to 1215 and 2393 to 2684, and all met;
+//! at 2000 us, 8 dispatches, 1440 and 1441 and 2803 to 3000, and all met.
+//! Halving the bound from 1000 to 500 doubled the dispatches for 31 to 208 us
+//! less at the median, and both 500 runs missed deadlines where no 1000 run
+//! did, which is why 1000 is the default; on another adapter the sweep is the
+//! thing to repeat.
+//!
+//! The misses at 500 are confounded. The loop's cost model starts every part
+//! from the same prior, so a job's estimated cost before its first
+//! measurements grows with its number of parts, and early jobs of a finely
+//! split network can miss their deadline for that reason alone. One 300-frame
+//! run with the 1000 us default showed the same collapse when calibration
+//! measured the last matrix multiply at twice its usual time and split the
+//! network into 14 dispatches: 0.13 of the deadlines were met, against 1.0 in
+//! the two runs that followed (Apple M1 Pro, Metal, 2026-10-21). Until parts
+//! start from estimates that reflect their size, the sweep cannot separate the
+//! bound's effect from the prior's.
+//!
+//! Calibration is paced at the frame period, because unpaced it measured
+//! every kernel two to four times faster than the loop runs it (`calibrate.rs`
+//! has the figures).
+//!
 //! # Running it
 //!
 //! ```text
@@ -155,12 +245,16 @@
 //! cargo run --release -p beatlm-bench -- --frames 600 --runs 3 --mode thread
 //! cargo run --release -p beatlm-bench -- --frames 600 --runs 2 --estimator capped --background-load
 //! cargo run --release -p beatlm-bench -- --workload net --frames 600 --runs 2 --fusion off
+//! cargo run --release -p beatlm-bench -- --workload net --frames 600 --runs 2 --split off
+//! cargo run --release -p beatlm-bench -- --workload net --frames 300 --runs 2 --max-dispatch-us 500
 //! cargo run --release -p beatlm-bench -- --workload net --frames 1 --dump-wgsl target/wgsl
 //! ```
 //!
 //! Options are listed by `--help`. It needs an adapter with
 //! `Features::TIMESTAMP_QUERY` and is not part of `just check`; an adapter is
-//! not guaranteed where `check` runs. A run takes about `frames / 60` seconds.
+//! not guaranteed where `check` runs. A run takes about `frames / 60` seconds;
+//! with splitting on, calibration first runs `2 * COST_WINDOW` paced frames
+//! plus one untimed frame.
 //! `--runs N` repeats the whole run `N` times in one process on one device, each
 //! with a fresh scheduler, cost model, timer and workload, and prints one report
 //! per run, so the variance between runs is visible without restarting.
@@ -193,11 +287,13 @@
 //! | `cpu_encode_us` | per frame, from creating the command encoder to finishing it, timestamp writes and the resolve included |
 //! | `cpu_queue_submit_us` | per frame, the time inside `queue.submit` |
 //! | `gpu_frame_us` | per timed frame, render plus every slice, on the GPU: p50, p99, max |
+//! | `longest_dispatch_us` | per timed frame that ran a slice, the longest single measured compute pass: how long one dispatch held up the queue; p50, p99, max |
 //! | `gpu_frames_over_period` | timed frames whose render plus slices took longer than the frame period, of the timed frames: a real overrun that the estimates were supposed to prevent |
 //! | `background_dispatches` | dispatches the competing load submitted, from the one completed before the first frame to the last one queued when it was stopped; present only with `--background-load` |
 //! | `slice[i]` | the cost model's final estimate for slice `i` against the mean of its measured durations |
-//! | `workload`, `fusion` (in `config`) | present as `workload=net fusion=on` or `fusion=off` only for the network; the synthetic report has neither |
-//! | `kernels` | `net` only: each kernel of a job, in dispatch order, named by its main operation and epilogue |
+//! | `workload`, `fusion`, `split` (in `config`) | present only for the network, as `workload=net fusion=on` or `fusion=off`, then `split=on max_dispatch_us=N` or `split=off`; the synthetic report has none. `slices` there is the kernel count before splitting |
+//! | `kernel_parts[i]` | `net` only: kernel `i` of the unsplit network, its parts, and calibration's estimate of it run whole (`calibrated_us`, `none` with splitting off) |
+//! | `kernels` | `net` only: each kernel of a job, in dispatch order, named by its main operation and epilogue, a part as `name[i/n]`; one slice each |
 //! | `memory_plan_*` | `net` only: tensors, input/output slots, arenas and their bytes, the plan's total, the most bytes live at one kernel, and the bytes with no sharing |
 //! | `wgpu_counters_populated` | `net` only: whether the backend sets wgpu's buffer counter; when false the loop's buffer creation is unmeasured and the report says so |
 //! | `loop_*` | `net` only: a counter's reading before the first frame and after the last, and the change; for buffers also the least and most seen at a frame boundary |
@@ -315,6 +411,7 @@
 //! crate reads no clock, which is why only the harness is affected.
 
 mod args;
+mod calibrate;
 mod counters;
 mod device;
 mod engine;
@@ -364,7 +461,13 @@ fn real_main() -> Result<ExitCode> {
     let workload = match args.workload {
         args::WorkloadKind::Synthetic => String::from("synthetic"),
         args::WorkloadKind::Net => {
-            format!("net with fusion {}", args::fusion_name(args.fusion))
+            let split = args
+                .max_dispatch_us
+                .map_or_else(|| String::from("off"), |us| format!("at {us} us"));
+            format!(
+                "net with fusion {}, splitting {split}",
+                args::fusion_name(args.fusion)
+            )
         }
     };
     eprintln!(

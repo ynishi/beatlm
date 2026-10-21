@@ -24,6 +24,7 @@ use beatlm_core::sync::{MissPolicy, SyncPolicy};
 use beatlm_core::time::{FrameIndex, FrameInfo, Micros, TimePoint};
 
 use crate::args::{Args, EstimatorKind, WorkloadKind};
+use crate::calibrate::calibrate;
 use crate::counters::{self, Watch};
 use crate::device::Gpu;
 use crate::net::{self, Net};
@@ -40,7 +41,7 @@ const COST_ALPHA: f64 = 0.2;
 const COST_SIGMAS: f64 = 2.0;
 /// Measurements per slice the windowed quantile reads, about half a second of
 /// frames at 60 Hz.
-const COST_WINDOW: usize = 32;
+pub const COST_WINDOW: usize = 32;
 /// The quantile of the window the windowed estimate is.
 const COST_QUANTILE: f64 = 0.9;
 /// The most the capped estimate pads the mean, as a multiple of the mean.
@@ -113,6 +114,9 @@ pub struct Outcome {
     /// Render plus every slice measured in the same frame, per timed frame, in
     /// microseconds.
     pub gpu_frame_us: Vec<u64>,
+    /// The longest single compute pass measured in each timed frame that ran
+    /// one, in microseconds: what one dispatch held up the queue for.
+    pub longest_dispatch_us: Vec<u64>,
     /// Latency in frames of each delivered result.
     pub latencies: Vec<u64>,
     /// Results delivered.
@@ -152,10 +156,24 @@ pub struct NetReport {
     pub tensors: usize,
     /// Input and output slots: the jobs the network keeps apart.
     pub slots: u32,
-    /// The name of each kernel of a job, in dispatch order.
+    /// The name of each kernel of a job, in dispatch order, a part of a split
+    /// kernel as `name[i/n]`, counting from one.
     pub kernels: Vec<String>,
+    /// Each kernel of the unsplit network, in program order.
+    pub kernel_parts: Vec<KernelParts>,
     /// wgpu's object counters across the loop.
     pub counters: counters::Report,
+}
+
+/// One kernel of the unsplit network and what calibration made of it.
+pub struct KernelParts {
+    /// The kernel's name.
+    pub name: String,
+    /// The parts it runs as; one when it is not split.
+    pub parts: u32,
+    /// What calibration estimated it takes run whole; `None` when splitting is
+    /// off and nothing was calibrated.
+    pub calibrated: Option<Micros>,
 }
 
 /// Decides, encodes, submits and reads back the GPU work of frames.
@@ -167,6 +185,7 @@ pub struct Engine<'g> {
     gpu: &'g Gpu,
     workload: Workload,
     net: Option<Net>,
+    kernel_parts: Vec<KernelParts>,
     watch: Option<Watch>,
     timer: SliceTimer<Tag>,
     scheduler: Scheduler,
@@ -182,59 +201,93 @@ pub struct Engine<'g> {
 }
 
 impl<'g> Engine<'g> {
-    /// Builds the run's workload, timer, scheduler and cost model on `gpu`, and
-    /// runs every slice the workload has once and one render pass to completion
-    /// so shader compilation and first-use costs are not charged to frame 0.
+    /// Builds the run's workload, timer, scheduler and cost model on `gpu`;
+    /// for the network with splitting on, first calibrates its kernels and
+    /// splits them (`calibrate.rs`); then runs every slice the workload has
+    /// once and one render pass to completion so shader compilation and
+    /// first-use costs are not charged to frame 0.
     ///
     /// # Errors
     ///
-    /// A timer that cannot be built, a scheduler that rejects the
-    /// configuration, or a device that cannot be polled.
+    /// A calibration, network or timer that cannot be built, a scheduler that
+    /// rejects the configuration, or a device that cannot be polled.
     pub fn new(gpu: &'g Gpu, args: &Args) -> Result<Self> {
         let workload = Workload::new(&gpu.device, args.slice_iters, args.render_iters);
         let policy = SyncPolicy::FixedLatency {
             frames: args.latency,
         };
+        let mut kernel_parts = Vec::new();
         let net = match args.workload {
             WorkloadKind::Synthetic => None,
             WorkloadKind::Net => {
+                let shape = net::DEFAULT_SHAPE;
+                let whole = net::program(&shape, args.fusion)?;
+                // The job's kernels before splitting; `args` counted them
+                // from its own lowering, so check they agree.
+                if u32::try_from(whole.kernels().len()).ok() != Some(args.slices) {
+                    anyhow::bail!(
+                        "--slices is {} but the network has {} kernels",
+                        args.slices,
+                        whole.kernels().len()
+                    );
+                }
+                let names = whole.kernels().iter().map(|k| k.name());
+                let program = match args.max_dispatch_us {
+                    None => {
+                        kernel_parts = names
+                            .map(|name| KernelParts {
+                                name,
+                                parts: 1,
+                                calibrated: None,
+                            })
+                            .collect();
+                        whole
+                    }
+                    Some(bound) => {
+                        let calibration = calibrate(
+                            gpu,
+                            &workload,
+                            &shape,
+                            &whole,
+                            estimator(args.estimator),
+                            SLICE_PRIOR,
+                            Micros::new(bound),
+                        )?;
+                        kernel_parts = names
+                            .zip(&calibration.parts)
+                            .zip(&calibration.durations)
+                            .map(|((name, &parts), &duration)| KernelParts {
+                                name,
+                                parts,
+                                calibrated: Some(duration),
+                            })
+                            .collect();
+                        calibration.program
+                    }
+                };
                 // One input and output slot per job that can be in flight: a
                 // job's output must survive until its delivery frame.
                 let slots = policy
                     .max_in_flight()
                     .context("the policy does not bound the jobs in flight")?;
                 Some(
-                    Net::new(
-                        &gpu.device,
-                        &gpu.queue,
-                        &net::DEFAULT_SHAPE,
-                        slots,
-                        args.fusion,
-                    )
-                    .context("cannot build the planned network")?,
+                    Net::new(&gpu.device, &gpu.queue, &shape, slots, program)
+                        .context("cannot build the planned network")?,
                 )
             }
         };
-        // The job's slices are the network's kernels; `args` counted them from
-        // its own lowering, so check they agree before a slice names no kernel.
-        if let Some(net) = &net {
-            if net.kernel_count() != args.slices {
-                anyhow::bail!(
-                    "--slices is {} but the network has {} kernels",
-                    args.slices,
-                    net.kernel_count()
-                );
-            }
-        }
+        // A job's slices are the network's kernels, each part of a split one
+        // included.
+        let slices = net.as_ref().map_or(args.slices, Net::kernel_count);
         // A frame can run slices of every job still pending, not only its own: a
         // job lives `latency` frames past its submission, so `latency + 1` jobs
         // of `slices` slices each can be pending at once.
-        let capacity = args.slices.saturating_mul(args.latency.saturating_add(1));
+        let capacity = slices.saturating_mul(args.latency.saturating_add(1));
         let timer: SliceTimer<Tag> = SliceTimer::new(&gpu.device, &gpu.queue, capacity)
             .with_context(|| {
                 format!(
-                    "cannot build the GPU timer for --slices {} with --latency {}",
-                    args.slices, args.latency
+                    "cannot build the GPU timer for {slices} slices with --latency {}",
+                    args.latency
                 )
             })?;
         let scheduler = Scheduler::new(policy, MissPolicy::HoldPrevious, None)
@@ -245,12 +298,13 @@ impl<'g> Engine<'g> {
             gpu,
             workload,
             net,
+            kernel_parts,
             watch: None,
             timer,
             scheduler,
             cost,
             render_estimate: RENDER_PRIOR,
-            slices: (0..args.slices).map(SliceId::new).collect(),
+            slices: (0..slices).map(SliceId::new).collect(),
             margin: Micros::new(args.margin_us),
             latency: args.latency,
             job_dispatches: BTreeMap::new(),
@@ -419,6 +473,9 @@ impl<'g> Engine<'g> {
             entry.1 += 1;
             gpu = gpu.saturating_add(*duration);
         }
+        if let Some(longest) = timing.compute.iter().map(|(_, d)| d.get()).max() {
+            self.outcome.longest_dispatch_us.push(longest);
+        }
         if let Some(render) = timing.render {
             self.render_estimate = render;
             self.outcome
@@ -456,7 +513,20 @@ impl<'g> Engine<'g> {
                 unshared_bytes: plan.placements().map(|(_, p)| p.size).sum(),
                 tensors: plan.placements().count(),
                 slots: net.slots(),
-                kernels: net.program().kernels().iter().map(|k| k.name()).collect(),
+                kernels: net
+                    .program()
+                    .kernels()
+                    .iter()
+                    .map(|k| {
+                        let part = k.part();
+                        if part.is_whole() {
+                            k.name()
+                        } else {
+                            format!("{}[{}/{}]", k.name(), part.index() + 1, part.count())
+                        }
+                    })
+                    .collect(),
+                kernel_parts: std::mem::take(&mut self.kernel_parts),
                 counters,
             });
         }
