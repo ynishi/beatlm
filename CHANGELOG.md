@@ -85,6 +85,11 @@ and this project adheres to
 - `beatlm::load::depth_anything_v2::reference`: the reference input, file
   layout, tolerances and error measures shared by the native test and the
   page.
+- `beatlm-web`: `estimator` selects the cost model's estimator with the bench's
+  names; depth runs report where slice times run long (`tail_*`) and whether a
+  job fits its promised frames (`capacity_frames_needed`).
+- `beatlm::gpu::PassSpan`: each timed pass's begin and end timestamps, kept in
+  `FrameTiming` beside the durations.
 
 ### Changed
 

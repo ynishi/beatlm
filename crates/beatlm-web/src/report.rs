@@ -20,7 +20,9 @@
 //! (`timing_lag_frames`), the frame's first compute pass apart from the later
 //! ones (`first_pass_us`, `later_pass_us`, `first_pass_over_later_mean`), and
 //! a job's estimated GPU time when the loop began and ended
-//! (`job_estimate_us`). The last line is `status: done`, so a reader can tell a
+//! (`job_estimate_us`); and, for the depth model, where the time of the slow
+//! slice measurements comes from (`tail_*`, which [`crate::diagnosis`] lists
+//! with what each tests). The last line is `status: done`, so a reader can tell a
 //! finished report from one still being written.
 //!
 //! Four shared lines keep their names and change their meaning, because the
@@ -42,7 +44,13 @@
 //! (`calibrated_job_us`, `memory_plan_*`): the weights and their inventory
 //! check, calibration's GPU time per run (`gpu_run_us`), the comparison with
 //! the reference (`reference*`, `depth_check*`), and whether the native
-//! default held (`native_default*`). [`DepthReport`] says what each is. A run
+//! default held (`native_default*`), and whether the frames promised can hold
+//! a job at all, even with exact estimates (`capacity_frames_needed`,
+//! [`depth::Capacity`] defines it from the loop's own measurements).
+//! [`DepthReport`] says what each is. The `config:` line's `estimator=` is the
+//! page's `estimator` parameter in the form [`crate::config::estimator`]
+//! reads back: the bench's bare name (`quantile`, `mean-sigmas`, `capped`)
+//! when it is exactly what the name means, else the parameterised form. A run
 //! asked for its latency in time also says what it asked for and the period it
 //! was turned into frames at (`latency_asked_ms`, `latency_period_us`); the
 //! frames are `config`'s `latency`.
@@ -68,11 +76,13 @@ use beatlm::load::depth_anything_v2::reference::{
 use beatlm_core::cost::SliceId;
 use beatlm_core::time::Micros;
 
-use crate::config::{Config, MARGIN_US, Model, SLICES};
-use crate::depth::{self, Facts, MAX_DISPATCH_US, NATIVE_DEFAULT_LATENCY, NATIVE_DEFAULT_SIDE};
-use crate::diagnosis::Diagnosis;
+use crate::config::{Config, MARGIN_US, Model, SLICES, estimator_name};
+use crate::depth::{
+    self, Capacity, Facts, MAX_DISPATCH_US, NATIVE_DEFAULT_LATENCY, NATIVE_DEFAULT_SIDE,
+};
+use crate::diagnosis::{Diagnosis, tail};
 use crate::pace::NOMINAL_PERIOD;
-use crate::stats::{histogram, summarize};
+use crate::stats::{histogram, nearest_rank, summarize};
 use crate::workload::{DEFAULT_RENDER_ITERS, DEFAULT_SLICE_ITERS};
 
 /// The two limits a memory plan can need raised, as a device or an adapter
@@ -182,6 +192,11 @@ pub struct DepthReport {
     /// The GPU time of each counted run of calibration's first pass, every
     /// kernel of the unsplit program summed, in microseconds: `gpu_run_us`.
     pub runs_us: Vec<u64>,
+    /// Each part's counted measurements in calibration's second pass, part
+    /// `i` being the loop's slice `i`, in microseconds: what the loop's
+    /// estimates started from, which `tail_loop_over_calibration` compares
+    /// the loop with.
+    pub parts_us: Vec<Vec<u64>>,
     /// Bytes of each arena of the loop's plan.
     pub arenas: Vec<u64>,
     /// Bytes of all arenas.
@@ -243,6 +258,11 @@ pub struct Outcome {
     pub display_period_us: Option<u64>,
     /// Every interval between consecutive callbacks, in microseconds.
     pub interval_us: Vec<u64>,
+    /// The budget the scheduler expected of the frames after each frame's own,
+    /// as set in that frame (the period less the median of the recent renders
+    /// and the margin), in microseconds: what `capacity_frames_needed` takes
+    /// its median of.
+    pub expected_budget_us: Vec<u64>,
     /// Render plus every slice measured in the same frame, per timed frame, in
     /// microseconds.
     pub gpu_frame_us: Vec<u64>,
@@ -290,10 +310,6 @@ pub struct Outcome {
 /// model's default estimate reads.
 pub const STARTUP_FRAMES: u64 = 64;
 
-/// The cost model's estimator, by the name the bench's `--estimator` gives
-/// it: the core's default.
-const ESTIMATOR: &str = "quantile";
-
 /// Renders the summary of a finished run.
 #[must_use]
 pub fn render(env: &Environment, config: &Config, outcome: &Outcome) -> String {
@@ -336,9 +352,11 @@ fn write_report(
     write!(
         out,
         "config: frames={} latency={} slices={slices} slice_iters={DEFAULT_SLICE_ITERS} \
-         render_iters={DEFAULT_RENDER_ITERS} margin_us={MARGIN_US} estimator={ESTIMATOR} \
+         render_iters={DEFAULT_RENDER_ITERS} margin_us={MARGIN_US} estimator={} \
          submit={submit}",
-        config.frames, outcome.latency,
+        config.frames,
+        outcome.latency,
+        estimator_name(config.estimator),
     )?;
     if let Some(bytes) = config.arena_bytes {
         write!(out, " arena_bytes={bytes}")?;
@@ -423,6 +441,7 @@ fn write_report(
     }
     write_diagnosis(out, &outcome.diagnosis)?;
     if let Some(depth) = &outcome.depth {
+        write_tail(out, depth, outcome)?;
         write_depth(out, depth, outcome)?;
     }
     writeln!(out, "canvas_unavailable: {}", outcome.canvas_unavailable)?;
@@ -491,6 +510,177 @@ fn write_diagnosis(out: &mut String, d: &Diagnosis) -> std::fmt::Result {
         "job_estimate_us: loop_start={} loop_end={}",
         d.job_estimate_us.0, d.job_estimate_us.1
     )
+}
+
+/// The `tail_*` lines of a depth run: where the time of the slow slice
+/// measurements comes from ([`crate::diagnosis`], "Where the slow
+/// measurements come from", says what each line tests).
+fn write_tail(out: &mut String, depth: &DepthReport, outcome: &Outcome) -> std::fmt::Result {
+    let estimates: BTreeMap<SliceId, u64> = outcome
+        .estimates
+        .iter()
+        .map(|(&slice, estimate)| (slice, estimate.get()))
+        .collect();
+    let t = tail::analyse(
+        &outcome.diagnosis.frames,
+        tail::Context {
+            calibration: &depth.parts_us,
+            estimates: &estimates,
+            period_us: outcome.display_period_us,
+        },
+    );
+    match t.step_ns {
+        Some(step) => writeln!(
+            out,
+            "tail_timestamp_step_ns: {step} timestamps={}",
+            t.timestamps
+        )?,
+        None => writeln!(out, "tail_timestamp_step_ns: none")?,
+    }
+    match t.quantization {
+        Some(q) => writeln!(
+            out,
+            "tail_quantization: step_us={:.1} slices_p90_within_one_step_of_p50={} \
+             median_step_over_p90={} median_step_over_estimate_excess={}",
+            q.step_us,
+            q.within_step,
+            fixed(q.step_over_p90),
+            fixed(q.step_over_excess)
+        )?,
+        None => writeln!(out, "tail_quantization: none")?,
+    }
+    match t.spread {
+        Some(s) => writeln!(
+            out,
+            "tail_slice_spread: slices={} median_p90_over_p50={:.2} p90_p90_over_p50={:.2} \
+             median_max_over_p50={:.2}",
+            s.slices, s.p90_over_p50.median, s.p90_over_p50.p90, s.max_over_p50
+        )?,
+        None => writeln!(out, "tail_slice_spread: none")?,
+    }
+    match t.versus_calibration {
+        Some(v) => writeln!(
+            out,
+            "tail_loop_over_calibration: slices={} median_mean_ratio={:.2} median_p50_ratio={:.2}",
+            v.slices, v.mean, v.p50
+        )?,
+        None => writeln!(out, "tail_loop_over_calibration: none")?,
+    }
+    let o = t.outliers;
+    writeln!(
+        out,
+        "tail_outliers: samples={} over_{}x_median={} share={} first_in_frame={} \
+         first_share_of_outliers={} first_share_of_samples={}",
+        o.samples,
+        tail::OUTLIER_FACTOR,
+        o.over,
+        share(o.over, o.samples),
+        o.first_over,
+        share(o.first_over, o.over),
+        share(o.first_samples, o.samples)
+    )?;
+    let c = t.clustering;
+    writeln!(
+        out,
+        "tail_outlier_frames: frames={} at_least_half_outliers={} expected_if_independent={:.1}",
+        c.frames, c.at_least_half, c.expected
+    )?;
+    write_gaps(
+        out,
+        "tail_gap_before_first_us",
+        "frames",
+        &t.gap_before_first_ns,
+    )?;
+    write_gaps(out, "tail_gap_between_passes_us", "gaps", &t.gap_between_ns)?;
+    match t.first_over_later {
+        Some(r) => writeln!(
+            out,
+            "tail_first_over_later: samples={} median={:.2} p90={:.2} later_p90={}",
+            r.samples,
+            r.median,
+            r.p90,
+            fixed(t.later_over_later.map(|l| l.p90))
+        )?,
+        None => writeln!(out, "tail_first_over_later: none")?,
+    }
+    for (gap, ratios) in tail::Gap::ALL.iter().zip(&t.first_by_gap) {
+        let name = gap.name();
+        match ratios {
+            Some(r) => writeln!(
+                out,
+                "tail_first_over_later_by_gap[{name}]: samples={} median={:.2} p90={:.2}",
+                r.samples, r.median, r.p90
+            )?,
+            None => writeln!(out, "tail_first_over_later_by_gap[{name}]: none")?,
+        }
+    }
+    write!(
+        out,
+        "tail_busy_previous: window_frames={} unknown_samples={}",
+        tail::BUSY_WINDOW,
+        t.busy_unknown
+    )?;
+    match outcome.display_period_us {
+        Some(period) => writeln!(out, " period_us={period}")?,
+        None => writeln!(out, " period_us=none")?,
+    }
+    for bucket in &t.busy {
+        let range = match bucket.below_percent {
+            Some(below) => format!("{}-{below}%", bucket.from_percent),
+            None => format!("{}%-", bucket.from_percent),
+        };
+        writeln!(
+            out,
+            "tail_by_busy_previous[{range}]: samples={} over_{}x_median={} share={} \
+             median_ratio={}",
+            bucket.samples,
+            tail::OUTLIER_FACTOR,
+            bucket.over,
+            share(bucket.over, bucket.samples),
+            fixed(bucket.ratio)
+        )?;
+    }
+    Ok(())
+}
+
+/// `name: <count_name>=n negative=k min=.. p50=.. p99=.. max=..` over signed
+/// gaps in nanoseconds, written in microseconds, or `name: none`.
+fn write_gaps(out: &mut String, name: &str, count_name: &str, gaps_ns: &[i64]) -> std::fmt::Result {
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    let mut us: Vec<i64> = gaps_ns
+        .iter()
+        .map(|&ns| (ns as f64 / 1_000.0).round() as i64)
+        .collect();
+    us.sort_unstable();
+    let negative = gaps_ns.iter().filter(|&&ns| ns < 0).count();
+    match (
+        us.first(),
+        nearest_rank(&us, 50),
+        nearest_rank(&us, 99),
+        us.last(),
+    ) {
+        (Some(min), Some(p50), Some(p99), Some(max)) => writeln!(
+            out,
+            "{name}: {count_name}={} negative={negative} min={min} p50={p50} p99={p99} max={max}",
+            us.len()
+        ),
+        _ => writeln!(out, "{name}: none"),
+    }
+}
+
+/// `part / whole` to four places, or `none` when `whole` is zero.
+#[allow(clippy::cast_precision_loss)]
+fn share(part: u64, whole: u64) -> String {
+    if whole == 0 {
+        String::from("none")
+    } else {
+        format!("{:.4}", part as f64 / whole as f64)
+    }
+}
+
+/// A ratio to two places, or `none`.
+fn fixed(value: Option<f64>) -> String {
+    value.map_or_else(|| String::from("none"), |v| format!("{v:.2}"))
 }
 
 /// `name: count first=a last=b` over frame indices, or `name: 0`.
@@ -584,7 +774,14 @@ fn write_depth(out: &mut String, depth: &DepthReport, outcome: &Outcome) -> std:
         out,
         "native_default_holds: {}",
         one_line(&depth::native_default(&facts))
-    )
+    )?;
+    let capacity = Capacity::of(
+        &outcome.measured,
+        outcome.estimates.len(),
+        summarize(&outcome.expected_budget_us).map(|s| s.p50),
+        outcome.latency,
+    );
+    writeln!(out, "capacity_frames_needed: {}", capacity.line())
 }
 
 /// Microseconds as milliseconds to one decimal place, the precision the
@@ -714,6 +911,36 @@ mod tests {
     }
 
     #[test]
+    fn the_config_line_prints_the_chosen_estimator_precisely() {
+        let config_of = |value: &str| {
+            let config = Config {
+                estimator: crate::config::estimator(value).unwrap(),
+                ..Config::default()
+            };
+            let text = render(&Environment::default(), &config, &Outcome::default());
+            let config = line(&text, "config").unwrap().to_owned();
+            config
+                .split(' ')
+                .find_map(|word| word.strip_prefix("estimator="))
+                .unwrap()
+                .to_owned()
+        };
+        assert_eq!(config_of("quantile:0.75"), "quantile:0.75:32");
+        assert_eq!(config_of("quantile:0.75:16"), "quantile:0.75:16");
+        assert_eq!(config_of("mean-sigmas"), "mean-sigmas");
+        assert_eq!(config_of("mean-sigmas:0.3:2"), "mean-sigmas:0.3:2");
+        assert_eq!(config_of("capped"), "capped");
+        assert_eq!(config_of("quantile:0.9:32"), "quantile");
+        // Without the parameter it is the core's default, the bench's name.
+        let text = report(&Environment::default(), &Outcome::default());
+        assert!(
+            line(&text, "config")
+                .unwrap()
+                .contains(" estimator=quantile ")
+        );
+    }
+
+    #[test]
     fn every_line_is_one_name_and_one_value() {
         let text = report(&Environment::default(), &Outcome::default());
         for l in text.lines() {
@@ -818,6 +1045,7 @@ mod tests {
                 slices: 160,
                 calibrated: vec![Micros::new(30_000), Micros::new(24_000)],
                 runs_us: vec![54_000, 53_000, 55_000],
+                parts_us: vec![vec![1_000; 4]],
                 arenas: vec![100, 200],
                 total_bytes: 300,
                 peak_live_bytes: 250,
@@ -845,8 +1073,8 @@ mod tests {
             line(&text, "config"),
             Some(
                 "frames=600 latency=10 slices=155 slice_iters=500 render_iters=50 margin_us=2000 \
-                 estimator=quantile submit=free workload=depth size=266 fusion=on split=on \
-                 max_dispatch_us=1000"
+                 estimator=quantile submit=free workload=depth size=266 fusion=on \
+                 split=on max_dispatch_us=1000"
             )
         );
         assert_eq!(line(&text, "latency_asked_ms"), Some("83.3"));
@@ -876,6 +1104,148 @@ mod tests {
             assert!(!value.is_empty(), "{l}");
         }
         assert_eq!(text.lines().last(), Some("status: done"));
+    }
+
+    /// The tail lines of a depth run, from frames of slice 0 at 1 000 µs on
+    /// a 65 536 ns clock, one of them at 3 000 µs as its frame's first pass;
+    /// a synthetic run has none.
+    #[test]
+    fn a_depth_run_reports_where_its_slow_measurements_come_from() {
+        use crate::diagnosis::tail::{Pass, TimedFrame};
+        let q = 65_536;
+        let frames: Vec<TimedFrame> = (0..10)
+            .map(|i| {
+                let first = if i == 9 { 3_000 } else { 1_000 };
+                let at = i * 128 * q;
+                let pass = |us: u64, begin_ns: u64| Pass {
+                    us,
+                    begin_ns,
+                    end_ns: begin_ns + 17 * q,
+                };
+                TimedFrame {
+                    frame: i,
+                    compute: vec![
+                        (SliceId::new(0), pass(first, at)),
+                        (SliceId::new(0), pass(1_000, at + 17 * q)),
+                    ],
+                    render: Some(pass(1_900, at + 34 * q)),
+                }
+            })
+            .collect();
+        let config = Config {
+            model: Model::Depth { side: 266 },
+            ..Config::default()
+        };
+        let outcome = Outcome {
+            display_period_us: Some(8_389),
+            diagnosis: Diagnosis {
+                frames,
+                ..Diagnosis::default()
+            },
+            estimates: BTreeMap::from([(SliceId::new(0), Micros::new(1_000))]),
+            depth: Some(DepthReport {
+                parts_us: vec![vec![500; 4]],
+                ..DepthReport::default()
+            }),
+            ..Outcome::default()
+        };
+        let text = render(&Environment::default(), &config, &outcome);
+        assert_eq!(
+            line(&text, "tail_timestamp_step_ns"),
+            Some("65536 timestamps=60")
+        );
+        assert_eq!(
+            line(&text, "tail_outliers"),
+            Some(
+                "samples=20 over_2x_median=1 share=0.0500 first_in_frame=1 \
+                 first_share_of_outliers=1.0000 first_share_of_samples=0.5000"
+            )
+        );
+        assert_eq!(
+            line(&text, "tail_loop_over_calibration"),
+            Some("slices=1 median_mean_ratio=2.20 median_p50_ratio=2.00")
+        );
+        assert_eq!(
+            line(&text, "tail_first_over_later"),
+            Some("samples=10 median=1.00 p90=1.00 later_p90=1.00")
+        );
+        // Each frame begins 128 steps after the one before, which ended 51
+        // steps after it began: 77 steps of 65.536 µs between them.
+        assert_eq!(
+            line(&text, "tail_gap_before_first_us"),
+            Some("frames=9 negative=0 min=5046 p50=5046 p99=5046 max=5046")
+        );
+        assert_eq!(
+            line(&text, "tail_first_over_later_by_gap[idle]"),
+            Some("samples=9 median=1.00 p90=3.00")
+        );
+        assert_eq!(
+            line(&text, "tail_first_over_later_by_gap[overlap]"),
+            Some("none")
+        );
+        assert!(line(&text, "tail_by_busy_previous[0-25%]").is_some());
+        assert!(line(&text, "tail_by_busy_previous[75%-]").is_some());
+        for l in text.lines() {
+            let (name, value) = l.split_once(": ").unwrap();
+            assert!(!name.is_empty() && !name.contains(' '), "{l}");
+            assert!(!value.is_empty(), "{l}");
+        }
+        let synthetic = Outcome {
+            depth: None,
+            ..outcome
+        };
+        let text = render(&Environment::default(), &Config::default(), &synthetic);
+        assert!(!text.contains("tail_"), "{text}");
+    }
+
+    #[test]
+    fn a_depth_run_says_whether_its_promise_has_the_capacity() {
+        let config = Config {
+            model: Model::Depth { side: 266 },
+            ..Config::default()
+        };
+        // Two slices that measured 27 ms each in the loop, against expected
+        // budgets with a median of 4 334 us: 13 frames, where a promise of 10
+        // frames has 11.
+        let outcome = Outcome {
+            latency: 10,
+            display_period_us: Some(8_333),
+            expected_budget_us: vec![2_000, 4_334, 4_400, 4_334, 4_300],
+            measured: BTreeMap::from([
+                (SliceId::new(0), (54_000, 2)),
+                (SliceId::new(1), (27_000, 1)),
+            ]),
+            estimates: BTreeMap::from([
+                (SliceId::new(0), Micros::new(27_500)),
+                (SliceId::new(1), Micros::new(27_000)),
+            ]),
+            depth: Some(DepthReport::default()),
+            ..Outcome::default()
+        };
+        let text = render(&Environment::default(), &config, &outcome);
+        assert_eq!(
+            line(&text, "capacity_frames_needed"),
+            Some(
+                "in_loop_run_us=54000 slice_budget_us=4334 frames=13 frames_promised=10 \
+                 frames_available=11 slices_measured=2 of 2 verdict=infeasible"
+            )
+        );
+        // It follows the native default's verdict, and a synthetic run has none.
+        let names: Vec<&str> = text
+            .lines()
+            .filter_map(|l| l.split_once(": ").map(|(name, _)| name))
+            .collect();
+        let holds = names.iter().position(|&n| n == "native_default_holds");
+        assert_eq!(
+            names.iter().position(|&n| n == "capacity_frames_needed"),
+            holds.map(|at| at + 1)
+        );
+        let synthetic = render(
+            &Environment::default(),
+            &Config::default(),
+            &Outcome::default(),
+        );
+        assert!(!synthetic.contains("capacity_frames_needed"), "{synthetic}");
     }
 
     #[test]

@@ -27,7 +27,7 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use anyhow::{Context, Result, anyhow, bail};
-use beatlm::gpu::{FrameTiming, MAX_SLICES, SliceTimer};
+use beatlm::gpu::{FrameTiming, MAX_SLICES, PassSpan, SliceTimer};
 use beatlm_core::budget::Budget;
 use beatlm_core::cost::{CostModel, Estimator, SliceId};
 use beatlm_core::schedule::{Due, FramePlan, JobId, Scheduler, SliceRun};
@@ -41,6 +41,7 @@ use super::display::Display;
 use super::page;
 use crate::config::{Config, MARGIN_US, SLICES};
 use crate::depth::still_busy;
+use crate::diagnosis::tail::{Pass as TailPass, TimedFrame};
 use crate::diagnosis::{self, Reason, Unstarted};
 use crate::pace::{FrameStart, NOMINAL_PERIOD, Pace, Pacer, ms_to_us};
 use crate::render_cost::{RENDER_PRIOR, RenderCost};
@@ -98,6 +99,10 @@ pub struct Run {
     pub period: Option<Micros>,
     /// The job.
     pub load: Load,
+    /// The statistic the loop's cost model estimates a slice with: the model
+    /// a synthetic run builds here, and the placeholder beside the depth
+    /// model's, which calibration built with the same estimator.
+    pub estimator: Estimator,
 }
 
 /// The run: the device, the load, the decisions and what was measured.
@@ -135,7 +140,8 @@ pub struct Host {
 
 impl Host {
     /// Builds the run's timer, scheduler and cost model for `run` on `gpu`,
-    /// which `workload` was built on.
+    /// which `workload` was built on. The cost model reads with
+    /// `run.estimator`.
     ///
     /// # Errors
     ///
@@ -143,6 +149,7 @@ impl Host {
     /// have more slices than the timer can time, a timer or cost model that
     /// cannot be built, or a page without `performance`.
     pub fn new(gpu: Gpu, workload: Workload, mut run: Run) -> Result<Self> {
+        let estimator = run.estimator;
         let (slices, jobs, cost) = match &mut run.load {
             // Every frame submits a job, and a job lives `latency` frames past
             // its submission, so `latency + 1` jobs can have slices left in a
@@ -150,17 +157,17 @@ impl Host {
             Load::Synthetic => (
                 SLICES,
                 run.latency.checked_add(1),
-                CostModel::new(SLICE_PRIOR, Estimator::default())
-                    .context("cannot build the cost model")?,
+                CostModel::new(SLICE_PRIOR, estimator).context("cannot build the cost model")?,
             ),
             // A frame submits only once the job before has had its slices, so
-            // one job at a time has slices left.
+            // one job at a time has slices left. The model is calibration's,
+            // built with the run's estimator.
             Load::Depth(depth) => (
                 depth.net.kernel_count(),
                 Some(1),
                 std::mem::replace(
                     &mut depth.cost,
-                    CostModel::new(SLICE_PRIOR, Estimator::default())
+                    CostModel::new(SLICE_PRIOR, estimator)
                         .context("cannot build the cost model")?,
                 ),
             ),
@@ -272,6 +279,7 @@ impl Host {
         let budget = self.render.budget(start.period, self.margin);
         let forecast = self.render.expected(start.period, self.margin);
         self.scheduler.set_expected_budget(forecast);
+        self.outcome.expected_budget_us.push(forecast.get().get());
         let takes_input = match self.load {
             Load::Synthetic => true,
             Load::Depth(_) => self.busy.is_none(),
@@ -489,6 +497,10 @@ impl Host {
             .map(|&((_, slice), duration)| (slice, duration))
             .collect();
         self.outcome.diagnosis.passes(&passes);
+        // Only a depth run writes the `tail_*` lines that read them.
+        if matches!(self.load, Load::Depth(_)) {
+            self.outcome.diagnosis.frames.push(timed(&timing));
+        }
         let mut gpu = Micros::ZERO;
         for ((_, slice), duration) in &timing.compute {
             self.cost.record(*slice, *duration);
@@ -539,6 +551,29 @@ impl Host {
         }
         self.outcome.gpu_errors = device::gpu_errors();
         self.outcome
+    }
+}
+
+/// One frame's timing as the `tail_*` lines read it: each pass's duration, as
+/// the cost model receives it, with its timestamps.
+fn timed(timing: &FrameTiming<Tag>) -> TimedFrame {
+    let pass = |duration: Micros, span: &PassSpan| TailPass {
+        us: duration.get(),
+        begin_ns: span.begin_ns,
+        end_ns: span.end_ns,
+    };
+    TimedFrame {
+        frame: timing.frame.get(),
+        compute: timing
+            .compute
+            .iter()
+            .zip(&timing.compute_spans)
+            .map(|(&((_, slice), duration), span)| (slice, pass(duration, span)))
+            .collect(),
+        render: timing
+            .render
+            .zip(timing.render_span.as_ref())
+            .map(|(duration, span)| pass(duration, span)),
     }
 }
 

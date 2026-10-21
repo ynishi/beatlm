@@ -6,6 +6,8 @@
 //! fetching and the GPU work; the crate documentation ("The depth model")
 //! describes the whole path.
 
+use std::collections::BTreeMap;
+
 use anyhow::{Context, Result};
 use beatlm::load::depth_anything_v2::{Config, reference};
 use beatlm_core::cost::SliceId;
@@ -52,7 +54,9 @@ pub const MAX_DISPATCH_US: u64 = 1_000;
 /// Timed frames of whole jobs in each calibration pass, after one untimed
 /// frame: the bench's (`calibrate.rs`), twice the window of the core's
 /// default estimator, so the half the decision reads is as long as the window
-/// the loop's estimate reads.
+/// the loop's estimate reads. An `estimator` with a longer window starts the
+/// loop with the counted half, which is [`CALIBRATION_FRAMES`] / 2
+/// measurements of each part, and fills the rest from the loop.
 pub const CALIBRATION_FRAMES: u64 = 64;
 
 /// The share of deadlines that must arrive with their result for the native
@@ -214,6 +218,131 @@ pub fn still_busy(
     let gone =
         plan.delivered.iter().any(|d| d.job == id) || plan.missed.iter().any(|m| m.job == id);
     (left > 0 && !gone).then_some((id, left))
+}
+
+/// Whether the frames a job is promised can hold its slices at all: the
+/// report's `capacity_frames_needed` line.
+///
+/// A job's slices run in the frames from its submission to the frame that
+/// keeps its deadline, and each frame takes slices only while their estimates
+/// fit its budget (`beatlm_core::schedule`, "Projecting the queue onto frames
+/// to come"). A promise of `k` frames therefore has `k + 1` frames to run a job
+/// in, the deadline frame included, and each of them holds at most the
+/// *expected* budget the scheduler plans the later frames with. If a whole job
+/// takes more time than those frames have budget, no estimate, however exact,
+/// lets it deliver on time; this says whether that is the case, from
+/// measurements the run made.
+///
+/// The inputs are the run's own. `run_us` is the sum, over the slices measured
+/// in the loop, of the slice's mean measured duration: what one whole job
+/// costs in the loop, which is not calibration's `gpu_run_us` (the same model
+/// measured alone, and the loop's slices were found slower). `budget_us` is
+/// the median over the run's frames of the expected budget, the period less the
+/// recent median render and the margin. Both are means and medians, the
+/// statistics an exact estimator of the typical cost would plan with: an
+/// estimator that pads (the default's 0.9 quantile) needs more room than this,
+/// so `frames` is a lower bound. Slices cannot be split across frames, so even
+/// at the exact mean the real count can be higher still.
+///
+/// So `infeasible` is a finding, and `not_ruled_out` is only the absence of
+/// one: the capacity alone does not decide that the promise is kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Capacity {
+    /// The sum of the measured slices' mean durations in the loop, in
+    /// microseconds, rounded.
+    pub run_us: u64,
+    /// The median expected budget of the run's frames, in microseconds; `None`
+    /// when no frame was run.
+    pub budget_us: Option<u64>,
+    /// The promised latency in frames.
+    pub promised: u32,
+    /// The slices of a job that were measured in the loop.
+    pub measured: usize,
+    /// The slices of a job.
+    pub slices: usize,
+}
+
+impl Capacity {
+    /// The capacity check of a run whose loop measured each slice's `(sum,
+    /// count)` of durations in `measured`, with `slices` slices to a job, a
+    /// median expected budget of `budget_us` and a promise of `promised`
+    /// frames.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_sign_loss)]
+    pub fn of(
+        measured: &BTreeMap<SliceId, (u64, u64)>,
+        slices: usize,
+        budget_us: Option<u64>,
+        promised: u32,
+    ) -> Self {
+        let means = measured
+            .values()
+            .filter(|(_, count)| *count > 0)
+            .map(|&(sum, count)| sum as f64 / count as f64);
+        let (total, seen) = means.fold((0.0, 0), |(total, n), mean| (total + mean, n + 1));
+        Self {
+            // A sum of at most a few hundred microsecond means: far inside u64.
+            run_us: f64::round(total) as u64,
+            budget_us,
+            promised,
+            measured: seen,
+            slices,
+        }
+    }
+
+    /// The frames the job's measured time needs at the budget: the fewest
+    /// whole frames of `budget_us` that hold `run_us`. `None` without a
+    /// positive budget.
+    #[must_use]
+    pub fn frames(&self) -> Option<u64> {
+        self.budget_us
+            .filter(|&budget| budget > 0)
+            .map(|budget| self.run_us.div_ceil(budget))
+    }
+
+    /// The frames a job can run in: the promised latency's frames and the
+    /// deadline frame.
+    #[must_use]
+    pub fn available(&self) -> u64 {
+        u64::from(self.promised).saturating_add(1)
+    }
+
+    /// `infeasible` when the job needs more frames than it has, `not_ruled_out`
+    /// when it does not, `none` when nothing was measured or there was no
+    /// budget to compare with.
+    #[must_use]
+    pub fn verdict(&self) -> &'static str {
+        match self.frames() {
+            Some(frames) if self.measured > 0 => {
+                if frames > self.available() {
+                    "infeasible"
+                } else {
+                    "not_ruled_out"
+                }
+            }
+            _ => "none",
+        }
+    }
+
+    /// The report line's value.
+    #[must_use]
+    pub fn line(&self) -> String {
+        let number =
+            |value: Option<u64>| value.map_or_else(|| "none".to_owned(), |v| v.to_string());
+        format!(
+            "in_loop_run_us={} slice_budget_us={} frames={} frames_promised={} \
+             frames_available={} slices_measured={} of {} verdict={}",
+            self.run_us,
+            number(self.budget_us),
+            number(self.frames()),
+            self.promised,
+            self.available(),
+            self.measured,
+            self.slices,
+            self.verdict(),
+        )
+    }
 }
 
 /// What a run measured that decides whether the native default held.
@@ -395,6 +524,85 @@ mod tests {
         );
         let mut empty = WholeRuns::new(1);
         assert!(empty.durations().is_err());
+    }
+
+    fn means(slices: &[(u64, u64)]) -> BTreeMap<SliceId, (u64, u64)> {
+        slices
+            .iter()
+            .enumerate()
+            .map(|(i, &measured)| (SliceId::new(i as u32), measured))
+            .collect()
+    }
+
+    #[test]
+    fn a_job_is_summed_from_the_loops_slice_means() {
+        // Means 50, 300 and 10; the slice never measured adds nothing and is
+        // said.
+        let measured = means(&[(100, 2), (900, 3), (0, 0), (10, 1)]);
+        let capacity = Capacity::of(&measured, 4, Some(4_300), 10);
+        assert_eq!(capacity.run_us, 360);
+        assert_eq!((capacity.measured, capacity.slices), (3, 4));
+        assert_eq!(capacity.frames(), Some(1));
+        assert_eq!(capacity.available(), 11);
+        assert_eq!(capacity.verdict(), "not_ruled_out");
+        assert_eq!(
+            capacity.line(),
+            "in_loop_run_us=360 slice_budget_us=4300 frames=1 frames_promised=10 \
+             frames_available=11 slices_measured=3 of 4 verdict=not_ruled_out"
+        );
+        // The means are summed before rounding: four of 0.5 are 2, not four
+        // times a rounded 1.
+        let halves = means(&[(1, 2), (1, 2), (1, 2), (1, 2)]);
+        assert_eq!(Capacity::of(&halves, 4, Some(10), 1).run_us, 2);
+    }
+
+    #[test]
+    fn a_job_needing_more_frames_than_it_has_is_infeasible_at_any_estimate() {
+        // A job of two slices at 27 ms each in the loop, against the 4 334 us
+        // a frame of a 120 Hz display leaves: 12.46 frames, so 13.
+        let measured = means(&[(54_000, 2), (27_000, 1)]);
+        let at = |promised| Capacity::of(&measured, 2, Some(4_334), promised);
+        assert_eq!(at(10).run_us, 54_000);
+        assert_eq!(at(10).frames(), Some(13));
+        assert_eq!(at(10).verdict(), "infeasible");
+        // The deadline frame counts: 12 frames promised are 13 frames to run in.
+        assert_eq!(at(11).verdict(), "infeasible");
+        assert_eq!(at(12).verdict(), "not_ruled_out");
+        assert!(
+            at(10)
+                .line()
+                .contains("frames=13 frames_promised=10 frames_available=11")
+        );
+        assert!(at(10).line().ends_with("verdict=infeasible"));
+        // An exact multiple needs no more frame.
+        assert_eq!(
+            Capacity::of(&measured, 2, Some(54_000), 0).frames(),
+            Some(1)
+        );
+        assert_eq!(
+            Capacity::of(&measured, 2, Some(27_000), 1).frames(),
+            Some(2)
+        );
+        assert_eq!(
+            Capacity::of(&measured, 2, Some(27_000), 1).verdict(),
+            "not_ruled_out"
+        );
+    }
+
+    #[test]
+    fn without_a_budget_or_a_measurement_the_capacity_says_none() {
+        let measured = means(&[(100, 1)]);
+        for capacity in [
+            Capacity::of(&measured, 1, None, 5),
+            Capacity::of(&measured, 1, Some(0), 5),
+            Capacity::of(&means(&[(0, 0)]), 1, Some(4_000), 5),
+            Capacity::of(&BTreeMap::new(), 0, Some(4_000), 5),
+        ] {
+            assert_eq!(capacity.verdict(), "none", "{capacity:?}");
+            assert!(capacity.line().ends_with("verdict=none"));
+        }
+        let said = Capacity::of(&measured, 1, None, 5).line();
+        assert!(said.contains("slice_budget_us=none frames=none"), "{said}");
     }
 
     fn facts() -> Facts {

@@ -71,6 +71,24 @@ pub enum TimerError {
     RenderPassAlreadyTimed,
 }
 
+/// When one pass began and ended, in nanoseconds on the queue's timestamp
+/// clock: the two timestamps its duration was computed from, converted with
+/// the queue's period but not otherwise changed.
+///
+/// A duration says how long a pass's boundaries were apart; only the
+/// timestamps say where the pass sat against the passes before it, such as
+/// whether it began the moment the previous one ended, or before. The clock's
+/// origin is the implementation's, so only differences between timestamps
+/// mean anything, and a host that compares timestamps of different frames
+/// relies on their queries resolving on one clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PassSpan {
+    /// The pass's beginning-of-pass timestamp, in nanoseconds.
+    pub begin_ns: u64,
+    /// The pass's end-of-pass timestamp, in nanoseconds.
+    pub end_ns: u64,
+}
+
 /// What one frame's passes took on the GPU.
 ///
 /// `T` is whatever the host attached to each compute pass, so a measurement
@@ -85,6 +103,11 @@ pub struct FrameTiming<T> {
     pub compute: Vec<(T, Micros)>,
     /// The duration of the render pass, when the frame timed one.
     pub render: Option<Micros>,
+    /// The timestamps of each entry of [`compute`](Self::compute), in the
+    /// same order.
+    pub compute_spans: Vec<PassSpan>,
+    /// The timestamps of the render pass, when the frame timed one.
+    pub render_span: Option<PassSpan>,
 }
 
 /// Counts of what the timer could and could not measure.
@@ -514,21 +537,59 @@ fn decode<T>(
     period_ns: f32,
 ) -> FrameTiming<T> {
     let mut compute = Vec::new();
+    let mut compute_spans = Vec::new();
     let mut render = None;
+    let mut render_span = None;
     for (k, entry) in entries.into_iter().enumerate() {
         let (Some(&begin), Some(&end)) = (ticks.get(k * 2), ticks.get(k * 2 + 1)) else {
             continue;
         };
         let duration = ticks_to_micros(begin, end, period_ns);
+        let span = PassSpan {
+            begin_ns: ticks_to_nanos(begin, period_ns),
+            end_ns: ticks_to_nanos(end, period_ns),
+        };
         match entry {
-            Entry::Compute(tag) => compute.push((tag, duration)),
-            Entry::Render => render = Some(duration),
+            Entry::Compute(tag) => {
+                compute.push((tag, duration));
+                compute_spans.push(span);
+            }
+            Entry::Render => {
+                render = Some(duration);
+                render_span = Some(span);
+            }
         }
     }
     FrameTiming {
         frame,
         compute,
         render,
+        compute_spans,
+        render_span,
+    }
+}
+
+/// A timestamp of `ticks` in nanoseconds, rounded to nearest, at `period_ns`
+/// nanoseconds per tick. One nanosecond per tick, what WebGPU reports, keeps
+/// the value exact; a product past `u64` saturates.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::float_cmp
+)]
+fn ticks_to_nanos(ticks: u64, period_ns: f32) -> u64 {
+    const U64_LIMIT: f64 = 18_446_744_073_709_551_616.0; // 2^64
+    if period_ns == 1.0 {
+        return ticks;
+    }
+    let nanos = (ticks as f64 * f64::from(period_ns)).round();
+    if nanos.is_nan() || nanos <= 0.0 {
+        0
+    } else if nanos >= U64_LIMIT {
+        u64::MAX
+    } else {
+        nanos as u64
     }
 }
 
@@ -614,6 +675,12 @@ mod tests {
             vec![("a", Micros::new(1_000)), ("b", Micros::new(3_000))]
         );
         assert_eq!(timing.render, Some(Micros::new(5_000)));
+        let span = |begin_ns, end_ns| PassSpan { begin_ns, end_ns };
+        assert_eq!(
+            timing.compute_spans,
+            vec![span(0, 1_000_000), span(1_000_000, 4_000_000)]
+        );
+        assert_eq!(timing.render_span, Some(span(4_000_000, 9_000_000)));
     }
 
     #[test]
@@ -621,7 +688,19 @@ mod tests {
         let entries = vec![Entry::Compute(1u32), Entry::Compute(2u32)];
         let timing = decode(FrameIndex::new(0), entries, &[0, 1_000], 1_000.0);
         assert_eq!(timing.compute, vec![(1, Micros::new(1_000))]);
+        assert_eq!(timing.compute_spans.len(), 1);
         assert_eq!(timing.render, None);
+        assert_eq!(timing.render_span, None);
+    }
+
+    #[test]
+    fn timestamps_convert_to_nanoseconds_exactly_at_one_per_tick() {
+        // Past 2^53, where a round trip through f64 would lose the low bits.
+        let large = (1_u64 << 60) + 1;
+        assert_eq!(ticks_to_nanos(large, 1.0), large);
+        assert_eq!(ticks_to_nanos(24_000, 41.666_668), 1_000_000);
+        assert_eq!(ticks_to_nanos(u64::MAX, f32::MAX), u64::MAX);
+        assert_eq!(ticks_to_nanos(0, 41.666_668), 0);
     }
 
     #[test]
@@ -669,6 +748,9 @@ mod tests {
         assert_eq!(ready[0].frame, FrameIndex::new(0));
         assert_eq!(ready[0].compute.len(), 1);
         assert_eq!(ready[0].compute[0].0, 7);
+        assert_eq!(ready[0].compute_spans.len(), 1);
+        let span = ready[0].compute_spans[0];
+        assert!(span.end_ns >= span.begin_ns, "{span:?}");
         assert_eq!(timer.in_flight(), 0);
     }
 }
