@@ -20,9 +20,11 @@
 //! ```
 //!
 //! then open `http://127.0.0.1:8000/?frames=600&latency=2` in a browser with
-//! WebGPU. The run starts when the page loads; the report replaces the text
-//! under the canvas when it ends, with `status: done` as its last line, and is
-//! logged to the console. An error ends the report with `error:` and
+//! WebGPU; a run long enough that a display's departure from exactly 60 Hz
+//! would show in `frames_dropped` and `frame_start_lateness_us`, were the
+//! pacing to drift, is `?frames=3000`. The run starts when the page loads; the
+//! report replaces the text under the canvas when it ends, with `status: done`
+//! as its last line, and is logged to the console. An error ends the report with `error:` and
 //! `status: failed`.
 //!
 //! The query string takes `frames` (default 600) and `latency` (default 2),
@@ -46,9 +48,11 @@
 //! side of a frame"), and each step is the bench's synchronous `tick`. One
 //! `requestAnimationFrame` callback runs:
 //!
-//! 0. **Pace.** Read `performance.now()` and ask the pacer whether this
-//!    callback is a frame ([`pace`] has the rule). If it is not, ask for the
-//!    next callback and return.
+//! 0. **Pace.** The callback is the frame. Give the pacer the callback's
+//!    timestamp argument: it returns the frame's index, its start and the
+//!    display's period, which the budget and the core's `FrameInfo` take
+//!    ([`pace`] has the rule, and why the timestamp and not a fresh clock
+//!    reading).
 //! 1. **Decide.** Set this frame's budget from the last render measured and
 //!    the forecast of later frames from the median of the recent renders,
 //!    submit the frame's input as a job of [`config::SLICES`] slices under
@@ -79,13 +83,21 @@
 //! # What differs from the native bench, and why
 //!
 //! - **Pacing.** The browser chooses when a callback runs, at the display's
-//!   rate; the bench sleeps until the next period. The frame index is the
-//!   bench's rule (the 60 Hz period a frame began in, with the periods a late
-//!   frame overran given up), and a callback in a period that already had its
-//!   frame is not one, because a display faster than 60 Hz calls back more
-//!   often. `frame_start_lateness_us` is measured from the phase the first
-//!   callback set rather than from the period's boundary ([`pace`] says why).
-//!   A page in a background tab gets no callbacks, and its periods are dropped.
+//!   rate; the bench sleeps until the next period of a fixed 60 Hz grid. Here
+//!   every callback is a frame, it starts at the callback's timestamp, and its
+//!   period is the display's, the median of the per-period intervals between
+//!   callbacks ([`pace`] has the rule and why a fixed grid was dropped: a display that
+//!   is not exactly 60.000 Hz drifts off it and a healthy run is counted as
+//!   dropping frames). The native bench keeps its grid, which its published
+//!   measurements were made with. The consequences are in the report: the
+//!   frame budget is the display's period less the render and the margin, so
+//!   at 120 Hz it is about 8.3 ms less than at 60 Hz, and a latency promised in
+//!   `k` frames is `k` display periods, half the time at 120 Hz; the report
+//!   states the period (`display_period_us`) so runs compare only at the same
+//!   one. `frames_dropped`, `frame_start_lateness_us`, `promised_latency_ms`
+//!   and `gpu_frames_over_period` keep their names with the meaning the
+//!   [`report`] documentation gives. A page in a background tab gets no
+//!   callbacks, and its periods are dropped.
 //! - **Waiting.** A page can never block, so the warm-up is awaited on the
 //!   event loop before the first frame, and the timings still in flight after
 //!   the last frame are collected over one second of further callbacks

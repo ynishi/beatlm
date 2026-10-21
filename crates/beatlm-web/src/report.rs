@@ -6,9 +6,33 @@
 //! (`beatlm-bench`'s `report.rs`), so a browser report and a native one compare
 //! line by line; percentiles come from the bench's own `stats.rs`. The lines
 //! only a browser has say where it ran (`user_agent`, `date`), what the device
-//! was given (`timestamp_query`, the limits) and what went wrong on the GPU
+//! was given (`timestamp_query`, the limits), what the display did
+//! (`display_period_us`, `callback_interval_us`) and what went wrong on the GPU
 //! (`gpu_errors`). The last line is `status: done`, so a reader can tell a
 //! finished report from one still being written.
+//!
+//! Four shared lines keep their names and change their meaning, because the
+//! browser's frame is the display's callback and not a slot on a 60 Hz grid
+//! ([`crate::pace`] has the rule), so they compare with a native run only at a
+//! display period of 16.7 ms:
+//!
+//! - `frames_dropped` counts the periods a callback gap of more than 1.5
+//!   periods gave up, at the display's period; with `frames` it is the number
+//!   of frames a run that completed was asked for.
+//! - `frame_start_lateness_us` is the part of the gap since the previous
+//!   callback that the periods it counted as do not explain.
+//! - `promised_latency_ms` is the promised frames at the display's period,
+//!   which is half as long at 120 Hz.
+//! - `gpu_frames_over_period` holds a frame to the display's period.
+//!
+//! `display_period_us` is the period as measured at the end of the run, the
+//! median of the last per-period callback intervals, so that a host which
+//! overran its frames does not read as a slower display and timestamp jitter
+//! does not read as a faster one ([`crate::pace`] says how); the frames before
+//! it was measured were given the nominal 60 Hz one, and frames of a display
+//! that changed rate were given the rate of their time. `promised_latency_ms` and
+//! `gpu_frames_over_period` take this one period for the whole run.
+//! `callback_interval_us` is the spread of the raw intervals, stalls included.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -18,7 +42,7 @@ use beatlm_core::cost::SliceId;
 use beatlm_core::time::Micros;
 
 use crate::config::{Config, MARGIN_US, SLICES};
-use crate::pace::FRAME_PERIOD;
+use crate::pace::NOMINAL_PERIOD;
 use crate::stats::{histogram, summarize};
 use crate::workload::{DEFAULT_RENDER_ITERS, DEFAULT_SLICE_ITERS};
 
@@ -78,10 +102,19 @@ pub struct Outcome {
     pub dispatches_per_frame: Vec<u64>,
     /// Compute dispatches encoded for each delivered job.
     pub dispatches_per_job: Vec<u64>,
-    /// How late each frame began after its on-time phase, in microseconds.
+    /// How late each frame's callback came after the time the previous
+    /// callback and the periods its gap counted as put it at, in microseconds
+    /// ([`crate::pace`] defines it).
     pub lateness_us: Vec<u64>,
-    /// Frame periods given up because a frame began whole periods late.
+    /// Frame periods given up because a callback came more than 1.5 periods
+    /// after the one before.
     pub dropped: u64,
+    /// The display's period as measured from the callbacks, in microseconds;
+    /// `None` when the run was too short to measure it, and then the frames
+    /// were given the nominal period.
+    pub display_period_us: Option<u64>,
+    /// Every interval between consecutive callbacks, in microseconds.
+    pub interval_us: Vec<u64>,
     /// Render plus every slice measured in the same frame, per timed frame, in
     /// microseconds.
     pub gpu_frame_us: Vec<u64>,
@@ -171,10 +204,15 @@ fn write_report(
         Some(bytes) => writeln!(out, " arena_bytes={bytes}")?,
         None => writeln!(out)?,
     }
+    match outcome.display_period_us {
+        Some(us) => writeln!(out, "display_period_us: {us}")?,
+        None => writeln!(out, "display_period_us: none")?,
+    }
+    let period = period_of(outcome);
     writeln!(
         out,
         "promised_latency_ms: {:.1}",
-        promised_latency_ms(config.latency)
+        promised_latency_ms(config.latency, period)
     )?;
     writeln!(out, "frames: {}", outcome.cpu_us.len())?;
     writeln!(out, "frames_dropped: {}", outcome.dropped)?;
@@ -196,6 +234,7 @@ fn write_report(
     }
     write_summary(out, "dispatches_per_job", &outcome.dispatches_per_job)?;
     write_summary(out, "dispatches_per_frame", &outcome.dispatches_per_frame)?;
+    write_summary(out, "callback_interval_us", &outcome.interval_us)?;
     write_summary(out, "frame_start_lateness_us", &outcome.lateness_us)?;
     write_summary(out, "cpu_start_to_submit_us", &outcome.cpu_us)?;
     write_summary(out, "cpu_start_to_tick_end_us", &outcome.tick_us)?;
@@ -207,7 +246,7 @@ fn write_report(
     writeln!(
         out,
         "gpu_frames_over_period: {} of {}",
-        gpu_frames_over_period(&outcome.gpu_frame_us),
+        gpu_frames_over_period(&outcome.gpu_frame_us, period),
         outcome.gpu_frame_us.len()
     )?;
     for (slice, estimate) in &outcome.estimates {
@@ -270,18 +309,26 @@ fn delivery_rate(delivered: u64, missed: u64) -> Option<f64> {
     (total > 0).then(|| delivered as f64 / total as f64)
 }
 
-/// The promised latency of `frames` frames at the period, in milliseconds.
-#[allow(clippy::cast_precision_loss)]
-fn promised_latency_ms(frames: u32) -> f64 {
-    f64::from(frames) * FRAME_PERIOD.get() as f64 / 1_000.0
+/// The period the run's frames were given: the display's as measured, or the
+/// nominal one when the run was too short to measure it.
+fn period_of(outcome: &Outcome) -> Micros {
+    outcome
+        .display_period_us
+        .map_or(NOMINAL_PERIOD, Micros::new)
 }
 
-/// Timed frames whose render plus slices took longer than the frame period.
-fn gpu_frames_over_period(gpu_frame_us: &[u64]) -> usize {
-    gpu_frame_us
-        .iter()
-        .filter(|&&us| us > FRAME_PERIOD.get())
-        .count()
+/// The promised latency of `frames` frames of `period`, in milliseconds. The
+/// time a promise in frames is worth follows the display, so this is not the
+/// bench's figure unless the display is 60 Hz.
+#[allow(clippy::cast_precision_loss)]
+fn promised_latency_ms(frames: u32, period: Micros) -> f64 {
+    f64::from(frames) * period.get() as f64 / 1_000.0
+}
+
+/// Timed frames whose render plus slices took longer than the frame `period`,
+/// the display's, so a 120 Hz run is held to 8.3 ms.
+fn gpu_frames_over_period(gpu_frame_us: &[u64], period: Micros) -> usize {
+    gpu_frame_us.iter().filter(|&&us| us > period.get()).count()
 }
 
 #[cfg(test)]
@@ -325,6 +372,7 @@ mod tests {
         );
         assert_eq!(line(&text, "gpu_frames_over_period"), Some("1 of 3"));
         assert_eq!(line(&text, "promised_latency_ms"), Some("33.3"));
+        assert_eq!(line(&text, "display_period_us"), Some("none"));
         assert_eq!(
             line(&text, "config"),
             Some(
@@ -365,15 +413,38 @@ mod tests {
     }
 
     #[test]
-    fn the_period_and_the_promise_are_the_benchs() {
-        assert_eq!(promised_latency_ms(0), 0.0);
-        assert!((promised_latency_ms(5) - 83.335).abs() < 1e-9);
-        let period = FRAME_PERIOD.get();
-        assert_eq!(
-            gpu_frames_over_period(&[period - 1, period, period + 1, period * 2]),
-            2
-        );
+    fn the_promise_and_the_period_follow_the_display() {
+        assert_eq!(promised_latency_ms(0, NOMINAL_PERIOD), 0.0);
+        assert!((promised_latency_ms(5, NOMINAL_PERIOD) - 83.335).abs() < 1e-9);
+        assert!((promised_latency_ms(2, Micros::new(8_333)) - 16.666).abs() < 1e-9);
+        let period = NOMINAL_PERIOD;
+        let over = [
+            period.get() - 1,
+            period.get(),
+            period.get() + 1,
+            period.get() * 2,
+        ];
+        assert_eq!(gpu_frames_over_period(&over, period), 2);
+        assert_eq!(gpu_frames_over_period(&over, Micros::new(8_333)), 4);
         assert_eq!(delivery_rate(0, 0), None);
         assert_eq!(delivery_rate(5, 0), Some(1.0));
+    }
+
+    #[test]
+    fn a_measured_display_period_is_reported_and_sets_the_promise() {
+        let outcome = Outcome {
+            display_period_us: Some(8_333),
+            interval_us: vec![8_300, 8_400, 8_333],
+            gpu_frame_us: vec![8_000, 9_000],
+            ..Outcome::default()
+        };
+        let text = report(&Environment::default(), &outcome);
+        assert_eq!(line(&text, "display_period_us"), Some("8333"));
+        assert_eq!(line(&text, "promised_latency_ms"), Some("16.7"));
+        assert_eq!(
+            line(&text, "callback_interval_us"),
+            Some("p50=8333 p99=8400 max=8400")
+        );
+        assert_eq!(line(&text, "gpu_frames_over_period"), Some("1 of 2"));
     }
 }
