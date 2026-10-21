@@ -74,6 +74,10 @@ and this project adheres to
 - `beatlm-bench --workload depth`, `--size` and `--submit every|free`: the real
   model under the fixed-latency promise; the measured default is 266 px at a
   latency of 5 frames on Apple M1 Pro.
+- `beatlm-web`: a browser host driving the engine from
+  `requestAnimationFrame` over WebGPU, with `just setup-web`, `build-web` and
+  `serve-web`; `beatlm::gpu::required_limits` asks the adapter for exactly what
+  a plan needs.
 
 ### Changed
 
