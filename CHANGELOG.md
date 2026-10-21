@@ -78,6 +78,13 @@ and this project adheres to
   `requestAnimationFrame` over WebGPU, with `just setup-web`, `build-web` and
   `serve-web`; `beatlm::gpu::required_limits` asks the adapter for exactly what
   a plan needs.
+- `beatlm-web --model depth`: Depth Anything V2 Small in the browser, with the
+  weights served locally by `just serve-web` under `/models/` (never in the
+  build output), checked against the reference at the same side, and
+  `latency_ms` for a promise in time.
+- `beatlm::load::depth_anything_v2::reference`: the reference input, file
+  layout, tolerances and error measures shared by the native test and the
+  page.
 
 ### Changed
 
