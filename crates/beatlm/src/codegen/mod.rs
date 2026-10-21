@@ -32,10 +32,30 @@
 //!   pipeline constant; the launch geometry (workgroup size and count) is the
 //!   core's [`Requirements`](beatlm_core::kernel::Requirements), which the
 //!   template reads rather than restates.
+//! - **A part's range is a pipeline-overridable constant.** A kernel the core
+//!   split ([`Program::split`](beatlm_core::kernel::Program::split)) is the
+//!   same text for every part: each template declares the range of the output
+//!   it walks as WGSL `override`s defaulting to the whole kernel, and
+//!   [`constants`] gives a part's values, which [`Kernels`] sets on that part's
+//!   pipeline. [`generate`] checks them against the overrides naga parsed from
+//!   the text, so every part is validated, not only the text.
+//!
+//! The part's range could have been a uniform instead. Overrides were chosen
+//! because the range of a part never changes after the plan is made, and an
+//! override makes it part of the pipeline: the steady-state loop binds and
+//! dispatches what exists and writes no buffer, no buffer outside the memory
+//! plan's arenas is created for it, no binding is added to kernels whose
+//! storage bindings fusion already fills to the baseline's limit, and the
+//! shader compiler sees the range as a constant. The price is one pipeline and
+//! one bind group per part rather than per kernel, all created before the
+//! loop; the parts of a kernel share one shader module, because the text is
+//! the same. A uniform per part would have needed one pipeline per kernel, and
+//! a buffer per part made and filled before the loop.
 //!
 //! [`Kernels`] creates every pipeline and bind group of a program once, before
-//! the frame loop, so the loop only records passes. Why fusion pays, with the
-//! measurement, is in the [`beatlm_core::kernel`] documentation.
+//! the frame loop, so the loop only records passes. Why fusion and splitting
+//! pay, with the measurements, is in the [`beatlm_core::kernel`]
+//! documentation.
 
 mod kernels;
 mod wgsl;
@@ -108,26 +128,87 @@ pub enum CodegenError {
     /// An index past the binding sets a [`Kernels`] was built with.
     #[error("there is no binding set {0}")]
     NoSuchSet(usize),
+    /// A part's constants do not match the overrides the text declares: a
+    /// value for a name the text lacks or declares as other than `u32`, or an
+    /// override left without a value.
+    #[error(
+        "generated WGSL for kernel {kernel} does not declare `override {name}: u32` once, or declares it and the part gives it no value"
+    )]
+    PartConstant {
+        /// The kernel's name.
+        kernel: String,
+        /// The constant's name.
+        name: String,
+        /// The generated text.
+        wgsl: String,
+    },
 }
 
 /// The WGSL text of `variant` of `spec`, unvalidated, for inspection.
 ///
-/// A pure function: the same spec and variant give the same text. [`generate`]
-/// is the same text, validated.
+/// A pure function of the kernel: the same kernel and variant give the same
+/// text, and so does every part of a split kernel, whose range is in
+/// [`constants`]. [`generate`] is the same text, validated.
 #[must_use]
 pub fn wgsl(spec: &KernelSpec, variant: Variant) -> String {
     wgsl::text(spec, variant)
 }
 
+/// The pipeline-overridable constants that make a dispatch of the text of
+/// `variant` of `spec` compute `spec`'s part, as `(name, value)`, in the form
+/// [`wgpu::PipelineCompilationOptions::constants`] takes.
+///
+/// A whole kernel's values are the text's defaults.
+#[must_use]
+pub fn constants(spec: &KernelSpec, variant: Variant) -> Vec<(&'static str, f64)> {
+    wgsl::part_constants(spec, variant)
+        .into_iter()
+        .map(|(name, value)| (name, f64::from(value)))
+        .collect()
+}
+
 /// The WGSL text of `variant` of `spec`, parsed and validated by naga with
-/// the capabilities the variant's features grant.
+/// the capabilities the variant's features grant, and with `spec`'s
+/// [`constants`] checked against the overrides the parsed module declares:
+/// each names one `u32` override, and each override has a value.
+///
+/// A part's values change no type or size in the text, so a text that
+/// validates with its defaults validates with any part's; naga's override
+/// substitution is not in this crate's naga features, and wgpu performs it,
+/// and validates the result again, when it creates the part's pipeline.
 ///
 /// # Errors
 ///
-/// [`CodegenError::Parse`] or [`CodegenError::Validation`], with the text.
+/// [`CodegenError::Parse`] or [`CodegenError::Validation`], with the text, or
+/// [`CodegenError::PartConstant`].
 pub fn generate(spec: &KernelSpec, variant: Variant) -> Result<String, CodegenError> {
+    let kernel = spec.name();
     let text = wgsl(spec, variant);
-    validate(&spec.name(), &text, spec.requirements(variant).features)?;
+    let module = parse_and_validate(&kernel, &text, spec.requirements(variant).features)?;
+    let constants = constants(spec, variant);
+    let error = |name: &str| CodegenError::PartConstant {
+        kernel: kernel.clone(),
+        name: name.to_owned(),
+        wgsl: text.clone(),
+    };
+    // Every override the text declares is a u32 the part gives one value...
+    for (_, o) in module.overrides.iter() {
+        let name = o.name.as_deref().unwrap_or_default();
+        let is_u32 = module.types[o.ty].inner == naga::TypeInner::Scalar(naga::Scalar::U32);
+        if !is_u32 || constants.iter().filter(|(c, _)| *c == name).count() != 1 {
+            return Err(error(name));
+        }
+    }
+    // ...and every value the part gives names one of them.
+    let declared = |name: &str| {
+        module
+            .overrides
+            .iter()
+            .any(|(_, o)| o.name.as_deref() == Some(name))
+    };
+    if let Some((name, _)) = constants.iter().find(|(c, _)| !declared(c)) {
+        return Err(error(name));
+    }
     Ok(text)
 }
 
@@ -140,6 +221,15 @@ pub fn generate(spec: &KernelSpec, variant: Variant) -> Result<String, CodegenEr
 /// [`CodegenError::Validation`] when the module does not validate; both carry
 /// naga's diagnostic and the text.
 pub fn validate(kernel: &str, wgsl: &str, features: DeviceFeatures) -> Result<(), CodegenError> {
+    parse_and_validate(kernel, wgsl, features).map(drop)
+}
+
+/// [`validate`], returning the parsed module.
+fn parse_and_validate(
+    kernel: &str,
+    wgsl: &str,
+    features: DeviceFeatures,
+) -> Result<naga::Module, CodegenError> {
     let module = naga::front::wgsl::parse_str(wgsl).map_err(|e| CodegenError::Parse {
         kernel: kernel.to_owned(),
         diagnostic: e.emit_to_string(wgsl),
@@ -152,7 +242,7 @@ pub fn validate(kernel: &str, wgsl: &str, features: DeviceFeatures) -> Result<()
             diagnostic: e.emit_to_string(wgsl),
             wgsl: wgsl.to_owned(),
         })?;
-    Ok(())
+    Ok(module)
 }
 
 /// The naga capabilities a kernel with `features` may use: none beyond the
@@ -360,6 +450,66 @@ mod tests {
         ] {
             assert!(names.contains(name), "{name} in {names:?}");
         }
+    }
+
+    #[test]
+    fn every_part_of_every_split_kernel_validates_and_shares_its_kernels_text() {
+        for (inputs, heavy, out) in heavies() {
+            let elements = u32::try_from(out).unwrap();
+            for steps in epilogues(elements) {
+                for fusion in [Fusion::On, Fusion::Off] {
+                    let whole = program(&inputs, heavy, out, &steps, fusion);
+                    // 64 is more parts than the convolution, the layer norm
+                    // and the matrix multiply allow, so it is clamped.
+                    for count in [2, 3, 7, 64] {
+                        let split = whole.split(&vec![count; whole.kernels().len()]).unwrap();
+                        for part in split.kernels() {
+                            let what = format!("{} split {count} ways", part.name());
+                            let text = generate(part, Variant::Baseline)
+                                .unwrap_or_else(|e| panic!("{what}: {e}"));
+                            assert_eq!(text, wgsl(&part.whole(), Variant::Baseline), "{what}");
+                            let values = constants(part, Variant::Baseline);
+                            let start = values.iter().find(|(n, _)| *n == "PART_START").unwrap().1;
+                            let end = values.iter().find(|(n, _)| *n == "PART_END").unwrap().1;
+                            assert!(start < end, "{what}: {values:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_whole_kernels_constants_are_the_texts_defaults() {
+        for (inputs, heavy, out) in heavies() {
+            let p = program(&inputs, heavy, out, &[], Fusion::On);
+            let spec = &p.kernels()[0];
+            let text = generate(spec, Variant::Baseline).unwrap();
+            for (name, value) in constants(spec, Variant::Baseline) {
+                let declaration = format!("override {name}: u32 = {value}u;");
+                assert!(text.contains(&declaration), "{declaration} in\n{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_parts_of_a_kernel_carry_their_own_ranges() {
+        // A layer norm of 11 rows in three parts: rows 0..3, 3..7, 7..11.
+        let (inputs, heavy, out) = heavies().remove(2);
+        let p = program(&inputs, heavy, out, &[], Fusion::On);
+        let split = p.split(&[3]).unwrap();
+        let ranges: Vec<(f64, f64, f64)> = split
+            .kernels()
+            .iter()
+            .map(|k| {
+                let c = constants(k, Variant::Baseline);
+                (c[0].1, c[1].1, c[2].1)
+            })
+            .collect();
+        assert_eq!(
+            ranges,
+            vec![(0.0, 3.0, 3.0), (3.0, 7.0, 4.0), (7.0, 11.0, 4.0)]
+        );
     }
 
     #[test]

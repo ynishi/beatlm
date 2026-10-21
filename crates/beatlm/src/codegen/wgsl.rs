@@ -1,10 +1,14 @@
 //! The templates: one per main operation, sharing a header, the binding
-//! declarations and the epilogue hook.
+//! declarations, the part's range and the epilogue hook.
 //!
 //! Every template computes one value per output element and stores it as
 //! `out[i] = epilogue(value, i)`; [`epilogue`] writes that function from the
 //! spec's steps, so the templates know nothing about fusion. Layouts are the
 //! ones [`beatlm_core::kernel`] documents.
+//!
+//! Every template also walks only its part's range of the output, read from
+//! the constants [`part_constants`] names, so the text is the whole kernel's
+//! and one shader module serves every part.
 
 use std::fmt::Write as _;
 
@@ -16,23 +20,81 @@ use beatlm_core::memory::TensorId;
 
 use super::ENTRY_POINT;
 
-/// The whole text of `variant` of `spec`.
+/// First unit of the part: an output element for the convolution and the map,
+/// a row for the layer norm and the matrix multiply.
+const PART_START: &str = "PART_START";
+/// One past the last unit of the part, in the unit of [`PART_START`].
+const PART_END: &str = "PART_END";
+/// Width of the part's grid of workgroups, for the templates that number work
+/// over rows of workgroups: the `x` of the part's dispatch.
+const PART_GRID_ROW: &str = "PART_GRID_ROW";
+
+/// The whole text of `variant` of the kernel `spec` is a part of. Every part of
+/// a kernel has the same text.
 pub(super) fn text(spec: &KernelSpec, variant: Variant) -> String {
+    let spec = &spec.whole();
     let req = spec.requirements(variant);
     let names = Names {
         bindings: spec.bindings(),
     };
     let mut out = String::new();
     header(&mut out, spec, variant, &req, &names);
+    overrides(&mut out, spec, variant);
     epilogue(&mut out, spec.epilogue(), &names);
     let y = names.of(spec.output());
     match *spec.main() {
         MainOp::Conv2d3x3(c) => conv(&mut out, &c, &req, &names, &y),
         MainOp::LayerNorm(l) => layer_norm(&mut out, &l, &req, &names, &y),
         MainOp::MatMul(mm) => matmul(&mut out, &mm, &req, &names, &y),
-        MainOp::Map { input, elements } => map(&mut out, &names.of(input), elements, &req, &y),
+        MainOp::Map { input, .. } => map(&mut out, &names.of(input), &req, &y),
     }
     out
+}
+
+/// The pipeline-overridable constants of `variant` of `spec`'s template, with
+/// the values that make a dispatch compute `spec`'s part, in declaration order.
+///
+/// Values are `u32`: the core bounds every output by `MAX_ELEMENTS`, below
+/// `u32::MAX`, and a dispatch's grid by the workgroups per dimension.
+pub(super) fn part_constants(spec: &KernelSpec, variant: Variant) -> Vec<(&'static str, u32)> {
+    let narrow = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
+    let req = spec.requirements(variant);
+    let rows = spec.part().range();
+    match spec.main() {
+        MainOp::Conv2d3x3(_) | MainOp::Map { .. } => {
+            let elements = spec.output_range();
+            vec![
+                (PART_START, narrow(elements.start)),
+                (PART_END, narrow(elements.end)),
+                (PART_GRID_ROW, req.workgroups[0]),
+            ]
+        }
+        MainOp::LayerNorm(_) => vec![
+            (PART_START, rows.start),
+            (PART_END, rows.end),
+            (PART_GRID_ROW, req.workgroups[0]),
+        ],
+        MainOp::MatMul(_) => vec![(PART_START, rows.start), (PART_END, rows.end)],
+    }
+}
+
+/// The declarations of the part's range, defaulting to the whole kernel, so
+/// the text alone is the unsplit kernel and a pipeline that sets the
+/// constants runs one part of it.
+fn overrides(out: &mut String, whole: &KernelSpec, variant: Variant) {
+    let unit = match whole.main() {
+        MainOp::Conv2d3x3(_) | MainOp::Map { .. } => "output elements",
+        MainOp::LayerNorm(_) | MainOp::MatMul(_) => "rows",
+    };
+    let _ = writeln!(
+        out,
+        "// The part of the output one dispatch computes, in {unit}, set per part as\n\
+         // pipeline-overridable constants. The defaults are the whole kernel."
+    );
+    for (name, value) in part_constants(whole, variant) {
+        let _ = writeln!(out, "override {name}: u32 = {value}u;");
+    }
+    let _ = writeln!(out);
 }
 
 /// Binding names: binding `i` is `t{i}`, in the order of
@@ -106,8 +168,8 @@ fn header(
     );
     let _ = writeln!(
         out,
-        "// Workgroup size {:?}, dispatched as {:?} workgroups; {} bytes of workgroup memory.",
-        req.workgroup_size, req.workgroups, req.workgroup_storage_bytes
+        "// Workgroup size {:?}, {} bytes of workgroup memory; the whole kernel is {:?} workgroups.",
+        req.workgroup_size, req.workgroup_storage_bytes, req.workgroups
     );
     let _ = writeln!(out, "//");
     let _ = writeln!(
@@ -168,10 +230,10 @@ fn entry(req: &Requirements) -> String {
     format!("@compute @workgroup_size({x}, {y}, {z})\nfn {ENTRY_POINT}(")
 }
 
-/// One invocation per output element, numbered in memory order (channel
-/// fastest) over a grid of rows `workgroups[0]` workgroups wide.
+/// One invocation per output element of the part, numbered in memory order
+/// (channel fastest) from the part's first element over a grid of rows
+/// `PART_GRID_ROW` workgroups wide.
 fn conv(out: &mut String, c: &Conv2d3x3, req: &Requirements, names: &Names, y: &str) {
-    let elements = u64::from(c.height) * u64::from(c.width) * u64::from(c.cout);
     let bias = c.bias.map_or(String::new(), |b| {
         format!("    acc = acc + {}[co];\n", names.of(b))
     });
@@ -182,17 +244,15 @@ const H: u32 = {h}u;
 const W: u32 = {w}u;
 const CIN: u32 = {cin}u;
 const COUT: u32 = {cout}u;
-const ELEMENTS: u32 = {elements}u;
 const GROUP: u32 = {group}u;
-const ROW: u32 = {row}u;
 
 // 3x3 convolution, stride 1, zero padding of 1: NHWC input, HWIO weights.
 {entry}
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_index) lane: u32,
 ) {{
-    let element = (wid.y * ROW + wid.x) * GROUP + lane;
-    if (element >= ELEMENTS) {{
+    let element = {PART_START} + (wid.y * {PART_GRID_ROW} + wid.x) * GROUP + lane;
+    if (element >= {PART_END}) {{
         return;
     }}
     let co = element % COUT;
@@ -225,25 +285,22 @@ const ROW: u32 = {row}u;
         cin = c.cin,
         cout = c.cout,
         group = req.workgroup_size[0],
-        row = req.workgroups[0],
         entry = entry(req),
         x = names.of(c.input),
         wt = names.of(c.weights),
     );
 }
 
-/// One workgroup per row: its invocations stride over the channels and
-/// reduce through workgroup memory. Rows are numbered over a grid of rows
-/// `workgroups[0]` workgroups wide.
+/// One workgroup per row of the part: its invocations stride over the
+/// channels and reduce through workgroup memory. Rows are numbered from the
+/// part's first row over a grid of rows `PART_GRID_ROW` workgroups wide.
 fn layer_norm(out: &mut String, l: &LayerNorm, req: &Requirements, names: &Names, y: &str) {
     let lanes = req.workgroup_size[0];
     let _ = write!(
         out,
         "\
-const ROWS: u32 = {rows}u;
 const C: u32 = {channels}u;
 const LANES: u32 = {lanes}u;
-const ROW: u32 = {row}u;
 
 var<workgroup> ln_scratch: array<f32, {lanes}>;
 
@@ -267,9 +324,9 @@ fn ln_reduce(lane: u32) -> f32 {{
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_index) lane: u32,
 ) {{
-    let row = wid.y * ROW + wid.x;
+    let row = {PART_START} + wid.y * {PART_GRID_ROW} + wid.x;
     // Uniform across the workgroup, so the barriers below are safe.
-    if (row >= ROWS) {{
+    if (row >= {PART_END}) {{
         return;
     }}
     let base = row * C;
@@ -296,9 +353,7 @@ fn ln_reduce(lane: u32) -> f32 {{
     }}
 }}
 ",
-        rows = l.rows,
         channels = l.channels,
-        row = req.workgroups[0],
         entry = entry(req),
         eps = exact(LAYER_NORM_EPSILON),
         x = names.of(l.input),
@@ -307,9 +362,10 @@ fn ln_reduce(lane: u32) -> f32 {{
     );
 }
 
-/// One workgroup per output tile, staging a tile of each operand in workgroup
-/// memory per step along `k`. Tiles that run off the matrices load zeros, so
-/// every invocation reaches every barrier.
+/// One workgroup per output tile of the part, rows counted from the part's
+/// first row, staging a tile of each operand in workgroup memory per step
+/// along `k`. Tiles that run off the part's rows or the matrices load zeros, so
+/// every invocation reaches every barrier, and store nothing.
 fn matmul(out: &mut String, mm: &MatMul, req: &Requirements, names: &Names, y: &str) {
     let tile = req.workgroup_size[0];
     let bias = mm.bias.map_or(String::new(), |b| {
@@ -318,7 +374,6 @@ fn matmul(out: &mut String, mm: &MatMul, req: &Requirements, names: &Names, y: &
     let _ = write!(
         out,
         "\
-const M: u32 = {m}u;
 const K: u32 = {k}u;
 const N: u32 = {n}u;
 const TILE: u32 = {tile}u;
@@ -331,7 +386,7 @@ var<workgroup> mm_tile_b: array<f32, {cells}>;
     @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(workgroup_id) wid: vec3<u32>,
 ) {{
-    let row = wid.y * TILE + lid.y;
+    let row = {PART_START} + wid.y * TILE + lid.y;
     let col = wid.x * TILE + lid.x;
     var acc = 0.0;
     let steps = (K + TILE - 1u) / TILE;
@@ -339,7 +394,7 @@ var<workgroup> mm_tile_b: array<f32, {cells}>;
         let ka = t * TILE + lid.x;
         let kb = t * TILE + lid.y;
         var va = 0.0;
-        if (row < M && ka < K) {{
+        if (row < {PART_END} && ka < K) {{
             va = {a}[row * K + ka];
         }}
         var vb = 0.0;
@@ -354,13 +409,12 @@ var<workgroup> mm_tile_b: array<f32, {cells}>;
         }}
         workgroupBarrier();
     }}
-    if (row < M && col < N) {{
+    if (row < {PART_END} && col < N) {{
 {bias}        let i = row * N + col;
         {y}[i] = epilogue(acc, i);
     }}
 }}
 ",
-        m = mm.m,
         k = mm.k,
         n = mm.n,
         cells = tile * tile,
@@ -370,30 +424,27 @@ var<workgroup> mm_tile_b: array<f32, {cells}>;
     );
 }
 
-/// One invocation per element: the main operation of a standalone
+/// One invocation per element of the part: the main operation of a standalone
 /// element-wise kernel, whose work is all in the epilogue.
-fn map(out: &mut String, x: &str, elements: u32, req: &Requirements, y: &str) {
+fn map(out: &mut String, x: &str, req: &Requirements, y: &str) {
     let _ = write!(
         out,
         "\
-const ELEMENTS: u32 = {elements}u;
 const GROUP: u32 = {group}u;
-const ROW: u32 = {row}u;
 
 // An element-wise operation on its own.
 {entry}
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_index) lane: u32,
 ) {{
-    let element = (wid.y * ROW + wid.x) * GROUP + lane;
-    if (element >= ELEMENTS) {{
+    let element = {PART_START} + (wid.y * {PART_GRID_ROW} + wid.x) * GROUP + lane;
+    if (element >= {PART_END}) {{
         return;
     }}
     {y}[element] = epilogue({x}[element], element);
 }}
 ",
         group = req.workgroup_size[0],
-        row = req.workgroups[0],
         entry = entry(req),
     );
 }

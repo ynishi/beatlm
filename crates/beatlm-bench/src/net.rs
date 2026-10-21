@@ -20,8 +20,10 @@
 //! per kernel. With fusion the ReLU joins the first convolution, the GELU the
 //! first matrix multiply, and the residual add and the scale the second, so a
 //! job is six kernels; without, it is ten, one per operation
-//! ([`kernel_count`]). The dispatches they cost are measured in the crate
-//! documentation, not read from here. `d2` is read by the layer norm and by the residual add,
+//! ([`kernel_count`]). A kernel calibration split (`calibrate.rs`) is several
+//! kernels of the program, its parts, and so several slices; [`Net::new`]
+//! takes the program already split. The dispatches they cost are measured in
+//! the crate documentation, not read from here. `d2` is read by the layer norm and by the residual add,
 //! so it is never fused away; `a`, `d`, `f` and `r` are, and leave the memory
 //! plan with it. Every weight, and every input and output (below), is live for
 //! the whole program; activations are live from the kernel that writes them to
@@ -442,7 +444,8 @@ fn binding_sets(slots: u32) -> Vec<Vec<Substitution>> {
 }
 
 /// The network, realised on a device: planned memory, uploaded numbers and one
-/// generated kernel per spec with its bind groups.
+/// generated kernel per spec, each part of a split kernel included, with its
+/// bind groups.
 ///
 /// Everything that allocates happens in [`Net::new`]; [`Net::encode`] only
 /// records passes over existing pipelines and bind groups.
@@ -457,40 +460,49 @@ pub struct Net {
 }
 
 impl Net {
-    /// Lowers the network with `fusion`, plans its memory against the baseline
-    /// profile, creates the arenas, uploads the weights and the `slots`
-    /// inputs, and builds every kernel with a bind group for every slot that
-    /// needs one.
+    /// Plans the memory of `program`, the network at `shape` lowered and
+    /// perhaps split, against the baseline profile, creates the arenas,
+    /// uploads the weights and the `slots` inputs, and builds every kernel
+    /// with a bind group for every slot that needs one.
     ///
     /// `slots` is the number of jobs that can be in flight, from
-    /// `SyncPolicy::max_in_flight`.
+    /// `SyncPolicy::max_in_flight`. A split program is planned like any other:
+    /// its lifetimes are in its own kernel indices.
     ///
     /// # Errors
     ///
-    /// No slots or more than [`MAX_SLOTS`], a shape the IR refuses or whose
-    /// tensors cannot be planned, a plan the device cannot hold, or a kernel
+    /// No slots or more than [`MAX_SLOTS`], tensors that cannot be planned, a
+    /// program of another shape, a plan the device cannot hold, or a kernel
     /// that cannot be generated or bound.
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         shape: &Shape,
         slots: u32,
-        fusion: Fusion,
+        program: Program,
     ) -> Result<Self> {
         if slots == 0 || slots > MAX_SLOTS {
             bail!("{slots} slots; the network has between 1 and {MAX_SLOTS}");
         }
-        let program = program(shape, fusion)?;
-        let plan = MemoryPlan::new(
-            &tensors(&program, slots)?,
-            &DeviceProfile::webgpu_baseline(),
-        )
-        .context("cannot plan the network's memory")?;
+        let descs = tensors(&program, slots)?;
+        let plan = MemoryPlan::new(&descs, &DeviceProfile::webgpu_baseline())
+            .context("cannot plan the network's memory")?;
         let arenas = Arenas::new(device, &plan).context("cannot create the arenas")?;
 
         let mut uploads = Data::generate(shape).weights;
         uploads.extend((0..slots).map(|slot| (input_id(slot), Data::input(shape, slot))));
         for (id, numbers) in &uploads {
+            // `program` is given apart from `shape`, so a program of another
+            // shape must not be uploaded into: the data of a smaller shape
+            // would leave the rest of a larger tensor unwritten.
+            let elements = descs.iter().find(|t| t.id == *id).map(|t| t.elements);
+            if elements != u64::try_from(numbers.len()).ok() {
+                bail!(
+                    "tensor {}: {} numbers at this shape for a program tensor of {elements:?} elements; the program is of another shape",
+                    id.get(),
+                    numbers.len()
+                );
+            }
             let placement = plan.placement(*id).context("a tensor has no placement")?;
             let buffer = arenas
                 .buffer(placement.arena)
@@ -542,7 +554,8 @@ impl Net {
         self.slots
     }
 
-    /// How many kernels, hence slices and dispatches, one job has.
+    /// How many kernels, hence slices and dispatches, one job has: a split
+    /// kernel counts each of its parts.
     pub fn kernel_count(&self) -> u32 {
         u32::try_from(self.kernels.len()).unwrap_or(u32::MAX)
     }
@@ -635,17 +648,19 @@ mod tests {
         }
     }
 
-    /// Runs `graph`, lowered with `fusion`, in planned memory through generated
-    /// kernels, with the inputs and weights in `values`, and returns every
-    /// output tensor's numbers.
+    /// Runs `graph`, lowered with `fusion` and every kernel split into `parts`
+    /// parts, in planned memory through generated kernels, with the inputs and
+    /// weights in `values`, and returns every output tensor's numbers.
     fn run_on_gpu(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         graph: &Graph,
         fusion: Fusion,
+        parts: u32,
         values: &BTreeMap<TensorId, Vec<f32>>,
     ) -> BTreeMap<TensorId, Vec<f32>> {
-        let program = graph.lower(fusion).unwrap();
+        let whole = graph.lower(fusion).unwrap();
+        let program = whole.split(&vec![parts; whole.kernels().len()]).unwrap();
         let plan = MemoryPlan::new(program.tensors(), &DeviceProfile::webgpu_baseline()).unwrap();
         let arenas = Arenas::new(device, &plan).unwrap();
         for (id, numbers) in values {
@@ -757,20 +772,28 @@ mod tests {
             .collect()
     }
 
-    /// Every case on the GPU, fused and unfused, against the reference
-    /// interpreter.
+    /// Part counts every kernel test splits each kernel into: whole, counts
+    /// that do and do not divide the kernels' sizes, and one past what the
+    /// matrix multiply and the layer norm of the tests allow, which clamps.
+    const PART_COUNTS: [u32; 5] = [1, 2, 3, 7, 64];
+
+    /// Every case on the GPU, fused and unfused, whole and split into each of
+    /// [`PART_COUNTS`], against the reference interpreter and, split, against
+    /// the same kernels run whole.
     fn assert_kernels_match(what: &str, cases: Vec<(String, Graph, BTreeMap<TensorId, Vec<f32>>)>) {
         let (device, queue) = device();
         for (name, graph, values) in cases {
             let mut want = values.clone();
             reference::run(&graph, &mut want);
             for fusion in [Fusion::On, Fusion::Off] {
-                let got = run_on_gpu(&device, &queue, &graph, fusion, &values);
-                assert_close(
-                    &got[&KY],
-                    &want[&KY],
-                    &format!("{what} with epilogue {name}, fusion {fusion:?}"),
-                );
+                let whole = run_on_gpu(&device, &queue, &graph, fusion, 1, &values);
+                for parts in PART_COUNTS {
+                    let got = run_on_gpu(&device, &queue, &graph, fusion, parts, &values);
+                    let case =
+                        format!("{what} with epilogue {name}, fusion {fusion:?}, {parts} parts");
+                    assert_close(&got[&KY], &want[&KY], &case);
+                    assert_close(&got[&KY], &whole[&KY], &format!("{case}, against whole"));
+                }
             }
         }
     }
@@ -894,8 +917,15 @@ mod tests {
             let values = BTreeMap::from([(KX, x.clone()), (KRES, r.clone())]);
             let mut want = values.clone();
             reference::run(&g, &mut want);
-            let got = run_on_gpu(&device, &queue, &g, Fusion::On, &values);
-            assert_close(&got[&KY], &want[&KY], &format!("{op:?}"));
+            let whole = run_on_gpu(&device, &queue, &g, Fusion::On, 1, &values);
+            // 1 000 elements: 3, 7 and 64 parts do not divide them. The clamp
+            // of a map's count is the core's property test; on the GPU the
+            // other kernels' tests clamp.
+            for parts in PART_COUNTS {
+                let got = run_on_gpu(&device, &queue, &g, Fusion::On, parts, &values);
+                assert_close(&got[&KY], &want[&KY], &format!("{op:?}, {parts} parts"));
+                assert_close(&got[&KY], &whole[&KY], &format!("{op:?}, {parts} parts"));
+            }
         }
     }
 
@@ -947,7 +977,8 @@ mod tests {
         let shape = TEST_SHAPE;
         let want = reference_output(&shape, &Data::input(&shape, 0));
         for fusion in [Fusion::On, Fusion::Off] {
-            let net = Net::new(&device, &queue, &shape, 1, fusion).unwrap();
+            let net =
+                Net::new(&device, &queue, &shape, 1, program(&shape, fusion).unwrap()).unwrap();
             let plan = net.plan();
             assert!(plan.total_bytes() < plan.placements().map(|(_, p)| p.size).sum::<u64>());
             let got = run_job(&device, &queue, &net);
@@ -962,8 +993,17 @@ mod tests {
     #[ignore = "needs a GPU adapter"]
     fn the_fused_and_unfused_networks_agree() {
         let (device, queue) = device();
-        let fused = Net::new(&device, &queue, &TEST_SHAPE, 1, Fusion::On).unwrap();
-        let unfused = Net::new(&device, &queue, &TEST_SHAPE, 1, Fusion::Off).unwrap();
+        let net = |fusion| {
+            Net::new(
+                &device,
+                &queue,
+                &TEST_SHAPE,
+                1,
+                program(&TEST_SHAPE, fusion).unwrap(),
+            )
+            .unwrap()
+        };
+        let (fused, unfused) = (net(Fusion::On), net(Fusion::Off));
         assert!(fused.kernel_count() < unfused.kernel_count());
         let (a, b) = (
             run_job(&device, &queue, &fused),
@@ -972,11 +1012,41 @@ mod tests {
         assert_close(&a, &b, "fused against unfused");
     }
 
+    /// Splitting changes no result: the network with its kernels split into
+    /// parts, in a plan of its own, agrees with the whole network and with the
+    /// reference, fused and unfused.
+    #[test]
+    #[ignore = "needs a GPU adapter"]
+    fn the_split_network_matches_the_whole_one_and_the_reference() {
+        let (device, queue) = device();
+        let shape = TEST_SHAPE;
+        let want = reference_output(&shape, &Data::input(&shape, 0));
+        for fusion in [Fusion::On, Fusion::Off] {
+            let whole_program = program(&shape, fusion).unwrap();
+            let kernels = whole_program.kernels().len();
+            let whole = Net::new(&device, &queue, &shape, 1, whole_program.clone()).unwrap();
+            let whole_out = run_job(&device, &queue, &whole);
+            // Counts that do and do not divide the kernels' sizes, and ones
+            // past what they allow.
+            for counts in [[2_u32, 3, 5, 7, 4, 3, 9, 11, 2, 6], [64; 10]] {
+                let split = whole_program.split(&counts[..kernels]).unwrap();
+                assert!(split.kernels().len() > kernels);
+                let net = Net::new(&device, &queue, &shape, 1, split).unwrap();
+                let got = run_job(&device, &queue, &net);
+                let what = format!("network split {:?}, fusion {fusion:?}", &counts[..kernels]);
+                assert_close(&got, &want, &what);
+                assert_close(&got, &whole_out, &format!("{what}, against whole"));
+            }
+        }
+    }
+
     /// One run of [`drive`]: a job is submitted at each of the `submit` frames,
     /// and frame `f` has `budgets[f]` microseconds to spend.
     struct Scenario {
         name: &'static str,
         fusion: Fusion,
+        /// The parts of each kernel, or `None` for the network whole.
+        parts: Option<&'static [u32]>,
         submit: &'static [u64],
         budgets: &'static [u64],
         /// Whether some job's slices must be split across frames.
@@ -999,7 +1069,12 @@ mod tests {
         let policy = SyncPolicy::FixedLatency { frames: 2 };
         let slots = policy.max_in_flight().unwrap();
         assert_eq!(slots, 3);
-        let net = Net::new(&device, &queue, &shape, slots, scenario.fusion).unwrap();
+        let whole = program(&shape, scenario.fusion).unwrap();
+        let program = match scenario.parts {
+            Some(parts) => whole.split(parts).unwrap(),
+            None => whole,
+        };
+        let net = Net::new(&device, &queue, &shape, slots, program).unwrap();
 
         let mut cost = CostModel::new(
             Micros::new(100),
@@ -1110,8 +1185,29 @@ mod tests {
         drive(&Scenario {
             name: "split",
             fusion: Fusion::On,
+            parts: None,
             submit: &[0, 1, 2],
             budgets: &[240, 150, 300, 500, 540, 540],
+            split: true,
+        });
+    }
+
+    /// The parts of one kernel handed out in different frames, three jobs in
+    /// flight: the parts are slices like any other, and the next job's first
+    /// slice must wait for the earlier job's last part.
+    #[test]
+    #[ignore = "needs a GPU adapter"]
+    fn the_parts_of_a_kernel_run_in_different_frames_keep_every_result() {
+        // The second matrix multiply in four parts makes a job ten slices,
+        // 940 us. Frame 0's 740 us end after its second part; frame 1 runs
+        // the last two and then job 1's slices 0 to 3, and so on, so every
+        // job finishes the frame before its delivery.
+        drive(&Scenario {
+            name: "parts in different frames",
+            fusion: Fusion::On,
+            parts: Some(&[1, 1, 1, 1, 1, 4]),
+            submit: &[0, 1, 2],
+            budgets: &[740, 540, 1_000, 1_000, 1_000, 1_000],
             split: true,
         });
     }
@@ -1125,13 +1221,17 @@ mod tests {
         // Every frame has room for a whole job (540 us fused, 940 us unfused),
         // so job 0 is finished at frame 0, job 1 at frame 1 and job 2 at frame
         // 2, and job 0 is delivered at frame 2.
-        for (name, fusion) in [
-            ("early, fused", Fusion::On),
-            ("early, unfused", Fusion::Off),
+        // Split into nine slices the fused job costs 840 us, so it fits too.
+        let split: &'static [u32] = &[2, 1, 1, 1, 1, 3];
+        for (name, fusion, parts) in [
+            ("early, fused", Fusion::On, None),
+            ("early, unfused", Fusion::Off, None),
+            ("early, fused and split", Fusion::On, Some(split)),
         ] {
             drive(&Scenario {
                 name,
                 fusion,
+                parts,
                 submit: &[0, 1, 2],
                 budgets: &[1_000, 1_000, 1_000, 1_000, 1_000, 1_000],
                 split: false,

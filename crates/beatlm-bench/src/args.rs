@@ -21,6 +21,11 @@ usage: beatlm-bench [options]
                     before them, on or off                  (default on)
   --dump-wgsl DIR   net only: write each generated kernel's WGSL into DIR
                     before the run
+  --max-dispatch-us N  net only: calibrate each kernel before the run and
+                    split those measured longer than N us into parts; 0
+                    turns splitting off                     (default 1000)
+  --split S         net only: on or off; off is --max-dispatch-us 0
+                                                           (default on)
   --mode M          concurrency candidate: sync, thread or async (default sync)
   --runs N          repeat the whole run N times on one device (default 1)
   --estimator E     cost estimate: mean-sigmas, quantile or capped
@@ -42,6 +47,11 @@ pub const DEFAULT_RENDER_ITERS: u32 = 50;
 /// Loop iterations per invocation of the competing load's kernel; see the
 /// crate documentation for what it did to the slices' measured times.
 pub const DEFAULT_BACKGROUND_ITERS: u32 = 4_000;
+
+/// The longest a dispatch of the network may take before calibration splits
+/// its kernel, in microseconds; the crate documentation, under "Splitting",
+/// has the sweep that chose it.
+pub const DEFAULT_MAX_DISPATCH_US: u64 = 1_000;
 
 /// Which statistic the cost model reads a slice's measurements with; the
 /// parameters of each are constants in `engine.rs`. The default is the one the
@@ -141,6 +151,10 @@ pub struct Args {
     pub fusion: Fusion,
     /// Where to write the network's generated WGSL before the run; `net` only.
     pub dump_wgsl: Option<PathBuf>,
+    /// The bound a calibrated kernel's dispatch is split to fit, in
+    /// microseconds, or `None` when the network runs unsplit and is not
+    /// calibrated; `net` only.
+    pub max_dispatch_us: Option<u64>,
     /// The concurrency candidate that drives the frame.
     pub mode: Mode,
     /// How many times the whole run is repeated in one process.
@@ -166,6 +180,7 @@ impl Default for Args {
             workload: WorkloadKind::Synthetic,
             fusion: Fusion::On,
             dump_wgsl: None,
+            max_dispatch_us: Some(DEFAULT_MAX_DISPATCH_US),
             mode: Mode::Sync,
             runs: 1,
             estimator: EstimatorKind::Quantile,
@@ -201,6 +216,8 @@ where
     let mut slices_given = false;
     let mut background_iters_given = false;
     let mut fusion_given = false;
+    let mut bound_given: Option<u64> = None;
+    let mut split_given: Option<bool> = None;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let (name, inline) = match arg.split_once('=') {
@@ -232,6 +249,8 @@ where
                 fusion_given = true;
             }
             "--dump-wgsl" => out.dump_wgsl = Some(PathBuf::from(value()?)),
+            "--max-dispatch-us" => bound_given = Some(number(&name, &value()?)?),
+            "--split" => split_given = Some(on_off(&name, &value()?)?),
             "--mode" => out.mode = mode(&value()?)?,
             "--runs" => out.runs = number(&name, &value()?)?,
             "--estimator" => out.estimator = estimator(&value()?)?,
@@ -268,6 +287,15 @@ where
             );
         }
         out.slices = kernels;
+        out.max_dispatch_us = match (split_given, bound_given) {
+            (Some(false), Some(us)) if us > 0 => {
+                bail!("--max-dispatch-us {us} has no effect with --split off")
+            }
+            (Some(true), Some(0)) => bail!("--split on needs a --max-dispatch-us above 0"),
+            (Some(false), _) | (_, Some(0)) => None,
+            (_, Some(us)) => Some(us),
+            (_, None) => Some(DEFAULT_MAX_DISPATCH_US),
+        };
     } else {
         if fusion_given {
             bail!("--fusion has no effect without --workload net");
@@ -275,8 +303,20 @@ where
         if out.dump_wgsl.is_some() {
             bail!("--dump-wgsl has no effect without --workload net");
         }
+        if bound_given.is_some() || split_given.is_some() {
+            bail!("--max-dispatch-us and --split have no effect without --workload net");
+        }
     }
     Ok(Command::Run(out))
+}
+
+/// Parses an `on` or `off` value.
+fn on_off(name: &str, text: &str) -> Result<bool> {
+    match text {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        _ => bail!("{name}: {text:?} is not one of on, off"),
+    }
 }
 
 /// Parses the value of `--fusion`.
@@ -446,6 +486,44 @@ mod tests {
         assert!(parse_strs(&["--estimator", "median"]).is_err());
         assert!(parse_strs(&["--background-load", "--background-iters", "0"]).is_err());
         assert!(parse_strs(&["--background-iters", "900"]).is_err());
+    }
+
+    #[test]
+    fn splitting_is_on_by_default_and_turned_off_by_a_zero_bound_or_by_name() {
+        let net = |extra: &[&str]| {
+            let mut all = vec!["--workload", "net"];
+            all.extend_from_slice(extra);
+            match parse_strs(&all) {
+                Ok(Command::Run(a)) => Ok(a.max_dispatch_us),
+                Ok(Command::Help) => panic!("expected a run"),
+                Err(e) => Err(e),
+            }
+        };
+        assert_eq!(net(&[]).unwrap(), Some(DEFAULT_MAX_DISPATCH_US));
+        assert_eq!(net(&["--max-dispatch-us", "500"]).unwrap(), Some(500));
+        assert_eq!(net(&["--max-dispatch-us=0"]).unwrap(), None);
+        assert_eq!(net(&["--split", "off"]).unwrap(), None);
+        assert_eq!(
+            net(&["--split", "off", "--max-dispatch-us", "0"]).unwrap(),
+            None
+        );
+        assert_eq!(
+            net(&["--split", "on", "--max-dispatch-us", "700"]).unwrap(),
+            Some(700)
+        );
+        assert_eq!(net(&["--split=on"]).unwrap(), Some(DEFAULT_MAX_DISPATCH_US));
+        assert!(net(&["--split", "off", "--max-dispatch-us", "700"]).is_err());
+        assert!(net(&["--split", "on", "--max-dispatch-us", "0"]).is_err());
+        assert!(net(&["--split", "sometimes"]).is_err());
+        assert!(net(&["--max-dispatch-us", "-1"]).is_err());
+        // Splitting does not change the slice count `args` knows: the parts
+        // are decided by calibration, on the device.
+        let Command::Run(a) = parse_strs(&["--workload", "net"]).unwrap() else {
+            panic!("expected a run");
+        };
+        assert_eq!(a.slices, crate::net::kernel_count(Fusion::On).unwrap());
+        assert!(parse_strs(&["--split", "off"]).is_err());
+        assert!(parse_strs(&["--max-dispatch-us", "500"]).is_err());
     }
 
     #[test]

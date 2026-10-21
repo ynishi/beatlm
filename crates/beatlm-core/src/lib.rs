@@ -73,7 +73,7 @@
 //! | An on-beat deadline is the first beat at or after submission time plus estimated work plus margin. | [`schedule::Scheduler::submit`] |
 //! | A missed deadline is always reported, with the policy that says what to show. | [`schedule::Scheduler::plan_frame`] |
 //! | Cost estimates change only through measurements. | [`cost::CostModel::record`] |
-//! | One dispatch never runs longer than a bound, because a GPU cannot be preempted mid-dispatch. | the plan that slices a model |
+//! | Dispatches are planned to fit a duration bound, because a GPU cannot be preempted mid-dispatch: a kernel whose measured duration exceeds the bound is split into parts expected to fit it. The bound is a planning target, not a guarantee; measured dispatches can still exceed it, and how often is measured, not assumed. | [`kernel::Program::parts_within`] (carried out by [`kernel::Program::split`], whose parts cover the output exactly once: the [`kernel#rules`] list) |
 //! | Tensors whose lifetimes overlap never share memory; arenas respect the adapter's binding size and offset alignment; a tensor too large for an arena is an error, never split. | [`memory::MemoryPlan`] |
 //! | A plan made against the baseline profile is valid on every adapter. | [`device::DeviceProfile::webgpu_baseline`], checked for other profiles by [`memory::MemoryPlan::valid_on`] |
 //! | The steady-state loop allocates nothing and reads nothing back except timestamps. | the plan |
@@ -86,7 +86,8 @@
 //! Decisions expected to move are kept behind one owner each: the statistic a
 //! cost estimate uses lives in [`cost`], the delivery promises in [`sync`],
 //! the order jobs are served in [`schedule`], the packing algorithm that places tensors
-//! in memory in [`memory`], which operations share a kernel in [`kernel`].
+//! in memory in [`memory`], which operations share a kernel and how a kernel
+//! is cut into parts in [`kernel`].
 //! Shader languages, model formats and GPU backends are
 //! not decided here at all; what an adapter reports reaches the core only as
 //! the plain values of a [`device::DeviceProfile`].
