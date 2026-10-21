@@ -1072,7 +1072,11 @@ mod tests {
         )
         .unwrap();
         cost.record(SliceId::new(0), Micros::new(40));
-        let mut scheduler = Scheduler::new(policy, MissPolicy::Drop, None).unwrap();
+        // The scenario's largest budget is the forecast, so its smaller ones
+        // are frames that fell short of it, as a slow render does.
+        let expected = scenario.budgets.iter().copied().max().unwrap();
+        let mut scheduler =
+            Scheduler::new(policy, MissPolicy::Drop, Budget::new(Micros::new(expected)));
         let all: Vec<SliceId> = (0..net.kernel_count()).map(SliceId::new).collect();
 
         let mut frames_with_slices: BTreeMap<u64, u32> = BTreeMap::new();

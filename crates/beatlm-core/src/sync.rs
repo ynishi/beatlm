@@ -1,6 +1,6 @@
 //! The delivery promise and what to do when it breaks.
 
-use crate::time::Micros;
+use crate::time::{BeatGrid, Micros};
 
 /// When the result for an input is delivered.
 ///
@@ -21,11 +21,19 @@ pub enum SyncPolicy {
     /// The result is delivered on the first frame starting at or after a target
     /// beat. The target is the first beat at or after the input's estimated
     /// completion plus `margin`, so work starts early enough to finish before
-    /// the beat.
+    /// the beat; [`Scheduler::submit`](crate::schedule::Scheduler::submit)
+    /// says how the completion is estimated.
+    ///
+    /// The beats are part of this promise and of no other, so the grid travels
+    /// with it rather than beside every policy.
     OnBeat {
         /// Slack added to the estimated completion before looking for a beat,
         /// absorbing estimate error.
         margin: Micros,
+        /// The beats in effect from the start of the session; a tempo change
+        /// replaces them from an instant on
+        /// ([`Scheduler::replace_beat_grid`](crate::schedule::Scheduler::replace_beat_grid)).
+        grid: BeatGrid,
     },
 }
 
@@ -86,6 +94,14 @@ pub enum MissPolicy {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::time::TimePoint;
+
+    fn on_beat() -> SyncPolicy {
+        SyncPolicy::OnBeat {
+            margin: Micros::ZERO,
+            grid: BeatGrid::new(TimePoint::new(0), Micros::new(500_000)).unwrap(),
+        }
+    }
 
     #[test]
     fn source_delay_follows_policy() {
@@ -94,13 +110,7 @@ mod tests {
             Some(3)
         );
         assert_eq!(SyncPolicy::SameFrame.source_delay(), Some(0));
-        assert_eq!(
-            SyncPolicy::OnBeat {
-                margin: Micros::ZERO
-            }
-            .source_delay(),
-            None
-        );
+        assert_eq!(on_beat().source_delay(), None);
     }
 
     #[test]
@@ -118,12 +128,6 @@ mod tests {
             Some(u32::MAX)
         );
         assert_eq!(SyncPolicy::SameFrame.max_in_flight(), Some(1));
-        assert_eq!(
-            SyncPolicy::OnBeat {
-                margin: Micros::ZERO
-            }
-            .max_in_flight(),
-            None
-        );
+        assert_eq!(on_beat().max_in_flight(), None);
     }
 }

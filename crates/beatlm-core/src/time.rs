@@ -140,7 +140,8 @@ pub enum TimeError {
 ///
 /// The `OnBeat` delivery promise needs to know where the next beat boundary is.
 /// The host derives the grid from tempo and phase and passes it in; the core
-/// never tracks tempo itself.
+/// never derives tempo itself. A tempo change is a new grid the host hands in
+/// with the instant it takes effect from ([`BeatMap`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BeatGrid {
     origin: TimePoint,
@@ -178,6 +179,82 @@ impl BeatGrid {
         } else {
             t.saturating_add(Micros::new(self.beat.get() - into_beat))
         }
+    }
+}
+
+/// Beats over a session whose tempo changes: a sequence of [`BeatGrid`]s,
+/// each in effect from an instant until the next one's.
+///
+/// A grid in effect from `from` contributes its beats at or after `from` and
+/// before the next grid's `from`; outside that span its beats do not exist. The
+/// first grid is in effect from the epoch. Instants are compared, never
+/// subtracted across grids, so a change neither has to fall on a beat of the
+/// old grid nor be the new grid's origin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BeatMap {
+    /// `(from, grid)` in strictly increasing `from`; never empty.
+    grids: Vec<(TimePoint, BeatGrid)>,
+}
+
+impl BeatMap {
+    /// Beats from `grid` alone, in effect from the epoch.
+    #[must_use]
+    pub fn new(grid: BeatGrid) -> Self {
+        Self {
+            grids: vec![(TimePoint::new(0), grid)],
+        }
+    }
+
+    /// Puts `grid` in effect from `from` on.
+    ///
+    /// Every grid that took effect at or after `from` is dropped, so the latest
+    /// call decides what follows `from`: a host that announced a change and
+    /// then changed its mind replaces the announcement.
+    pub fn replace_from(&mut self, from: TimePoint, grid: BeatGrid) {
+        self.grids.retain(|&(start, _)| start < from);
+        self.grids.push((from, grid));
+    }
+
+    /// The first beat at or after `t`, on whichever grid is in effect at that
+    /// beat.
+    ///
+    /// An instant before the earliest grid kept maps to that grid's first beat
+    /// at or after its `from` ([`forget_before`](Self::forget_before) is what
+    /// moves it from the epoch). A result that cannot be represented clamps at
+    /// the end of representable time.
+    #[must_use]
+    pub fn next_beat_at_or_after(&self, t: TimePoint) -> TimePoint {
+        let first = self
+            .grids
+            .partition_point(|&(from, _)| from <= t)
+            .saturating_sub(1);
+        let mut t = t;
+        let mut grids = self.grids.iter().skip(first).peekable();
+        while let Some(&(from, grid)) = grids.next() {
+            let beat = grid.next_beat_at_or_after(t.max(from));
+            match grids.peek() {
+                // The beat falls where the next grid is in effect, so the next
+                // grid decides.
+                Some(&&(next, _)) if beat >= next => t = next,
+                _ => return beat,
+            }
+        }
+        // The map is never empty, so the loop returned.
+        t
+    }
+
+    /// Drops the grids whose whole span ends at or before `t`, keeping the one
+    /// in effect at `t`.
+    ///
+    /// It bounds the map in a session with many tempo changes. A lookup at or
+    /// after `t` gives the same beat as before; one before `t` gets a beat at
+    /// or after the earliest kept grid's `from`, so never an earlier beat.
+    pub fn forget_before(&mut self, t: TimePoint) {
+        let in_effect = self
+            .grids
+            .partition_point(|&(from, _)| from <= t)
+            .saturating_sub(1);
+        self.grids.drain(..in_effect);
     }
 }
 
@@ -235,6 +312,84 @@ mod tests {
         let g = BeatGrid::new(TimePoint::new(0), Micros::new(1_000)).unwrap();
         let t = TimePoint::new(u64::MAX - 1);
         assert_eq!(g.next_beat_at_or_after(t), TimePoint::new(u64::MAX));
+    }
+
+    /// Beats every 1000 us from 0, then every 300 us from a change at 2500
+    /// whose own origin is 2600.
+    fn changed() -> BeatMap {
+        let mut map = BeatMap::new(BeatGrid::new(TimePoint::new(0), Micros::new(1_000)).unwrap());
+        map.replace_from(
+            TimePoint::new(2_500),
+            BeatGrid::new(TimePoint::new(2_600), Micros::new(300)).unwrap(),
+        );
+        map
+    }
+
+    #[test]
+    fn beat_map_uses_the_old_grid_before_the_change_and_the_new_one_after() {
+        let map = changed();
+        assert_eq!(
+            map.next_beat_at_or_after(TimePoint::new(1_200)),
+            TimePoint::new(2_000)
+        );
+        assert_eq!(
+            map.next_beat_at_or_after(TimePoint::new(2_700)),
+            TimePoint::new(2_900)
+        );
+    }
+
+    #[test]
+    fn beat_of_the_old_grid_past_the_change_does_not_exist() {
+        // The old grid's next beat after 2100 is 3000, past the change at
+        // 2500, so the new grid's first beat at or after 2500 is taken.
+        assert_eq!(
+            changed().next_beat_at_or_after(TimePoint::new(2_100)),
+            TimePoint::new(2_600)
+        );
+    }
+
+    #[test]
+    fn replacing_drops_the_grids_announced_at_or_after_it() {
+        let mut map = changed();
+        map.replace_from(
+            TimePoint::new(2_000),
+            BeatGrid::new(TimePoint::new(0), Micros::new(250)).unwrap(),
+        );
+        // The change at 2500 is gone; from 2000 the 250 us grid holds.
+        assert_eq!(
+            map.next_beat_at_or_after(TimePoint::new(2_700)),
+            TimePoint::new(2_750)
+        );
+        assert_eq!(
+            map.next_beat_at_or_after(TimePoint::new(1_500)),
+            TimePoint::new(2_000)
+        );
+    }
+
+    #[test]
+    fn forgetting_keeps_every_beat_from_then_on() {
+        let mut map = changed();
+        let before: Vec<_> = (2_500..4_000)
+            .step_by(7)
+            .map(|t| map.next_beat_at_or_after(TimePoint::new(t)))
+            .collect();
+        map.forget_before(TimePoint::new(2_500));
+        assert_eq!(map.grids.len(), 1);
+        let after: Vec<_> = (2_500..4_000)
+            .step_by(7)
+            .map(|t| map.next_beat_at_or_after(TimePoint::new(t)))
+            .collect();
+        assert_eq!(before, after);
+        // Before what was kept, a lookup gets the kept grid's first beat:
+        // later than the forgotten grid's, never earlier.
+        assert_eq!(
+            map.next_beat_at_or_after(TimePoint::new(1_200)),
+            TimePoint::new(2_600)
+        );
+        // Forgetting before the change keeps both grids.
+        let mut map = changed();
+        map.forget_before(TimePoint::new(2_499));
+        assert_eq!(map.grids.len(), 2);
     }
 
     #[test]
