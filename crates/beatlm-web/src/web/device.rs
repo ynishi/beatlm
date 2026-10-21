@@ -3,14 +3,14 @@
 //! The device gets the WebGPU default limits unless a memory plan needs more,
 //! and then exactly what the plan needs, through
 //! [`beatlm::gpu::required_limits`]; a plan the adapter cannot hold is refused
-//! there or by the planner, never cut down to fit. Timestamp queries are
-//! requested when the adapter has them, and their absence is reported rather
-//! than refused: the run still keeps or misses its deadlines, only the GPU
-//! times are not measured.
+//! there or by the planner, never cut down to fit. The plan is either the one
+//! arena `arena_bytes` asks for or the depth model's ([`Need`]). Timestamp
+//! queries are requested when the adapter has them, and their absence is
+//! reported rather than refused: the run still keeps or misses its deadlines,
+//! only the GPU times are not measured.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::task::{Context as TaskContext, Poll, Waker};
 
 use anyhow::{Context, Result, bail};
 use beatlm::gpu::{Arenas, profile, required_limits};
@@ -44,6 +44,18 @@ pub fn device_lost() -> Option<String> {
         .clone()
 }
 
+/// What the device must be able to hold.
+pub enum Need {
+    /// Nothing past the WebGPU defaults.
+    Defaults,
+    /// One arena of this many bytes, planned against the adapter's limits and
+    /// realised on the device before the run (`arena_bytes`).
+    Arena(u64),
+    /// This plan, which the caller realises once the device exists: the depth
+    /// model's, planned before the device so the device can be asked for it.
+    Plan(MemoryPlan),
+}
+
 /// The device the run uses, with the surface on the page's canvas and what the
 /// report says about them.
 pub struct Gpu {
@@ -66,16 +78,15 @@ pub struct Gpu {
 }
 
 /// Requests a high-performance adapter compatible with `canvas`, a device with
-/// the limits a plan of one `arena_bytes` arena needs (the defaults when there
-/// is none) and with timestamp queries when the adapter has them, and
-/// configures the canvas for the render pass.
+/// the limits `need` needs and with timestamp queries when the adapter has
+/// them, and configures the canvas for the render pass.
 ///
 /// # Errors
 ///
-/// No WebGPU in this browser or no adapter; an arena the adapter cannot hold;
+/// No WebGPU in this browser or no adapter; a plan the adapter cannot hold;
 /// a device the browser refuses; a canvas that cannot take the render
 /// target's format.
-pub async fn open(canvas: web_sys::HtmlCanvasElement, arena_bytes: Option<u64>) -> Result<Gpu> {
+pub async fn open(canvas: web_sys::HtmlCanvasElement, need: Need) -> Result<Gpu> {
     canvas.set_width(RENDER_WIDTH);
     canvas.set_height(RENDER_HEIGHT);
     let instance = wgpu::Instance::default();
@@ -96,11 +107,13 @@ pub async fn open(canvas: web_sys::HtmlCanvasElement, arena_bytes: Option<u64>) 
     let adapter_limits = adapter.limits();
     let timestamp_query = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
 
-    // The arena is planned against what the adapter can do, so it may need
-    // more than the defaults; the device is asked for exactly that.
-    let plan = arena_bytes
-        .map(|bytes| one_arena(bytes, &adapter_limits))
-        .transpose()?;
+    // A plan may need more than the defaults; the device is asked for
+    // exactly that. The arena is planned against what the adapter can do.
+    let (plan, realise_here) = match need {
+        Need::Defaults => (None, false),
+        Need::Arena(bytes) => (Some(one_arena(bytes, &adapter_limits)?), true),
+        Need::Plan(plan) => (Some(plan), false),
+    };
     let required = match &plan {
         Some(plan) => required_limits(plan, &adapter_limits)?,
         None => wgpu::Limits::default(),
@@ -142,8 +155,8 @@ pub async fn open(canvas: web_sys::HtmlCanvasElement, arena_bytes: Option<u64>) 
     });
 
     let arena_realised_bytes = match &plan {
-        Some(plan) => Some(realise(&device, plan).await?),
-        None => None,
+        Some(plan) if realise_here => Some(realise(&device, plan).await?),
+        _ => None,
     };
 
     let mut config = surface
@@ -187,25 +200,43 @@ fn one_arena(bytes: u64, limits: &wgpu::Limits) -> Result<MemoryPlan> {
 
 /// Creates `plan`'s arenas on `device` and waits for the browser to accept
 /// them, returning the largest arena's size.
-///
-/// In a browser a buffer the device rejects still comes back as a handle and
-/// the rejection arrives later as an error, so the creation runs inside an
-/// error scope and the scope is awaited.
 async fn realise(device: &wgpu::Device, plan: &MemoryPlan) -> Result<u64> {
+    let arenas = accepted(device, "the planned arena", || {
+        Arenas::new(device, plan).map_err(anyhow::Error::from)
+    })
+    .await?;
+    drop(arenas);
+    Ok(plan.arenas().iter().copied().max().unwrap_or(0))
+}
+
+/// Runs `create`, which creates objects on `device`, and waits for the
+/// browser to accept them; `what` names them in the error.
+///
+/// In a browser an object the device rejects still comes back as a handle and
+/// the rejection arrives later as an error, so the creation runs inside an
+/// error scope for validation and one for memory, and the scopes are awaited.
+///
+/// # Errors
+///
+/// `create`'s own error, or the first error either scope caught.
+pub async fn accepted<T>(
+    device: &wgpu::Device,
+    what: &str,
+    create: impl FnOnce() -> Result<T>,
+) -> Result<T> {
     let out_of_memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
     let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
-    let arenas = Arenas::new(device, plan);
+    let created = create();
     let invalid = validation.pop().await;
     let oom = out_of_memory.pop().await;
-    let arenas = arenas?;
+    let created = created?;
     if let Some(error) = invalid.or(oom) {
         bail!(
-            "the device did not create the planned arena: {}",
+            "the device did not create {what}: {}",
             page::one_line(&error.to_string())
         );
     }
-    drop(arenas);
-    Ok(plan.arenas().iter().copied().max().unwrap_or(0))
+    Ok(created)
 }
 
 /// The two size limits the report shows.
@@ -214,39 +245,4 @@ fn size_limits(limits: &wgpu::Limits) -> SizeLimits {
         max_storage_buffer_binding_size: limits.max_storage_buffer_binding_size,
         max_buffer_size: limits.max_buffer_size,
     }
-}
-
-/// Resolves once the GPU has finished the work submitted to `queue` so far.
-///
-/// The warm-up waits on it without blocking: the setup is a task on the
-/// event loop, and the callback arrives from there. The callback must be
-/// `Send`, so the state it shares with the future is behind a mutex rather
-/// than in a page object.
-pub async fn work_done(queue: &wgpu::Queue) {
-    let shared = Arc::new(Mutex::new(Signal::default()));
-    let fired = Arc::clone(&shared);
-    queue.on_submitted_work_done(move || {
-        let mut signal = fired.lock().unwrap_or_else(PoisonError::into_inner);
-        signal.done = true;
-        if let Some(waker) = signal.waker.take() {
-            waker.wake();
-        }
-    });
-    std::future::poll_fn(|cx: &mut TaskContext<'_>| {
-        let mut signal = shared.lock().unwrap_or_else(PoisonError::into_inner);
-        if signal.done {
-            Poll::Ready(())
-        } else {
-            signal.waker = Some(cx.waker().clone());
-            Poll::Pending
-        }
-    })
-    .await;
-}
-
-/// What [`work_done`]'s callback and future share.
-#[derive(Default)]
-struct Signal {
-    done: bool,
-    waker: Option<Waker>,
 }

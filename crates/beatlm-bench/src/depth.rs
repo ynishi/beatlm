@@ -28,13 +28,13 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use beatlm::load::depth_anything_v2::{Config, Role, inventory};
+use beatlm::load::depth_anything_v2::{Config, Role, inventory, reference};
 use beatlm::load::{Archive, read_file};
 use beatlm::model::Builder;
 use beatlm::model::depth_anything_v2::{DepthModel, model};
 use beatlm_core::kernel::{Fusion, Program};
 
-use crate::net::Numbers;
+use crate::slots::Numbers;
 
 /// The model's weights file, under `BEATLM_MODELS_DIR` or the workspace's
 /// `models/`.
@@ -44,7 +44,8 @@ fn weights_file() -> PathBuf {
             || Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models"),
             PathBuf::from,
         )
-        .join("depth-anything-v2-small/model.safetensors")
+        .join(reference::MODEL_DIR)
+        .join(reference::WEIGHTS_FILE)
 }
 
 /// The model at `side` pixels, built into a fresh builder.

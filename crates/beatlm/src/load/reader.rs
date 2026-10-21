@@ -377,6 +377,48 @@ mod tests {
         assert_eq!(StoredType::F64.to_planned(), None);
     }
 
+    /// A browser host parses the bytes of a fetched response and a native one
+    /// the bytes [`read_file`] read; the two must be the same archive.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn a_file_read_from_disk_parses_as_its_bytes_do() {
+        let file = file_of(&[
+            (
+                "w",
+                Dtype::F32,
+                vec![2, 2],
+                f32_bytes(&[1.0, -2.0, 3.5, 0.25]),
+            ),
+            ("ids", Dtype::U8, vec![3], vec![7, 8, 9]),
+        ]);
+        let path = std::env::temp_dir().join(format!(
+            "beatlm-reader-parity-{}.safetensors",
+            std::process::id()
+        ));
+        std::fs::write(&path, &file).expect("the test can write its file");
+        let read = read_file(&path);
+        std::fs::remove_file(&path).expect("the test can remove its file");
+        let read = read.expect("the file reads");
+
+        let from_disk = Archive::parse(&read).expect("parses");
+        let from_bytes = Archive::parse(&file).expect("parses");
+        let tensors = |archive: &Archive<'_>| -> Vec<(String, StoredType, Vec<usize>, Vec<u8>)> {
+            archive
+                .iter()
+                .map(|(name, t)| {
+                    (
+                        name.to_owned(),
+                        t.dtype(),
+                        t.shape().to_vec(),
+                        t.data().to_vec(),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(tensors(&from_disk), tensors(&from_bytes));
+        assert_eq!(from_disk.parameter_count(), from_bytes.parameter_count());
+    }
+
     #[cfg(not(target_family = "wasm"))]
     #[test]
     fn an_unreadable_path_is_an_io_error_naming_the_path() {

@@ -51,8 +51,10 @@
 //! Python environment and nothing in the engine's build or tests requires it;
 //! it is what the graph is compared with. The input is defined by a formula in
 //! integers and single-precision arithmetic so that Rust computes the same
-//! bits without reading a file: see `reference_input` in
-//! `crates/beatlm/tests/depth_anything_v2.rs` and the script's header.
+//! bits without reading a file. That formula, where the files are kept, the
+//! error measures and the tolerances of a comparison are
+//! [`depth_anything_v2::reference`], which the native tests and the browser
+//! host both read.
 
 pub mod depth_anything_v2;
 mod error;
