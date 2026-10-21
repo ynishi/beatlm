@@ -68,6 +68,12 @@ and this project adheres to
   resize with `align_corners=True`, and a ReLU prologue on 3x3 convolutions.
 - The whole Depth Anything V2 Small model (`model::depth_anything_v2::model`),
   whose depth matches the transformers reference on the real weights.
+- Input sides other than 518 (multiples of 14), with the position embedding
+  resampled on the host at load as transformers does, and
+  `just reference-depth-anything <size>`.
+- `beatlm-bench --workload depth`, `--size` and `--submit every|free`: the real
+  model under the fixed-latency promise; the measured default is 266 px at a
+  latency of 5 frames on Apple M1 Pro.
 
 ### Changed
 
