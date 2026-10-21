@@ -5,25 +5,42 @@
 //! be given any cost; the WGSL is in `shaders.wgsl`. The compute dispatch is
 //! sized to fill the GPU, so a slice's time grows with its iteration count and
 //! not with how few invocations it launches.
+//!
+//! The browser host (`beatlm-web`) compiles this file by path, so a browser run
+//! and a native run time the same kernels at the same sizes and their reports
+//! can be compared. That is why nothing here names a bench type, and why the
+//! render target is the caller's: the bench draws into an offscreen texture,
+//! the browser into its canvas, both of [`TARGET_FORMAT`] and
+//! [`RENDER_WIDTH`] by [`RENDER_HEIGHT`].
 
 use wgpu::util::DeviceExt;
 
-/// Width of the offscreen render target, in pixels.
+/// Width of the render target, in pixels.
 pub const RENDER_WIDTH: u32 = 1280;
-/// Height of the offscreen render target, in pixels.
+/// Height of the render target, in pixels.
 pub const RENDER_HEIGHT: u32 = 720;
+/// The render target's format, which the render pipeline is built for. A
+/// WebGPU canvas can always be configured with it.
+pub const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
+/// Loop iterations per slice-kernel invocation that put one slice at 0.8 to
+/// 1.4 ms on an Apple M1 Pro (Metal); see the `beatlm-bench` crate
+/// documentation.
+pub const DEFAULT_SLICE_ITERS: u32 = 500;
+
+/// Loop iterations per pixel that put the render pass at about 2 ms on an
+/// Apple M1 Pro (Metal); see the `beatlm-bench` crate documentation.
+pub const DEFAULT_RENDER_ITERS: u32 = 50;
 
 const WORKGROUP_SIZE: u32 = 64;
 const WORKGROUPS: u32 = 1024;
-const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
-/// The pipelines, bindings and targets of the synthetic load.
+/// The pipelines and bindings of the synthetic load.
 pub struct Workload {
     compute_pipeline: wgpu::ComputePipeline,
     compute_bind_group: wgpu::BindGroup,
     render_pipeline: wgpu::RenderPipeline,
     render_bind_group: wgpu::BindGroup,
-    target_view: wgpu::TextureView,
 }
 
 impl Workload {
@@ -104,28 +121,11 @@ impl Workload {
             }],
         });
 
-        let target = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("beatlm-bench target"),
-            size: wgpu::Extent3d {
-                width: RENDER_WIDTH,
-                height: RENDER_HEIGHT,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: TARGET_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
-        let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
-
         Self {
             compute_pipeline,
             compute_bind_group,
             render_pipeline,
             render_bind_group,
-            target_view,
         }
     }
 
@@ -144,17 +144,19 @@ impl Workload {
         pass.dispatch_workgroups(WORKGROUPS, 1, 1);
     }
 
-    /// Records the render pass: one full-screen triangle into the offscreen
-    /// target.
+    /// Records the render pass: one full-screen triangle into `target`, a
+    /// view of a [`TARGET_FORMAT`] texture of [`RENDER_WIDTH`] by
+    /// [`RENDER_HEIGHT`] pixels.
     pub fn encode_render(
         &self,
         encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
         timestamp_writes: Option<wgpu::RenderPassTimestampWrites<'_>>,
     ) {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("beatlm-bench render"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &self.target_view,
+                view: target,
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {

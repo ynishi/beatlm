@@ -75,6 +75,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "beatlm-web"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "beatlm",
+ "beatlm-core",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "wgpu",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

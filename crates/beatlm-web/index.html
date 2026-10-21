@@ -1,0 +1,32 @@
+<!doctype html>
+<!--
+  The page `just build-web` serves beside the module. The module finds the
+  canvas and the report by their ids and writes the report as plain text, one
+  `name: value` fact per line, ending with `status: done` or `status: failed`.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>beatlm web host</title>
+  <style>
+    body { margin: 16px; font-family: system-ui, sans-serif; background: #111; color: #ddd; }
+    /* The canvas draws 1280x720 pixels whatever size it is shown at. */
+    canvas { display: block; width: 640px; max-width: 100%; aspect-ratio: 16 / 9; background: #000; }
+    pre { font: 12px/1.4 ui-monospace, monospace; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <canvas id="beatlm-canvas" width="1280" height="720"></canvas>
+  <pre id="beatlm-report">status: loading</pre>
+  <script type="module">
+    import init from "./beatlm_web.js";
+    // The module's start function runs inside `init`; a failure to load the
+    // module at all lands here instead.
+    init().catch((error) => {
+      const report = document.getElementById("beatlm-report");
+      report.textContent += `\nerror: ${error}\nstatus: failed\n`;
+      console.error(error);
+    });
+  </script>
+</body>
+</html>

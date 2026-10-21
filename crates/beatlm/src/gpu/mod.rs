@@ -24,19 +24,23 @@
 //!
 //! Memory is the other thing this module realises. [`profile`] is the one place
 //! wgpu's limits and features are read, and becomes the core's
-//! [`DeviceProfile`](beatlm_core::device::DeviceProfile); [`Arenas`] turns a
-//! [`MemoryPlan`](beatlm_core::memory::MemoryPlan) into buffers, once, so the
+//! [`DeviceProfile`](beatlm_core::device::DeviceProfile); [`required_limits`]
+//! says what a device must be created with to hold a
+//! [`MemoryPlan`](beatlm_core::memory::MemoryPlan), and refuses a plan the
+//! adapter cannot hold; [`Arenas`] turns the plan into buffers, once, so the
 //! steady-state loop creates none.
 //!
 //! [`SliceTimer`] is the entry point for timing; the host's side of the frame it plugs into
 //! is described in the [crate documentation](crate#the-hosts-side-of-a-frame).
 
 mod arenas;
+mod limits;
 mod profile;
 mod ring;
 mod timer;
 
 pub use arenas::{ArenaError, Arenas};
+pub use limits::{LimitsError, required_limits};
 pub use profile::profile;
 pub use timer::{
     FrameTimestamps, FrameTiming, MAX_SLICES, RING_DEPTH, SliceTimer, TimerError, TimerStats,
