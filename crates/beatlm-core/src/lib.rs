@@ -66,13 +66,16 @@
 //! |---|---|
 //! | A result is delivered exactly on its promised frame or beat; a finished result seen after a skipped deadline frame is missed, not delivered late. | [`schedule::Scheduler`] (deadlines from [`sync::SyncPolicy`]) |
 //! | The source is delayed by the promised latency so it aligns with results. | [`sync::SyncPolicy::source_delay`] |
+//! | Jobs of one scheduler run in submission order, never interleaved, because they share one memory plan. | [`schedule::Scheduler::plan_frame`] |
+//! | A job's output stays intact until its delivery frame is rendered: the host keeps one output slot per in-flight job. | [`sync::SyncPolicy::max_in_flight`] |
 //! | The summed estimate of the slices run in a frame never exceeds that frame's budget. | [`schedule::Scheduler::plan_frame`] |
 //! | A frame's budget is its period minus measured render time minus a margin, never negative. | [`budget::Budget::for_frame`] |
 //! | An on-beat deadline is the first beat at or after submission time plus estimated work plus margin. | [`schedule::Scheduler::submit`] |
 //! | A missed deadline is always reported, with the policy that says what to show. | [`schedule::Scheduler::plan_frame`] |
 //! | Cost estimates change only through measurements. | [`cost::CostModel::record`] |
 //! | One dispatch never runs longer than a bound, because a GPU cannot be preempted mid-dispatch. | the plan that slices a model |
-//! | Tensors whose lifetimes overlap never share memory; buffers respect the adapter's binding size and alignment. | the memory plan |
+//! | Tensors whose lifetimes overlap never share memory; arenas respect the adapter's binding size and offset alignment; a tensor too large for an arena is an error, never split. | [`memory::MemoryPlan`] |
+//! | A plan made against the baseline profile is valid on every adapter. | [`device::DeviceProfile::webgpu_baseline`], checked for other profiles by [`memory::MemoryPlan::valid_on`] |
 //! | The steady-state loop allocates nothing and reads nothing back except timestamps. | the plan |
 //! | A kernel stays within the adapter's workgroup memory and requests only features the adapter has; a kernel using subgroups has a variant without them. | the kernel IR |
 //!
@@ -80,8 +83,10 @@
 //!
 //! Decisions expected to move are kept behind one owner each: the statistic a
 //! cost estimate uses lives in [`cost`], the delivery promises in [`sync`],
-//! deadline ordering in [`schedule`]. Shader languages, model formats and GPU
-//! backends are not decided here at all.
+//! the order jobs are served in [`schedule`], the packing algorithm that places tensors
+//! in memory in [`memory`]. Shader languages, model formats and GPU backends are
+//! not decided here at all; what an adapter reports reaches the core only as
+//! the plain values of a [`device::DeviceProfile`].
 
 // Also set as a workspace lint. Kept at the crate root so the requirement is
 // visible where the crate's documentation starts, and survives the crate
@@ -90,6 +95,8 @@
 
 pub mod budget;
 pub mod cost;
+pub mod device;
+pub mod memory;
 pub mod schedule;
 pub mod sync;
 pub mod time;

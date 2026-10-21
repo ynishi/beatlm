@@ -43,6 +43,30 @@ impl SyncPolicy {
             Self::OnBeat { .. } => None,
         }
     }
+
+    /// How many jobs can be in flight at once, or `None` when the policy does
+    /// not bound it.
+    ///
+    /// A job is in flight from its submission until its delivery frame has
+    /// been rendered, and its output must stay intact for all of that time:
+    /// the next job overwrites a shared output as soon as its last slice runs,
+    /// which can be before the earlier job's delivery frame renders. The host
+    /// therefore keeps one output slot per in-flight job and reads the slot of
+    /// the job being delivered.
+    ///
+    /// `FixedLatency { frames: k }` has the inputs of `k + 1` consecutive
+    /// frames in flight, `SameFrame` one. `OnBeat` does not bound it: how many
+    /// jobs wait for a beat depends on the beat spacing and on how fast inputs
+    /// arrive, so the host bounds it and decides what happens to an input
+    /// beyond the bound.
+    #[must_use]
+    pub const fn max_in_flight(&self) -> Option<u32> {
+        match self {
+            Self::FixedLatency { frames } => Some(frames.saturating_add(1)),
+            Self::SameFrame => Some(1),
+            Self::OnBeat { .. } => None,
+        }
+    }
 }
 
 /// What the host shows for an input whose deadline passed without a complete
@@ -75,6 +99,30 @@ mod tests {
                 margin: Micros::ZERO
             }
             .source_delay(),
+            None
+        );
+    }
+
+    #[test]
+    fn max_in_flight_follows_policy() {
+        assert_eq!(
+            SyncPolicy::FixedLatency { frames: 0 }.max_in_flight(),
+            Some(1)
+        );
+        assert_eq!(
+            SyncPolicy::FixedLatency { frames: 2 }.max_in_flight(),
+            Some(3)
+        );
+        assert_eq!(
+            SyncPolicy::FixedLatency { frames: u32::MAX }.max_in_flight(),
+            Some(u32::MAX)
+        );
+        assert_eq!(SyncPolicy::SameFrame.max_in_flight(), Some(1));
+        assert_eq!(
+            SyncPolicy::OnBeat {
+                margin: Micros::ZERO
+            }
+            .max_in_flight(),
             None
         );
     }

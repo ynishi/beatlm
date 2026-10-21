@@ -9,8 +9,20 @@
 //!
 //! A [`Scheduler`] turns each submitted input into a job with a deadline fixed
 //! by its [`SyncPolicy`]. Each frame it spends the [`Budget`] on pending jobs
-//! in earliest-deadline-first order, delivers the jobs whose deadline arrives
-//! and are complete, and reports the ones that are not as missed.
+//! in submission order, delivers the jobs whose deadline arrives and are
+//! complete, and reports the ones that are not as missed.
+//!
+//! # Jobs run as one sequence
+//!
+//! Jobs of one scheduler share one [`MemoryPlan`](crate::memory::MemoryPlan),
+//! which lets tensors of non-overlapping lifetimes share bytes over one job's
+//! operations in program order. A later job's first slice would overwrite
+//! bytes an earlier job's remaining slices still read, so slices never
+//! interleave: no job receives a slice while an earlier, not-yet-missed job
+//! has slices left. This is the rule even where it is not earliest deadline
+//! first: an `OnBeat` job with little work can target an earlier beat than an
+//! older, larger one, and it still waits. A job the budget cannot finish is
+//! missed (and reported) rather than overtaken.
 
 use thiserror::Error;
 
@@ -159,8 +171,9 @@ impl Job {
 /// Decides, frame by frame, which slices run and which results are delivered.
 ///
 /// It owns the promise made by a [`SyncPolicy`]: it fixes each job's deadline
-/// at submission, spends the frame budget earliest deadline first, and reports
-/// every deadline it could not keep with the configured [`MissPolicy`].
+/// at submission, spends the frame budget on jobs in submission order (see the
+/// [module documentation](self#jobs-run-as-one-sequence)), and reports every
+/// deadline it could not keep with the configured [`MissPolicy`].
 #[derive(Debug, Clone)]
 pub struct Scheduler {
     policy: SyncPolicy,
@@ -243,11 +256,13 @@ impl Scheduler {
     /// Plans `frame`: hands out slices within `budget`, then delivers or
     /// reports the jobs whose deadline arrives.
     ///
-    /// Pending jobs are served earliest deadline first, ties to the lower
-    /// [`JobId`]. A job's slices go out in order while they fit; when its next
-    /// slice does not fit the job waits and a later job's smaller slice may use
-    /// the rest. The summed estimate of the runs never exceeds `budget`. A job
-    /// whose deadline is already behind `frame` gets no slices.
+    /// Pending jobs are served in submission ([`JobId`]) order and never
+    /// interleave, because they share one memory plan: a job's slices go out in
+    /// order while they fit, and when its next slice does not fit the remaining
+    /// budget no slice of any later job is handed out this frame, however
+    /// small. The summed estimate of the runs never exceeds `budget`. A job
+    /// whose deadline is already behind `frame` gets no slices, does not hold
+    /// up the jobs after it, and is reported missed by this plan.
     ///
     /// A job is complete once all its slices were handed out in this or an
     /// earlier frame. A job whose deadline arrives with `frame` is delivered if
@@ -259,18 +274,19 @@ impl Scheduler {
     /// complete job whose deadline has not arrived stays, which is what keeps
     /// latency fixed when work finishes early.
     pub fn plan_frame(&mut self, frame: FrameInfo, budget: Budget, cost: &CostModel) -> FramePlan {
-        self.pending.sort_by_key(|job| (job.deadline, job.id));
-
+        // `pending` is in submission order: jobs are only ever pushed, and
+        // removal keeps the order of the rest.
         let mut runs = Vec::new();
         let mut spent = Micros::ZERO;
-        for job in &mut self.pending {
+        'jobs: for job in &mut self.pending {
             if job.deadline.passed(frame) {
                 continue;
             }
             while let Some(&slice) = job.slices.get(job.scheduled) {
                 let after = spent.saturating_add(cost.estimate(slice));
                 if after > budget.get() {
-                    break;
+                    // No later job may run before this one has finished.
+                    break 'jobs;
                 }
                 runs.push(SliceRun {
                     job: job.id,
@@ -462,7 +478,7 @@ mod tests {
     }
 
     #[test]
-    fn budget_is_never_exceeded_and_leftover_goes_to_a_later_job() {
+    fn budget_is_never_exceeded_and_leftover_is_not_given_to_a_later_job() {
         let mut c = cost();
         c.record(SliceId::new(2), Micros::new(40));
         let mut s = sched(SyncPolicy::FixedLatency { frames: 5 }, MissPolicy::Drop);
@@ -472,10 +488,16 @@ mod tests {
 
         let p = s.plan_frame(frame(1), budget(150), &c);
         let used: Vec<(JobId, usize)> = p.runs.iter().map(|r| (r.job, r.position)).collect();
-        // A's first slice fits, A's second does not, B's small slice fills in.
-        assert_eq!(used, vec![(a, 0), (b, 0)]);
-        assert_eq!(p.spent_estimate, Micros::new(140));
+        // A's first slice fits, A's second does not; B's 40 us slice would fit
+        // the 50 us left but must wait for A to finish.
+        assert_eq!(used, vec![(a, 0)]);
+        assert_eq!(p.spent_estimate, Micros::new(100));
         assert!(p.spent_estimate <= p.budget.get());
+
+        let p = s.plan_frame(frame(2), budget(150), &c);
+        let used: Vec<(JobId, usize)> = p.runs.iter().map(|r| (r.job, r.position)).collect();
+        assert_eq!(used, vec![(a, 1), (b, 0)]);
+        assert_eq!(p.spent_estimate, Micros::new(140));
 
         let sum = p
             .runs
@@ -501,16 +523,69 @@ mod tests {
     }
 
     #[test]
-    fn earliest_deadline_gets_slices_first() {
+    fn oldest_job_gets_slices_first_even_with_the_later_deadline() {
+        // Inputs submitted out of frame order: the older job has the later
+        // deadline, and still runs first.
         let mut s = sched(SyncPolicy::FixedLatency { frames: 5 }, MissPolicy::Drop);
         let c = cost();
-        let late = s.submit(frame(3), slices(&[0]), &c).unwrap();
-        let early = s.submit(frame(1), slices(&[0]), &c).unwrap();
-        assert!(late < early);
+        let first = s.submit(frame(3), slices(&[0]), &c).unwrap();
+        let second = s.submit(frame(1), slices(&[0]), &c).unwrap();
+        assert!(first < second);
 
         let p = s.plan_frame(frame(3), budget(100), &c);
         assert_eq!(p.runs.len(), 1);
-        assert_eq!(p.runs[0].job, early);
+        assert_eq!(p.runs[0].job, first);
+    }
+
+    #[test]
+    fn later_job_never_gets_a_slice_while_an_earlier_job_has_slices_left() {
+        let mut c = cost();
+        // Job B's slices are cheap enough to fit every leftover.
+        c.record(SliceId::new(10), Micros::new(10));
+        c.record(SliceId::new(11), Micros::new(10));
+        let mut s = sched(SyncPolicy::FixedLatency { frames: 6 }, MissPolicy::Drop);
+        let a = s.submit(frame(0), slices(&[0, 1, 2, 3]), &c).unwrap();
+        let b = s.submit(frame(1), slices(&[10, 11]), &c).unwrap();
+
+        let mut a_left = 4;
+        let mut b_ran = 0;
+        // 250 us fits two of A's 100 us slices and leaves 50 us over.
+        for f in 1..8 {
+            let p = s.plan_frame(frame(f), budget(250), &c);
+            for run in &p.runs {
+                if run.job == a {
+                    a_left -= 1;
+                } else {
+                    assert_eq!(run.job, b);
+                    assert_eq!(a_left, 0, "frame {f}: B ran while A had slices left");
+                    b_ran += 1;
+                }
+            }
+            // Within a frame A's slices also precede B's.
+            let first_b = p.runs.iter().position(|r| r.job == b);
+            let last_a = p.runs.iter().rposition(|r| r.job == a);
+            if let (Some(fb), Some(la)) = (first_b, last_a) {
+                assert!(la < fb, "frame {f}");
+            }
+        }
+        assert_eq!((a_left, b_ran), (0, 2));
+    }
+
+    #[test]
+    fn a_missed_job_does_not_hold_up_the_jobs_after_it() {
+        let c = cost();
+        let mut s = sched(SyncPolicy::SameFrame, MissPolicy::Drop);
+        // The host skipped frame 0, so job A's deadline is behind frame 1; B's
+        // is frame 1 itself.
+        let a = s.submit(frame(0), slices(&[0, 1]), &c).unwrap();
+        let b = s.submit(frame(1), slices(&[0]), &c).unwrap();
+        let p = s.plan_frame(frame(1), budget(1_000), &c);
+        assert_eq!(p.runs.len(), 1);
+        assert_eq!(p.runs[0].job, b);
+        assert_eq!(p.missed.len(), 1);
+        assert_eq!(p.missed[0].job, a);
+        assert_eq!(p.delivered.len(), 1);
+        assert_eq!(p.delivered[0].job, b);
     }
 
     #[test]
