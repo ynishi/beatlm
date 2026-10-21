@@ -57,6 +57,8 @@
 //! the kernels, and the kernels that read the input or write the output get
 //! one bind group per slot, all created in [`Net::new`], so choosing a slot in
 //! the loop creates nothing. The kernels between share one bind group.
+//! [`Net::new`] takes the program with the [`Numbers`] it is realised with,
+//! which is how the depth model (`depth.rs`) gets the same slots.
 //!
 //! Two simplifications are the workload's, not the engine's:
 //!
@@ -421,25 +423,75 @@ pub fn dump_wgsl(dir: &Path, fusion: Fusion) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+/// What a program is realised with besides its kernels: which of its tensors
+/// are a job's input and output, every weight's numbers, and each slot's
+/// input. The network's are [`Numbers::net`]; the depth model's come from its
+/// weights file (`depth.rs`), so both run through one [`Net`] with the same
+/// slots and bind groups.
+pub struct Numbers {
+    /// The graph's input, which is slot 0's.
+    pub input: TensorId,
+    /// The graph's output, which is slot 0's.
+    pub output: TensorId,
+    /// Every weight of the graph with its numbers.
+    pub weights: Vec<(TensorId, Vec<f32>)>,
+    /// The numbers of a slot's input, uploaded once per slot before the loop.
+    pub slot_input: Box<dyn Fn(u32) -> Vec<f32>>,
+}
+
+impl Numbers {
+    /// The network's at `shape`: [`Data`]'s weights, and each slot's input
+    /// from its own seed.
+    pub fn net(shape: &Shape) -> Self {
+        let shape = *shape;
+        Self {
+            input: input_id(0),
+            output: output_id(0),
+            weights: Data::generate(&shape).weights,
+            slot_input: Box::new(move |slot| Data::input(&shape, slot)),
+        }
+    }
+
+    /// The input tensor of slot `slot`: the graph's own for slot 0, a stand-in
+    /// numbered from the input base for every other.
+    fn input_of(&self, slot: u32) -> TensorId {
+        if slot == 0 {
+            self.input
+        } else {
+            input_id(slot)
+        }
+    }
+
+    /// The output tensor of slot `slot`, as [`input_of`](Self::input_of).
+    fn output_of(&self, slot: u32) -> TensorId {
+        if slot == 0 {
+            self.output
+        } else {
+            output_id(slot)
+        }
+    }
+}
+
 /// The program's tensors with one input and one output stand-in for each slot
-/// after the first, all for the memory plan.
-fn tensors(program: &Program, slots: u32) -> Result<Vec<TensorDesc>> {
+/// after the first, all for the memory plan. A stand-in's id that the program
+/// already uses is refused by `Program::stand_in`.
+fn tensors(program: &Program, numbers: &Numbers, slots: u32) -> Result<Vec<TensorDesc>> {
     let mut all = program.tensors().to_vec();
     for slot in 1..slots {
-        all.push(program.stand_in(input_id(0), input_id(slot))?);
-        all.push(program.stand_in(output_id(0), output_id(slot))?);
+        all.push(program.stand_in(numbers.input, numbers.input_of(slot))?);
+        all.push(program.stand_in(numbers.output, numbers.output_of(slot))?);
     }
     Ok(all)
 }
 
 /// One binding set per slot: the graph's input and output rebound to the
 /// slot's.
-fn binding_sets(slots: u32) -> Vec<Vec<Substitution>> {
+fn binding_sets(numbers: &Numbers, slots: u32) -> Vec<Vec<Substitution>> {
     (0..slots)
         .map(|slot| {
             vec![
-                (input_id(0), input_id(slot)),
-                (output_id(0), output_id(slot)),
+                (numbers.input, numbers.input_of(slot)),
+                (numbers.output, numbers.output_of(slot)),
             ]
         })
         .collect()
@@ -462,10 +514,11 @@ pub struct Net {
 }
 
 impl Net {
-    /// Plans the memory of `program`, the network at `shape` lowered and
-    /// perhaps split, against the baseline profile, creates the arenas,
-    /// uploads the weights and the `slots` inputs, and builds every kernel
-    /// with a bind group for every slot that needs one.
+    /// Plans the memory of `program`, the network or the depth model lowered
+    /// and perhaps split, with `slots` input and output slots, against the
+    /// baseline profile, creates the arenas, uploads every weight and each
+    /// slot's input from `numbers`, and builds every kernel with a bind group
+    /// for every slot that needs one.
     ///
     /// `slots` is the number of jobs that can be in flight, from
     /// `SyncPolicy::max_in_flight`. A split program is planned like any other:
@@ -473,43 +526,45 @@ impl Net {
     ///
     /// # Errors
     ///
-    /// No slots or more than [`MAX_SLOTS`], tensors that cannot be planned, a
-    /// program of another shape, a plan the device cannot hold, or a kernel
-    /// that cannot be generated or bound.
+    /// No slots or more than [`MAX_SLOTS`], tensors that cannot be planned,
+    /// numbers whose sizes are not the program's tensors' (a program of
+    /// another shape), a plan the device cannot hold, or a kernel that cannot
+    /// be generated or bound.
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        shape: &Shape,
+        numbers: &Numbers,
         slots: u32,
         program: Program,
     ) -> Result<Self> {
         if slots == 0 || slots > MAX_SLOTS {
             bail!("{slots} slots; the network has between 1 and {MAX_SLOTS}");
         }
-        let descs = tensors(&program, slots)?;
+        let descs = tensors(&program, numbers, slots)?;
         let plan = MemoryPlan::new(&descs, &DeviceProfile::webgpu_baseline())
             .context("cannot plan the network's memory")?;
         let arenas = Arenas::new(device, &plan).context("cannot create the arenas")?;
 
-        let mut uploads = Data::generate(shape).weights;
-        uploads.extend((0..slots).map(|slot| (input_id(slot), Data::input(shape, slot))));
-        for (id, numbers) in &uploads {
-            // `program` is given apart from `shape`, so a program of another
-            // shape must not be uploaded into: the data of a smaller shape
-            // would leave the rest of a larger tensor unwritten.
+        let inputs: Vec<(TensorId, Vec<f32>)> = (0..slots)
+            .map(|slot| (numbers.input_of(slot), (numbers.slot_input)(slot)))
+            .collect();
+        for (id, values) in numbers.weights.iter().chain(&inputs) {
+            // `program` is given apart from its numbers, so a program of
+            // another shape must not be uploaded into: the data of a smaller
+            // shape would leave the rest of a larger tensor unwritten.
             let elements = descs.iter().find(|t| t.id == *id).map(|t| t.elements);
-            if elements != u64::try_from(numbers.len()).ok() {
+            if elements != u64::try_from(values.len()).ok() {
                 bail!(
                     "tensor {}: {} numbers at this shape for a program tensor of {elements:?} elements; the program is of another shape",
                     id.get(),
-                    numbers.len()
+                    values.len()
                 );
             }
             let placement = plan.placement(*id).context("a tensor has no placement")?;
             let buffer = arenas
                 .buffer(placement.arena)
                 .context("a placement names no arena")?;
-            let bytes: Vec<u8> = numbers.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
             // `write_buffer` checks only the buffer's end, so data longer than
             // its placement would overwrite a neighbouring tensor in the arena.
             if u64::try_from(bytes.len()).map_or(true, |len| len > placement.size) {
@@ -528,7 +583,7 @@ impl Net {
             &plan,
             &arenas,
             program.kernels(),
-            &binding_sets(slots),
+            &binding_sets(numbers, slots),
         )
         .context("cannot build the network's kernels")?;
         Ok(Self {
@@ -896,8 +951,14 @@ mod tests {
         let shape = TEST_SHAPE;
         let want = reference_output(&shape, &Data::input(&shape, 0));
         for fusion in [Fusion::On, Fusion::Off] {
-            let net =
-                Net::new(&device, &queue, &shape, 1, program(&shape, fusion).unwrap()).unwrap();
+            let net = Net::new(
+                &device,
+                &queue,
+                &Numbers::net(&shape),
+                1,
+                program(&shape, fusion).unwrap(),
+            )
+            .unwrap();
             let plan = net.plan();
             assert!(plan.total_bytes() < plan.placements().map(|(_, p)| p.size).sum::<u64>());
             let got = run_job(&device, &queue, &net);
@@ -916,7 +977,7 @@ mod tests {
             Net::new(
                 &device,
                 &queue,
-                &TEST_SHAPE,
+                &Numbers::net(&TEST_SHAPE),
                 1,
                 program(&TEST_SHAPE, fusion).unwrap(),
             )
@@ -943,14 +1004,21 @@ mod tests {
         for fusion in [Fusion::On, Fusion::Off] {
             let whole_program = program(&shape, fusion).unwrap();
             let kernels = whole_program.kernels().len();
-            let whole = Net::new(&device, &queue, &shape, 1, whole_program.clone()).unwrap();
+            let whole = Net::new(
+                &device,
+                &queue,
+                &Numbers::net(&shape),
+                1,
+                whole_program.clone(),
+            )
+            .unwrap();
             let whole_out = run_job(&device, &queue, &whole);
             // Counts that do and do not divide the kernels' sizes, and ones
             // past what they allow.
             for counts in [[2_u32, 3, 5, 7, 4, 3, 9, 11, 2, 6], [64; 10]] {
                 let split = whole_program.split(&counts[..kernels]).unwrap();
                 assert!(split.kernels().len() > kernels);
-                let net = Net::new(&device, &queue, &shape, 1, split).unwrap();
+                let net = Net::new(&device, &queue, &Numbers::net(&shape), 1, split).unwrap();
                 let got = run_job(&device, &queue, &net);
                 let what = format!("network split {:?}, fusion {fusion:?}", &counts[..kernels]);
                 assert_close(&got, &want, &what);
@@ -993,7 +1061,7 @@ mod tests {
             Some(parts) => whole.split(parts).unwrap(),
             None => whole,
         };
-        let net = Net::new(&device, &queue, &shape, slots, program).unwrap();
+        let net = Net::new(&device, &queue, &Numbers::net(&shape), slots, program).unwrap();
 
         let mut cost = CostModel::new(
             Micros::new(100),
@@ -1079,7 +1147,7 @@ mod tests {
         let program = program(&TEST_SHAPE, Fusion::On).unwrap();
         assert_eq!(program.kernels().len(), 6);
         let plan = MemoryPlan::new(
-            &tensors(&program, 3).unwrap(),
+            &tensors(&program, &Numbers::net(&TEST_SHAPE), 3).unwrap(),
             &DeviceProfile::webgpu_baseline(),
         )
         .unwrap();
@@ -1191,7 +1259,8 @@ mod tests {
         }
         assert_eq!(fused.role(D2), Some(TensorRole::Activation));
         let bytes = |p: &Program| {
-            MemoryPlan::new(&tensors(p, 3).unwrap(), &DeviceProfile::webgpu_baseline())
+            let all = tensors(p, &Numbers::net(&DEFAULT_SHAPE), 3).unwrap();
+            MemoryPlan::new(&all, &DeviceProfile::webgpu_baseline())
                 .unwrap()
                 .total_bytes()
         };
@@ -1202,8 +1271,8 @@ mod tests {
     fn the_default_shape_plans_and_reuses_memory() {
         for fusion in [Fusion::On, Fusion::Off] {
             let p = program(&DEFAULT_SHAPE, fusion).unwrap();
-            let plan = MemoryPlan::new(&tensors(&p, 3).unwrap(), &DeviceProfile::webgpu_baseline())
-                .unwrap();
+            let all = tensors(&p, &Numbers::net(&DEFAULT_SHAPE), 3).unwrap();
+            let plan = MemoryPlan::new(&all, &DeviceProfile::webgpu_baseline()).unwrap();
             let summed: u64 = plan.placements().map(|(_, p)| p.size).sum();
             assert!(plan.total_bytes() < summed);
             assert!(plan.peak_live_bytes() <= plan.total_bytes());
@@ -1258,7 +1327,7 @@ mod tests {
     #[test]
     fn slot_tensors_live_for_the_whole_program_and_share_nothing() {
         let p = program(&DEFAULT_SHAPE, Fusion::On).unwrap();
-        let all = tensors(&p, 3).unwrap();
+        let all = tensors(&p, &Numbers::net(&DEFAULT_SHAPE), 3).unwrap();
         let plan = MemoryPlan::new(&all, &DeviceProfile::webgpu_baseline()).unwrap();
         let last = u32::try_from(p.kernels().len() - 1).unwrap();
         let io: Vec<_> = (0..3)

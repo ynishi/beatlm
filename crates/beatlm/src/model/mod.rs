@@ -26,12 +26,17 @@
 //!   `[out][in][kh][kw]`); kernels read the IR's (`[in][out]`, HWIO; the
 //!   [`kernel`](beatlm_core::kernel#layouts) documentation). [`Weight::numbers`]
 //!   converts a tensor when it is read, as its [`Convert`] says, so no kernel
-//!   knows a file's layout and none pays for a transpose in a frame.
+//!   knows a file's layout and none pays for a transpose in a frame. A
+//!   number that depends only on the weights and the shape the graph was
+//!   built for is computed there too: a position embedding resampled to
+//!   another image size ([`Convert::InterpolatePositions`], which says where
+//!   the reason it is not a kernel is written).
 //! - **Every tensor of the graph comes from the builder.** It hands out ids in
 //!   the order tensors are declared, so the same model builds the same graph,
 //!   with the same ids, every time.
 
 pub mod depth_anything_v2;
+mod positions;
 
 use std::fmt::Debug;
 
@@ -56,6 +61,17 @@ pub enum ModelError {
     /// the source is the model's own configuration error.
     #[error("the configuration does not describe a model that can be built")]
     Config(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// The graph was asked for an image that is not a whole number of
+    /// patches a side, so it has no patch grid.
+    #[error(
+        "an image of {side} pixels a side is not a positive multiple of the {patch_size}-pixel patch"
+    )]
+    InputSize {
+        /// The side asked for, in pixels.
+        side: usize,
+        /// The model's patch side, in pixels.
+        patch_size: usize,
+    },
     /// A configuration value does not fit the IR's 32-bit dimensions.
     #[error("`{field}` is {value}, more than a kernel dimension holds")]
     TooLarge {
@@ -137,6 +153,20 @@ pub enum Convert {
     /// weight has the same shape either way, so only this conversion, not the
     /// shape, says which dimension is which.
     ConvTranspose,
+    /// A vision transformer's position embedding, `[1][1 + g * g][C]` in the
+    /// file for a `g x g` patch grid, for a graph whose patch grid is
+    /// `height x width`: the class token's row as stored, then the grid
+    /// resampled bicubically to `height x width` rows, as `transformers`'
+    /// DINOv2 does when the image is not the size the embedding was stored
+    /// for. The arithmetic, how it follows PyTorch's, and why it is done
+    /// here and not by a kernel are documented in the source of the private
+    /// `positions` module (`crates/beatlm/src/model/positions.rs`).
+    InterpolatePositions {
+        /// Patches down the graph's image.
+        height: u32,
+        /// Patches across the graph's image.
+        width: u32,
+    },
 }
 
 /// Where a weight's numbers come from: the tensors of these roles, each
@@ -284,7 +314,20 @@ fn convert(values: Vec<f32>, shape: &[usize], how: Convert) -> Option<(Vec<f32>,
             let cols = shape.last().copied().unwrap_or(1);
             (values, cols)
         }
-        (Convert::Linear | Convert::Conv | Convert::ConvTranspose, _) => return None,
+        (Convert::InterpolatePositions { height, width }, &[1, rows, channels]) => {
+            let to = (usize::try_from(height).ok()?, usize::try_from(width).ok()?);
+            (
+                positions::interpolate(&values, rows, channels, to)?,
+                channels,
+            )
+        }
+        (
+            Convert::Linear
+            | Convert::Conv
+            | Convert::ConvTranspose
+            | Convert::InterpolatePositions { .. },
+            _,
+        ) => return None,
     })
 }
 
@@ -440,6 +483,43 @@ mod tests {
         // A linear weight of another rank is refused, not read untransposed.
         assert_eq!(convert(vec![1.0; 6], &[1, 2, 3], Convert::Linear), None);
         assert_eq!(convert(vec![1.0; 6], &[2, 3], Convert::Conv), None);
+    }
+
+    #[test]
+    fn a_position_embedding_is_resampled_behind_its_class_row() {
+        // [1][1 + 2 * 2][2]: the class row, then a 2 x 2 grid that halved to
+        // one position is the mean of the four.
+        let stored = vec![9.0, -9.0, 1.0, 10.0, 2.0, 20.0, 3.0, 30.0, 4.0, 40.0];
+        let to_one = Convert::InterpolatePositions {
+            height: 1,
+            width: 1,
+        };
+        let (t, cols) = convert(stored.clone(), &[1, 5, 2], to_one).unwrap();
+        assert_eq!(cols, 2);
+        assert_eq!(&t[..2], &[9.0, -9.0]);
+        assert!((t[2] - 2.5).abs() < 1e-6 && (t[3] - 25.0).abs() < 1e-5);
+        // The same grid is returned as stored.
+        let same = Convert::InterpolatePositions {
+            height: 2,
+            width: 2,
+        };
+        assert_eq!(
+            convert(stored.clone(), &[1, 5, 2], same).unwrap(),
+            (stored.clone(), 2)
+        );
+        // A grid of 3 x 3 rows from 2 x 2 has ten rows.
+        let larger = Convert::InterpolatePositions {
+            height: 3,
+            width: 3,
+        };
+        assert_eq!(
+            convert(stored.clone(), &[1, 5, 2], larger).unwrap().0.len(),
+            20
+        );
+        // Another rank, or rows that are not a class token and a square, are
+        // refused.
+        assert_eq!(convert(stored.clone(), &[5, 2], to_one), None);
+        assert_eq!(convert(vec![0.0; 8], &[1, 4, 2], to_one), None);
     }
 
     #[test]

@@ -19,15 +19,17 @@ use anyhow::{Context, Result};
 use beatlm::gpu::{FrameTiming, MAX_SLICES, SliceTimer, TimerStats};
 use beatlm_core::budget::Budget;
 use beatlm_core::cost::{CostModel, Estimator, SliceId};
+use beatlm_core::kernel::Program;
 use beatlm_core::schedule::{FramePlan, JobId, Scheduler};
 use beatlm_core::sync::{MissPolicy, SyncPolicy};
 use beatlm_core::time::{FrameIndex, FrameInfo, Micros, TimePoint};
 
-use crate::args::{Args, EstimatorKind, WorkloadKind};
+use crate::args::{Args, EstimatorKind, Submit, WorkloadKind};
 use crate::calibrate::{Settings, calibrate};
 use crate::counters::{self, Watch};
+use crate::depth;
 use crate::device::Gpu;
-use crate::net::{self, Net};
+use crate::net::{self, Net, Numbers};
 use crate::pace::{FRAME_PERIOD, Tick, micros_between};
 use crate::workload::Workload;
 
@@ -55,14 +57,26 @@ const DRAIN_ATTEMPTS: usize = 8;
 pub const STARTUP_FRAMES: u64 = 2 * COST_WINDOW as u64;
 
 /// How many timed slices the loop's timer must hold for jobs of `slices`
-/// slices under a promised `latency`: a frame can run slices of every job
-/// still pending, not only its own, and a job lives `latency` frames past its
-/// submission, so `latency + 1` jobs can be pending at once. `None` when that
-/// is more than one query set can time ([`MAX_SLICES`]) or overflows.
-pub fn timer_capacity(slices: u32, latency: u32) -> Option<u32> {
+/// slices when `jobs` of them can have slices left at once
+/// ([`jobs_with_slices`]): a frame can run slices of every such job, not only
+/// its own. `None` when that is more than one query set can time
+/// ([`MAX_SLICES`]) or overflows.
+pub fn timer_capacity(slices: u32, jobs: u32) -> Option<u32> {
     slices
-        .checked_mul(latency.checked_add(1)?)
+        .checked_mul(jobs)
         .filter(|&capacity| capacity <= MAX_SLICES)
+}
+
+/// How many jobs can have slices left at once under `submit` and a promised
+/// `latency`. Submitting every frame, a job lives `latency` frames past its
+/// submission, so `latency + 1` can be pending with slices left. Submitting
+/// only once the last job's slices are all handed out, or it has left, one
+/// job at most has slices left. `None` on overflow.
+pub fn jobs_with_slices(submit: Submit, latency: u32) -> Option<u32> {
+    match submit {
+        Submit::Every => latency.checked_add(1),
+        Submit::Free => Some(1),
+    }
 }
 
 /// The cost model's statistic for the `--estimator` choice, with this
@@ -134,6 +148,9 @@ pub struct Outcome {
     pub longest_dispatch_us: Vec<u64>,
     /// Latency in frames of each delivered result.
     pub latencies: Vec<u64>,
+    /// Inputs submitted as jobs: one per frame with `--submit every`, fewer
+    /// with `--submit free`.
+    pub submitted: u64,
     /// Results delivered.
     pub delivered: u64,
     /// Deadlines that arrived without a complete result.
@@ -156,12 +173,12 @@ pub struct Outcome {
     /// before the run's first frame to the last one queued when it was stopped
     /// after the run; `None` when the run had no competing load.
     pub background_dispatches: Option<u64>,
-    /// The planned network's memory and allocation readings; `None` for the
+    /// The planned program's memory and allocation readings; `None` for the
     /// synthetic workload.
     pub net: Option<NetReport>,
 }
 
-/// What the `net` workload reports about memory.
+/// What the `net` and `depth` workloads report about memory.
 pub struct NetReport {
     /// Bytes of each arena.
     pub arenas: Vec<u64>,
@@ -213,17 +230,75 @@ pub struct Engine<'g> {
     slices: Vec<SliceId>,
     margin: Micros,
     latency: u32,
+    admission: Admission,
     /// Dispatches encoded so far for each job that is not yet delivered or
     /// missed, by submission index.
     job_dispatches: BTreeMap<u64, u64>,
     outcome: Outcome,
 }
 
+/// Whether a frame's input becomes a job: the `--submit` rule, kept apart
+/// from the device so a test can drive it against the scheduler alone.
+#[derive(Debug, Clone, Copy)]
+struct Admission {
+    submit: Submit,
+    /// The job submitted last, by submission index, with how many of its
+    /// slices are not yet handed out, while it has slices left and has not
+    /// left the scheduler: what `Submit::Free` waits for.
+    busy: Option<(JobId, usize)>,
+}
+
+impl Admission {
+    const fn new(submit: Submit) -> Self {
+        Self { submit, busy: None }
+    }
+
+    /// Whether this frame's input is submitted.
+    const fn takes_input(&self) -> bool {
+        match self.submit {
+            Submit::Every => true,
+            Submit::Free => self.busy.is_none(),
+        }
+    }
+
+    /// Records the frame's plan, after `job` of `slices` slices was submitted
+    /// for it if one was: the slices handed out, and the jobs that left.
+    fn planned(&mut self, job: Option<(JobId, usize)>, plan: &FramePlan) {
+        if job.is_some() {
+            self.busy = job;
+        }
+        if let Some((busy, left)) = &mut self.busy {
+            let handed_out = plan.runs.iter().filter(|run| run.job == *busy).count();
+            *left = left.saturating_sub(handed_out);
+            // A job that left the scheduler, delivered or missed with slices
+            // never handed out, no longer holds back the next input.
+            let gone = plan.delivered.iter().any(|d| d.job == *busy)
+                || plan.missed.iter().any(|m| m.job == *busy);
+            if *left == 0 || gone {
+                self.busy = None;
+            }
+        }
+    }
+}
+
+/// The unsplit program of a planned workload, and the numbers it is realised
+/// with.
+fn planned_program(args: &Args) -> Result<(Program, Numbers)> {
+    match args.workload {
+        WorkloadKind::Depth => depth::load(args.size, args.fusion),
+        WorkloadKind::Net => {
+            let shape = net::DEFAULT_SHAPE;
+            Ok((net::program(&shape, args.fusion)?, Numbers::net(&shape)))
+        }
+        WorkloadKind::Synthetic => anyhow::bail!("the synthetic workload has no program"),
+    }
+}
+
 impl<'g> Engine<'g> {
     /// Builds the run's workload, timer, scheduler and cost model on `gpu`;
-    /// for the network with splitting on, first calibrates its kernels, splits
-    /// them and measures the parts into the cost model the run then uses
-    /// (`calibrate.rs`); then runs every slice the workload has
+    /// for the network or the depth model with splitting on, first calibrates
+    /// its kernels, splits them and measures the parts into the cost model the
+    /// run then uses (`calibrate.rs`); then runs every slice the workload has
     /// once and one render pass to completion so shader compilation and
     /// first-use costs are not charged to frame 0.
     ///
@@ -236,21 +311,23 @@ impl<'g> Engine<'g> {
         let policy = SyncPolicy::FixedLatency {
             frames: args.latency,
         };
+        let jobs = jobs_with_slices(args.submit, args.latency)
+            .context("--latency is too large to count the jobs in flight")?;
         let mut kernel_parts = Vec::new();
         // The cost model calibration filled with the split program's parts, when
         // there was a calibration.
         let mut measured_cost = None;
         let net = match args.workload {
             WorkloadKind::Synthetic => None,
-            WorkloadKind::Net => {
-                let shape = net::DEFAULT_SHAPE;
-                let whole = net::program(&shape, args.fusion)?;
+            WorkloadKind::Net | WorkloadKind::Depth => {
+                let (whole, numbers) = planned_program(args)?;
                 // The job's kernels before splitting; `args` counted them
                 // from its own lowering, so check they agree.
                 if u32::try_from(whole.kernels().len()).ok() != Some(args.slices) {
                     anyhow::bail!(
-                        "--slices is {} but the network has {} kernels",
+                        "--slices is {} but the {} workload has {} kernels",
                         args.slices,
+                        args.workload.name(),
                         whole.kernels().len()
                     );
                 }
@@ -270,13 +347,13 @@ impl<'g> Engine<'g> {
                         let calibration = calibrate(
                             gpu,
                             &workload,
-                            &shape,
+                            &numbers,
                             &whole,
                             &Settings {
                                 estimator: estimator(args.estimator),
                                 prior: SLICE_PRIOR,
                                 bound: Micros::new(bound),
-                                latency: args.latency,
+                                jobs,
                             },
                         )?;
                         kernel_parts = names
@@ -298,18 +375,20 @@ impl<'g> Engine<'g> {
                     .max_in_flight()
                     .context("the policy does not bound the jobs in flight")?;
                 Some(
-                    Net::new(&gpu.device, &gpu.queue, &shape, slots, program)
-                        .context("cannot build the planned network")?,
+                    Net::new(&gpu.device, &gpu.queue, &numbers, slots, program)
+                        .context("cannot build the planned program")?,
                 )
             }
         };
-        // A job's slices are the network's kernels, each part of a split one
+        // A job's slices are the program's kernels, each part of a split one
         // included.
         let slices = net.as_ref().map_or(args.slices, Net::kernel_count);
-        let capacity = timer_capacity(slices, args.latency).with_context(|| {
+        let capacity = timer_capacity(slices, jobs).with_context(|| {
             format!(
-                "{slices} slices with --latency {} are more than the GPU timer can time ({MAX_SLICES})",
-                args.latency
+                "{slices} slices for each of {jobs} jobs with slices left (--latency {}, --submit \
+                 {}) are more than the GPU timer can time ({MAX_SLICES})",
+                args.latency,
+                args.submit.name()
             )
         })?;
         let timer: SliceTimer<Tag> = SliceTimer::new(&gpu.device, &gpu.queue, capacity)
@@ -339,6 +418,7 @@ impl<'g> Engine<'g> {
             slices: (0..slices).map(SliceId::new).collect(),
             margin: Micros::new(args.margin_us),
             latency: args.latency,
+            admission: Admission::new(args.submit),
             job_dispatches: BTreeMap::new(),
             outcome: Outcome::default(),
         };
@@ -422,9 +502,15 @@ impl<'g> Engine<'g> {
 
         let planning = Instant::now();
         let budget = Budget::for_frame(FRAME_PERIOD, self.render_estimate, self.margin);
-        self.scheduler
-            .submit(frame, self.slices.clone(), &self.cost)
-            .context("the scheduler rejected the frame's job")?;
+        let new_job = if self.admission.takes_input() {
+            let job = self
+                .scheduler
+                .submit(frame, self.slices.clone(), &self.cost)
+                .context("the scheduler rejected the frame's job")?;
+            Some(job)
+        } else {
+            None
+        };
         let plan = self.scheduler.plan_frame(frame, budget, &self.cost);
 
         let encoding = Instant::now();
@@ -467,7 +553,12 @@ impl<'g> Engine<'g> {
             .push(plan.runs.len() as u64);
         // Counted after the timed intervals, so the bookkeeping is not charged
         // to the encode time it is compared with. Every slice is one compute
-        // pass with one dispatch, in either workload.
+        // pass with one dispatch, in every workload.
+        if new_job.is_some() {
+            self.outcome.submitted += 1;
+        }
+        self.admission
+            .planned(new_job.map(|job| (job, self.slices.len())), &plan);
         for run in &plan.runs {
             *self.job_dispatches.entry(run.job.get()).or_default() += 1;
         }
@@ -575,32 +666,52 @@ impl<'g> Engine<'g> {
 
     /// Runs every slice the workload has once, and one render pass, to
     /// completion, so first-use costs are not charged to frame 0.
+    ///
+    /// A planned program runs once per slot, each slot its own submission
+    /// waited for before the next. One submission of every slot was the
+    /// depth model at 434 pixels and latency 13 run 14 times, about two
+    /// seconds of GPU work in one command buffer, and the device was lost
+    /// before the loop began (Apple M1 Pro, Metal, 2026-10-22); that is
+    /// consistent with the system ending a command buffer that runs too long,
+    /// which was not confirmed from a driver log.
     fn warm_up(&self) -> Result<()> {
-        let mut encoder = self
-            .gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        let device = &self.gpu.device;
+        let submit_and_wait = |encoder: wgpu::CommandEncoder| -> Result<()> {
+            self.gpu.queue.submit([encoder.finish()]);
+            device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .context("device poll failed")?;
+            Ok(())
+        };
+        let encoder = || {
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("beatlm-bench warm-up"),
-            });
+            })
+        };
         match &self.net {
             Some(net) => {
                 for slot in 0..net.slots() {
+                    let mut slot_encoder = encoder();
                     for slice in 0..net.kernel_count() {
-                        net.encode(&mut encoder, slot, SliceId::new(slice), None)?;
+                        net.encode(&mut slot_encoder, slot, SliceId::new(slice), None)?;
                     }
+                    submit_and_wait(slot_encoder)?;
                 }
             }
-            None => self.workload.encode_slice(&mut encoder, None),
+            None => {
+                let mut slice_encoder = encoder();
+                self.workload.encode_slice(&mut slice_encoder, None);
+                submit_and_wait(slice_encoder)?;
+            }
         }
-        self.workload.encode_render(&mut encoder, None);
-        self.gpu.queue.submit([encoder.finish()]);
+        let mut render_encoder = encoder();
+        self.workload.encode_render(&mut render_encoder, None);
+        submit_and_wait(render_encoder)?;
         // The network's uploads leave staging memory that wgpu releases on a
         // poll after the work completes, and the allocation counters are read
         // next, so it gets a second poll. The synthetic load has no uploads.
-        let polls = if self.net.is_some() { 2 } else { 1 };
-        for _ in 0..polls {
-            self.gpu
-                .device
+        if self.net.is_some() {
+            device
                 .poll(wgpu::PollType::wait_indefinitely())
                 .context("device poll failed")?;
         }
@@ -631,6 +742,7 @@ impl Future for ReadbackTurn<'_, '_> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -640,12 +752,77 @@ mod tests {
     }
 
     #[test]
-    fn the_timer_must_hold_the_slices_of_every_job_in_flight() {
-        assert_eq!(timer_capacity(6, 2), Some(18));
-        assert_eq!(timer_capacity(MAX_SLICES, 0), Some(MAX_SLICES));
-        assert_eq!(timer_capacity(MAX_SLICES, 1), None);
+    fn the_timer_must_hold_the_slices_of_every_job_with_slices_left() {
+        assert_eq!(timer_capacity(6, 3), Some(18));
+        assert_eq!(timer_capacity(MAX_SLICES, 1), Some(MAX_SLICES));
+        assert_eq!(timer_capacity(MAX_SLICES, 2), None);
         assert_eq!(timer_capacity(1, u32::MAX), None);
-        assert_eq!(timer_capacity(u32::MAX, 2), None);
+        assert_eq!(timer_capacity(u32::MAX, 3), None);
+        // Every frame's input: the latency plus one jobs. Only when the last
+        // is handed out: one, whatever the latency.
+        assert_eq!(jobs_with_slices(Submit::Every, 2), Some(3));
+        assert_eq!(jobs_with_slices(Submit::Every, u32::MAX), None);
+        assert_eq!(jobs_with_slices(Submit::Free, 17), Some(1));
+        assert_eq!(
+            timer_capacity(300, jobs_with_slices(Submit::Free, 17).unwrap()),
+            Some(300)
+        );
+        assert_eq!(
+            timer_capacity(300, jobs_with_slices(Submit::Every, 17).unwrap()),
+            None
+        );
+    }
+
+    /// The scheduler alone, for `frames` frames of a 10 ms budget, with jobs
+    /// of `slices` slices each estimated at 1 ms, under latency `k` and
+    /// `submit`: how many inputs were submitted, delivered and missed.
+    fn schedule_alone(submit: Submit, slices: u32, k: u32, frames: u64) -> (u64, u64, u64) {
+        let cost = CostModel::new(
+            Micros::new(1_000),
+            Estimator::MeanPlusSigmas {
+                alpha: 1.0,
+                sigmas: 0.0,
+            },
+        )
+        .unwrap();
+        let policy = SyncPolicy::FixedLatency { frames: k };
+        let mut scheduler = Scheduler::new(policy, MissPolicy::HoldPrevious, None).unwrap();
+        let mut admission = Admission::new(submit);
+        let job: Vec<SliceId> = (0..slices).map(SliceId::new).collect();
+        let (mut submitted, mut delivered, mut missed) = (0, 0, 0);
+        for i in 0..frames {
+            let frame = FrameInfo {
+                index: FrameIndex::new(i),
+                start: TimePoint::new(i * FRAME_PERIOD.get()),
+                period: FRAME_PERIOD,
+            };
+            let new_job = admission.takes_input().then(|| {
+                submitted += 1;
+                let id = scheduler.submit(frame, job.clone(), &cost).unwrap();
+                (id, job.len())
+            });
+            let plan = scheduler.plan_frame(frame, Budget::new(Micros::new(10_000)), &cost);
+            admission.planned(new_job, &plan);
+            delivered += plan.delivered.len() as u64;
+            missed += plan.missed.len() as u64;
+        }
+        (submitted, delivered, missed)
+    }
+
+    #[test]
+    fn a_job_longer_than_a_frame_starves_when_every_frame_submits_and_not_when_free() {
+        // 45 ms of work at 10 ms a frame is five frames, and latency 5 gives
+        // a job six. Every frame's input: job 0 is delivered, and every later
+        // job reaches the queue only when the one before it holds the budget
+        // until its own deadline, so each gets its deadline frame and misses.
+        assert_eq!(schedule_alone(Submit::Every, 45, 5, 120), (120, 1, 114));
+        // Only once the last job's slices are all handed out: one input every
+        // five frames, and every deadline that arrived is met.
+        assert_eq!(schedule_alone(Submit::Free, 45, 5, 120), (24, 23, 0));
+        // At latency 3 a job gets four frames and misses on the fourth; it
+        // leaves then, and the next frame takes the next input: one every four
+        // frames, every one missed.
+        assert_eq!(schedule_alone(Submit::Free, 45, 3, 120), (30, 0, 30));
     }
 
     #[test]

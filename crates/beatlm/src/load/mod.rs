@@ -45,7 +45,9 @@
 //! `just reference-depth-anything` runs the original `transformers`
 //! implementation on a fixed input and writes the input, the four encoder
 //! features the head reads and the predicted depth next to the weights, as raw
-//! little-endian `f32` files with a JSON manifest. It runs in an isolated
+//! little-endian `f32` files with a JSON manifest; given a side other than the
+//! default 518 (`just reference-depth-anything 266`), it does the same at that
+//! input size into a directory of its own. It runs in an isolated
 //! Python environment and nothing in the engine's build or tests requires it;
 //! it is what the graph is compared with. The input is defined by a formula in
 //! integers and single-precision arithmetic so that Rust computes the same
