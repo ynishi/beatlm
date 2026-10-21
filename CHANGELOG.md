@@ -101,3 +101,8 @@ and this project adheres to
   grid lives in `SyncPolicy::OnBeat` and can be replaced mid-session
   (`replace_beat_grid`, `time::BeatMap`). `Scheduler::new` no longer takes a
   grid or returns a `Result` (breaking).
+- `beatlm-web` paces frames by the display: every `requestAnimationFrame`
+  callback is a frame, started at the callback's timestamp, with the period
+  measured from the display instead of a fixed 60 Hz grid. Latency promised in
+  frames is shorter in time on a faster display. The report adds
+  `display_period_us` and `callback_interval_us`.
