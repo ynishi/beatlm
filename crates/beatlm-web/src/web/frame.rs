@@ -1,12 +1,15 @@
 //! The host's side of each frame, run from `requestAnimationFrame`.
 //!
 //! [`run`] registers one callback with the browser, and each callback is one
-//! [`Host::turn`]: it reads `performance.now()`, asks the [`Pacer`] whether the
-//! callback is a frame, and if it is runs the frame to its end before
-//! returning, in the order the `beatlm` crate documentation gives; then it asks
-//! for the next callback. Nothing in a turn waits. The map callbacks of the
+//! [`Host::turn`], which is one frame: the [`Pacer`] reads the callback's
+//! timestamp, the frame's start, to say which frame it is and how long the
+//! display's period is, and the frame runs to its end before the turn returns,
+//! in the order the `beatlm` crate documentation gives; then the turn asks for
+//! the next callback. Nothing in a turn waits. The map callbacks of the
 //! timestamp readbacks run from the event loop between turns, and a later
-//! turn collects what they completed.
+//! turn collects what they completed. `performance.now()` is still read
+//! inside a frame, for the CPU times the report quotes, which are durations on
+//! one clock and need no frame time.
 //!
 //! The frame's work is the bench's synchronous `tick` (`beatlm-bench`'s
 //! `engine.rs`) for the synthetic workload: the same budget and forecast, the
@@ -31,7 +34,7 @@ use wasm_bindgen::closure::Closure;
 use super::device::{self, Gpu};
 use super::page;
 use crate::config::{Config, MARGIN_US, SLICES};
-use crate::pace::{FRAME_PERIOD, FrameStart, Pace, Pacer, ms_to_us};
+use crate::pace::{FrameStart, NOMINAL_PERIOD, Pace, Pacer, ms_to_us};
 use crate::report::{Environment, Outcome, STARTUP_FRAMES, render};
 use crate::workload::Workload;
 
@@ -121,7 +124,9 @@ impl Host {
                 frames: config.latency,
             },
             MissPolicy::HoldPrevious,
-            Budget::for_frame(FRAME_PERIOD, RENDER_PRIOR, margin),
+            // Before the display's period is known, the nominal one; every
+            // frame sets its own budget from the period measured by then.
+            Budget::for_frame(NOMINAL_PERIOD, RENDER_PRIOR, margin),
         );
         let cost = CostModel::new(SLICE_PRIOR, Estimator::default())
             .context("cannot build the cost model")?;
@@ -147,25 +152,25 @@ impl Host {
         })
     }
 
-    /// One animation-frame callback: a frame when the pacer says it is one,
-    /// otherwise nothing, and once the frames are done a turn of the drain.
+    /// One animation-frame callback, which is one frame, and once the frames
+    /// are done a turn of the drain. `timestamp` is the callback's argument,
+    /// the display's frame time in milliseconds.
     ///
     /// # Errors
     ///
     /// A lost device, whose frames from then on would measure nothing, or a
     /// frame that fails.
-    fn turn(&mut self) -> Result<Turn> {
+    fn turn(&mut self, timestamp: f64) -> Result<Turn> {
         if let Some(lost) = device::device_lost() {
             bail!("the device was lost: {lost}");
         }
         let began = self.performance.now();
-        let now_us = ms_to_us(began);
+        let now_us = ms_to_us(timestamp);
         match self.pacer.frame_at(now_us) {
             Pace::Frame(start) => {
                 self.tick(start, began)?;
                 Ok(Turn::Continue)
             }
-            Pace::Wait => Ok(Turn::Continue),
             Pace::Done => {
                 self.read_back();
                 let drain_from = *self.drain_from_us.get_or_insert(now_us);
@@ -185,15 +190,16 @@ impl Host {
         let frame = FrameInfo {
             index: FrameIndex::new(start.index),
             start: TimePoint::new(start.start_us),
-            period: FRAME_PERIOD,
+            period: start.period,
         };
 
         let planning = self.performance.now();
-        // This frame's budget follows the last render measured; the frames to
-        // come are forecast from the median of the recent ones, as the bench
-        // does and for its reason (`Scheduler::set_expected_budget`).
-        let budget = Budget::for_frame(FRAME_PERIOD, self.render_estimate, self.margin);
-        let forecast = Budget::for_frame(FRAME_PERIOD, self.render_forecast(), self.margin);
+        // This frame's budget follows the last render measured and the
+        // display's period; the frames to come are forecast from the median of
+        // the recent renders, as the bench does and for its reason
+        // (`Scheduler::set_expected_budget`), at the same period.
+        let budget = Budget::for_frame(start.period, self.render_estimate, self.margin);
+        let forecast = Budget::for_frame(start.period, self.render_forecast(), self.margin);
         self.scheduler.set_expected_budget(forecast);
         self.scheduler
             .submit(frame, self.slices.clone(), &self.cost)
@@ -351,6 +357,8 @@ impl Host {
     fn finish(mut self) -> Outcome {
         self.outcome.dropped = self.pacer.dropped();
         self.outcome.lateness_us = self.pacer.lateness_us().to_vec();
+        self.outcome.display_period_us = self.pacer.measured_period().map(Micros::get);
+        self.outcome.interval_us = self.pacer.intervals_us().to_vec();
         self.outcome.pending_at_end = self.scheduler.pending();
         if let Some(timer) = &self.timer {
             self.outcome.timer = timer.stats();
@@ -389,11 +397,11 @@ pub fn run(host: Host, env: Environment, config: Config) -> Result<()> {
     let callback: Callback = Rc::new(RefCell::new(None));
     let again = Rc::clone(&callback);
     let mut host = Some(host);
-    *callback.borrow_mut() = Some(Closure::new(move |_timestamp: f64| {
+    *callback.borrow_mut() = Some(Closure::new(move |timestamp: f64| {
         let Some(running) = host.as_mut() else {
             return;
         };
-        let next = match running.turn() {
+        let next = match running.turn(timestamp) {
             Ok(Turn::Continue) => request(&again),
             Ok(Turn::Finished) => {
                 if let Some(done) = host.take() {
