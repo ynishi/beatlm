@@ -48,8 +48,8 @@
 //!
 //! Two explanations were tested and refuted by these lines: a render pass
 //! whose measurement carried the frame's slices, which would have shrunk the
-//! budget (`crate::render_cost`), and a single slice estimated above the
-//! expected budget, which no plan hands out whatever the latency (the test
+//! budget (`beatlm_host::frame::RenderCost`), and a single slice estimated
+//! above the expected budget, which no plan hands out whatever the latency (the test
 //! `a_slice_estimated_over_every_expected_frame_keeps_jobs_from_finishing`
 //! shows that rule). What remained was why the slices measure slower in the
 //! loop than in calibration, so that the estimates climb until whole jobs no
@@ -457,20 +457,19 @@ mod tests {
     }
 
     /// A loop on the scheduler alone, with the page's budget
-    /// (`crate::render_cost`), its `--submit free` admission and the core's
-    /// default estimator: 160 slices of a 29 ms job, each seeded with 32
+    /// (`beatlm_host::frame::RenderCost`), its `--submit free` admission and
+    /// the core's default estimator: 160 slices of a 29 ms job, each seeded with 32
     /// measurements of `seed_scale` times what it takes, as calibration seeds
     /// the model. The render is 1 900 µs, measured alone, the margin 2 ms and
     /// the latency 25 frames. One pass in `1 / every` measures `slow_us`
     /// longer than it ran, at pseudo-random. It models the rules, not the
     /// browser: what makes the page's estimates climb is not in it.
     fn simulate(period_us: u64, every: u64, slow_us: u64, seed_scale: u64, frames: u64) -> Run {
-        use crate::depth::still_busy;
-        use crate::render_cost::RenderCost;
         use beatlm_core::cost::{CostModel, Estimator};
         use beatlm_core::schedule::{Due, Scheduler};
         use beatlm_core::sync::{MissPolicy, SyncPolicy};
         use beatlm_core::time::{FrameIndex, FrameInfo, TimePoint};
+        use beatlm_host::frame::{Admission, RenderCost, Submit};
 
         let (period, margin) = (Micros::new(period_us), Micros::new(2_000));
         let costs: Vec<u64> = (0..160).map(|i| [60, 120, 180, 240, 300][i % 5]).collect();
@@ -490,7 +489,7 @@ mod tests {
             render_budget(period, margin),
         );
         let mut render = RenderCost::default();
-        let (mut busy, mut seed) = (None, 1_u64);
+        let (mut admission, mut seed) = (Admission::new(Submit::Free), 1_u64);
         let mut dispatched: BTreeMap<u64, u64> = BTreeMap::new();
         let mut pending: Vec<(SliceId, Micros)> = Vec::new();
         let mut run = Run {
@@ -513,7 +512,7 @@ mod tests {
             };
             let expected = render.expected(period, margin);
             scheduler.set_expected_budget(expected);
-            let job = if busy.is_none() {
+            let job = if admission.takes_input() {
                 Some(scheduler.submit(frame, slices.clone(), &cost).unwrap())
             } else {
                 None
@@ -539,7 +538,7 @@ mod tests {
                 pending.push((slice_run.slice, Micros::new(ran + slow)));
                 run.last_slice_frame = Some(index);
             }
-            busy = still_busy(busy, job.map(|job| (job, slices.len())), &plan);
+            admission.planned(job.map(|job| (job, slices.len())), &plan);
             run.delivered += plan.delivered.len() as u64;
         }
         run.job_estimate_us.1 = estimate(&cost);

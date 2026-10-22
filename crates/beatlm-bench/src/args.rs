@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use beatlm_core::kernel::Fusion;
+pub use beatlm_host::frame::Submit;
 use beatlm_host::pass_cost::{self, DEFAULT_DEPTH_SIDE, Dispatches};
 use beatlm_host::workload::{DEFAULT_RENDER_ITERS, DEFAULT_SLICE_ITERS, RenderOrder};
 
@@ -79,29 +80,6 @@ pub const DEFAULT_DEPTH_SIZE: u32 = 266;
 /// not given: the one the same sweep recommends at [`DEFAULT_DEPTH_SIZE`], a
 /// frame of slack above the smallest that met its criterion there.
 pub const DEFAULT_DEPTH_LATENCY: u32 = 5;
-
-/// When a frame submits its input as a job; the crate documentation, under
-/// "The `depth` workload", says why the model needs `Free`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Submit {
-    /// Every frame submits one job.
-    Every,
-    /// A frame submits a job only when the job submitted last has had all its
-    /// slices handed out, or has left the scheduler; otherwise its input is
-    /// not run, as a host feeding a model slower than its frame rate skips
-    /// frames of the source.
-    Free,
-}
-
-impl Submit {
-    /// The spelling `--submit` accepts and the report prints.
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Every => "every",
-            Self::Free => "free",
-        }
-    }
-}
 
 /// Which statistic the cost model reads a slice's measurements with; each is
 /// the preset of its name in `beatlm_host::presets`. The default is the one the

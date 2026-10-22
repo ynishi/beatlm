@@ -25,8 +25,8 @@
 //! slices when it read no such buffer (p50 1 245 µs, and 1 573 µs in a later
 //! run, with slices in its frame against 1 901 µs without; Chrome 154,
 //! WebGPU, Apple M1 Pro, 120 Hz, Depth Anything V2 Small at 266 pixels,
-//! [`crate::render_cost`]), and a delivery frame comes at most once per job,
-//! so a wait there would shrink the budget of the frame after it and not the
+//! [`RenderCost`](beatlm_host::frame::RenderCost)), and a delivery frame comes
+//! at most once per job, so a wait there would shrink the budget of the frame after it and not the
 //! median of recent renders the frames to come are forecast with. The
 //! report's `gpu_render_alone_us` and `gpu_render_with_slices_us` show the
 //! render's measurement without and with slices in its frame, and would show

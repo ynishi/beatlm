@@ -131,7 +131,11 @@
 //!    Each calibration frame starts at an animation
 //!    frame, and the next at the first animation frame after its timings came
 //!    back, where the bench waits on the device. It needs timestamp queries,
-//!    and the run fails without them.
+//!    and the run fails without them. As the bench's, it checks the unsplit
+//!    model before the first pass and the split one before the second
+//!    against what the loop's timer can hold
+//!    ([`beatlm_host::frame::timer_capacity`] says why), so a split too large
+//!    fails before calibration spends its seconds.
 //! 5. **Realise and check.** The split program is realised with its slots,
 //!    every slot's job is run once, each its own submission, and slot 0's
 //!    depth, the reference input's, is read back and compared with the
@@ -165,8 +169,8 @@
 //! copy, which reads an arena the frame's slices may write; the render was
 //! measured not to carry the slices when it read nothing written in its frame
 //! (`gpu_render_alone_us` against `gpu_render_with_slices_us`,
-//! [`render_cost`]), and a delivery frame comes at most once per job, so the
-//! copy is kept there (the display's documentation, `web/display.rs`, has the
+//! [`RenderCost`](beatlm_host::frame::RenderCost)), and a delivery frame comes
+//! at most once per job, so the copy is kept there (the display's documentation, `web/display.rs`, has the
 //! figures). Why a job was missed, and what the
 //! projection read when it abandoned one, is in the report's diagnosis lines
 //! ([`diagnosis`]).
@@ -524,25 +528,24 @@
 //!
 //! # What is shared with the bench
 //!
-//! The load, the depth model's slots, the pass-cost measurement, the
-//! report's shared lines and its statistics come from
-//! [`beatlm_host`], the crate both hosts depend on, whose documentation lists
-//! what it holds; so the two hosts time the same kernels at the same sizes and
+//! The load, the depth model's slots, the pieces of the frame's step that
+//! read no clock (the budget and forecast, the admission of an input, the
+//! timer's capacity), the pass-cost measurement, the report's shared lines
+//! and its statistics come from [`beatlm_host`], the crate both hosts depend
+//! on, whose documentation lists what it holds; so the two hosts time the
+//! same kernels at the same sizes, decide a frame from the same rules and
 //! quote the same statistic. The model, its loader and its reference
 //! comparison come from `beatlm::model` and `beatlm::load`, the kernels from
 //! `beatlm::codegen`, the timer, the limits and the arenas from `beatlm::gpu`,
 //! and the decisions from `beatlm_core`.
 //!
-//! The frame's bookkeeping — the budget and forecast, the admission of an
-//! input, the delivery and miss counts, what each measurement feeds — and
-//! calibration's two passes follow the bench's `engine.rs` and
-//! `calibrate.rs`, and a change to one is owed to
-//! the other. They are written twice because the
-//! bench's engine reads `std::time::Instant` and blocks on the device for its
-//! warm-up and drain, neither of which exists in a page, and carries the
-//! planned workloads and the bench's options; separating a clock-free frame
-//! step from it would change the code the bench's published measurements
-//! came from, which is a change of its own.
+//! The rest of the frame's bookkeeping — the delivery and miss counts, what
+//! each measurement feeds — and calibration's two passes follow the bench's
+//! `engine.rs` and `calibrate.rs`, and a change to one is owed to the other.
+//! They are written twice because the bench's engine reads
+//! `std::time::Instant` and blocks on the device for its warm-up and drain,
+//! neither of which exists in a page, and carries the planned workloads and
+//! the bench's options.
 //!
 //! # Builds
 //!
@@ -561,7 +564,6 @@ pub mod depth;
 pub mod diagnosis;
 pub mod onbeat;
 pub mod pace;
-pub mod render_cost;
 pub mod report;
 
 #[cfg(target_arch = "wasm32")]

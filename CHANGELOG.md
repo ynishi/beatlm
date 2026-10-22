@@ -161,6 +161,11 @@ and this project adheres to
   In the page's report `frame_ratio` and `frame_scale` moved from after
   `job_estimate_us` to after the `pass_overlap_*` lines, where the bench
   writes them; no other line changed name, order or format.
+- The clock-free pieces of a frame's step (the render budget and forecast,
+  admission under `submit=every|free`, the timer-capacity check and the
+  timer label) live once in `beatlm_host::frame`. The page's calibration now
+  runs the bench's timer-capacity checks before each pass, so a split the
+  loop's timer cannot hold is refused before calibration spends its frames.
 
 ### Fixed
 

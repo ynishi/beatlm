@@ -20,11 +20,12 @@ use beatlm::gpu::{FrameTiming, MAX_SLICES, SliceTimer, TimerStats};
 use beatlm_core::budget::Budget;
 use beatlm_core::cost::{CostModel, Estimator, FrameScale, SliceId};
 use beatlm_core::kernel::Program;
-use beatlm_core::schedule::{FramePlan, JobId, Scheduler};
+use beatlm_core::schedule::{FramePlan, Scheduler};
 use beatlm_core::sync::{MissPolicy, SyncPolicy};
 use beatlm_core::time::{FrameIndex, FrameInfo, Micros, TimePoint};
+use beatlm_host::frame::{Admission, InFlight, RenderCost, Tag, jobs_with_slices, timer_capacity};
 use beatlm_host::pass_overlap;
-use beatlm_host::presets::{self, RENDER_PRIOR, RENDER_WINDOW, SLICE_PRIOR, STARTUP_FRAMES};
+use beatlm_host::presets::{self, RENDER_PRIOR, SLICE_PRIOR, STARTUP_FRAMES};
 use beatlm_host::slots;
 use beatlm_host::stats::frame_ratio;
 use beatlm_host::workload::{
@@ -32,7 +33,7 @@ use beatlm_host::workload::{
     Workload, written_fits,
 };
 
-use crate::args::{Args, EstimatorKind, Submit, WorkloadKind};
+use crate::args::{Args, EstimatorKind, WorkloadKind};
 use crate::calibrate::{Settings, calibrate};
 use crate::counters::{self, Watch};
 use crate::depth;
@@ -44,29 +45,6 @@ use crate::pace::{FRAME_PERIOD, Tick, micros_between};
 /// timings still in flight.
 const DRAIN_ATTEMPTS: usize = 8;
 
-/// How many timed slices the loop's timer must hold for jobs of `slices`
-/// slices when `jobs` of them can have slices left at once
-/// ([`jobs_with_slices`]): a frame can run slices of every such job, not only
-/// its own. `None` when that is more than one query set can time
-/// ([`MAX_SLICES`]) or overflows.
-pub fn timer_capacity(slices: u32, jobs: u32) -> Option<u32> {
-    slices
-        .checked_mul(jobs)
-        .filter(|&capacity| capacity <= MAX_SLICES)
-}
-
-/// How many jobs can have slices left at once under `submit` and a promised
-/// `latency`. Submitting every frame, a job lives `latency` frames past its
-/// submission, so `latency + 1` can be pending with slices left. Submitting
-/// only once the last job's slices are all handed out, or it has left, one
-/// job at most has slices left. `None` on overflow.
-pub fn jobs_with_slices(submit: Submit, latency: u32) -> Option<u32> {
-    match submit {
-        Submit::Every => latency.checked_add(1),
-        Submit::Free => Some(1),
-    }
-}
-
 /// The cost model's statistic for the `--estimator` choice: the preset of
 /// that name ([`presets`]).
 const fn estimator(kind: EstimatorKind) -> Estimator {
@@ -77,15 +55,6 @@ const fn estimator(kind: EstimatorKind) -> Estimator {
         EstimatorKind::FrameScaled => presets::frame_scaled(),
     }
 }
-
-/// The label a timed slice carries from the scheduler to the cost model: its
-/// job, the slice, and what a frame's ratio takes the slice at when the frame
-/// was planned ([`CostModel::frame_estimate`], `None` for a slice left out of
-/// it). The timer hands the label back with the measurement, so a frame's
-/// measured slice time is compared with what those same slices were planned
-/// at ([`CostModel::record_frame`]), however many frames later the timing
-/// arrives and whichever of its passes were timed.
-type Tag = (JobId, SliceId, Option<Micros>);
 
 /// Everything a run measured.
 ///
@@ -228,10 +197,8 @@ pub struct Engine<'g> {
     timer: SliceTimer<Tag>,
     scheduler: Scheduler,
     cost: CostModel,
-    render_estimate: Micros,
-    /// The most recent render measurements, at most [`RENDER_WINDOW`], whose
-    /// median forecasts the frames to come.
-    render_recent: std::collections::VecDeque<Micros>,
+    /// The render's measurements, which set the budgets.
+    render: RenderCost,
     slices: Vec<SliceId>,
     margin: Micros,
     latency: u32,
@@ -240,50 +207,6 @@ pub struct Engine<'g> {
     /// missed, by submission index.
     job_dispatches: BTreeMap<u64, u64>,
     outcome: Outcome,
-}
-
-/// Whether a frame's input becomes a job: the `--submit` rule, kept apart
-/// from the device so a test can drive it against the scheduler alone.
-#[derive(Debug, Clone, Copy)]
-struct Admission {
-    submit: Submit,
-    /// The job submitted last, by submission index, with how many of its
-    /// slices are not yet handed out, while it has slices left and has not
-    /// left the scheduler: what `Submit::Free` waits for.
-    busy: Option<(JobId, usize)>,
-}
-
-impl Admission {
-    const fn new(submit: Submit) -> Self {
-        Self { submit, busy: None }
-    }
-
-    /// Whether this frame's input is submitted.
-    const fn takes_input(&self) -> bool {
-        match self.submit {
-            Submit::Every => true,
-            Submit::Free => self.busy.is_none(),
-        }
-    }
-
-    /// Records the frame's plan, after `job` of `slices` slices was submitted
-    /// for it if one was: the slices handed out, and the jobs that left.
-    fn planned(&mut self, job: Option<(JobId, usize)>, plan: &FramePlan) {
-        if job.is_some() {
-            self.busy = job;
-        }
-        if let Some((busy, left)) = &mut self.busy {
-            let handed_out = plan.runs.iter().filter(|run| run.job == *busy).count();
-            *left = left.saturating_sub(handed_out);
-            // A job that left the scheduler, delivered or missed with slices
-            // never handed out, no longer holds back the next input.
-            let gone = plan.delivered.iter().any(|d| d.job == *busy)
-                || plan.missed.iter().any(|m| m.job == *busy);
-            if *left == 0 || gone {
-                self.busy = None;
-            }
-        }
-    }
 }
 
 /// The unsplit program of a planned workload, and the numbers it is realised
@@ -319,7 +242,7 @@ impl<'g> Engine<'g> {
         let policy = SyncPolicy::FixedLatency {
             frames: args.latency,
         };
-        let jobs = jobs_with_slices(args.submit, args.latency)
+        let jobs = jobs_with_slices(args.submit, InFlight::Latency(args.latency))
             .context("--latency is too large to count the jobs in flight")?;
         let mut kernel_parts = Vec::new();
         // The cost model calibration filled with the split program's parts, when
@@ -460,8 +383,7 @@ impl<'g> Engine<'g> {
             timer,
             scheduler,
             cost,
-            render_estimate: RENDER_PRIOR,
-            render_recent: std::collections::VecDeque::with_capacity(RENDER_WINDOW),
+            render: RenderCost::default(),
             slices: (0..slices).map(SliceId::new).collect(),
             margin,
             latency: args.latency,
@@ -540,18 +462,6 @@ impl<'g> Engine<'g> {
 
     /// Decides the frame, encodes it and submits it, and records where the CPU
     /// time went.
-    /// The render time the frames to come are forecast with: the median of the
-    /// recent measurements (the upper one of an even count), or the prior
-    /// before any has arrived.
-    fn render_forecast(&self) -> Micros {
-        let mut recent: Vec<Micros> = self.render_recent.iter().copied().collect();
-        recent.sort_unstable();
-        recent
-            .get(recent.len() / 2)
-            .copied()
-            .unwrap_or(RENDER_PRIOR)
-    }
-
     fn submit_frame(&mut self, tick: &Tick) -> Result<FramePlan> {
         let frame = FrameInfo {
             index: FrameIndex::new(tick.index),
@@ -560,14 +470,10 @@ impl<'g> Engine<'g> {
         };
 
         let planning = Instant::now();
-        let budget = Budget::for_frame(FRAME_PERIOD, self.render_estimate, self.margin);
-        // This frame's budget follows the last render measured, as the host's
-        // order of a frame says; the frames to come are forecast from the
-        // median of the recent renders instead. One slow render would
-        // otherwise lower the forecast for every later frame, and the
-        // scheduler would abandon jobs those frames finish
-        // (`Scheduler::set_expected_budget` says why the forecast matters).
-        let forecast = Budget::for_frame(FRAME_PERIOD, self.render_forecast(), self.margin);
+        // This frame's budget and the forecast of the frames to come, at the
+        // bench's fixed period; `RenderCost` says why the two differ.
+        let budget = self.render.budget(FRAME_PERIOD, self.margin);
+        let forecast = self.render.expected(FRAME_PERIOD, self.margin);
         self.scheduler.set_expected_budget(forecast);
         let new_job = if self.admission.takes_input() {
             let job = self
@@ -698,11 +604,7 @@ impl<'g> Engine<'g> {
             self.outcome.longest_dispatch_us.push(longest);
         }
         if let Some(render) = timing.render {
-            self.render_estimate = render;
-            if self.render_recent.len() == RENDER_WINDOW {
-                self.render_recent.pop_front();
-            }
-            self.render_recent.push_back(render);
+            self.render.record(render);
             self.outcome
                 .gpu_frame_us
                 .push(gpu.saturating_add(render).get());
@@ -872,91 +774,6 @@ mod tests {
     #[test]
     fn the_default_estimator_is_the_cores_default() {
         assert_eq!(estimator(Args::default().estimator), Estimator::default());
-    }
-
-    #[test]
-    fn the_timer_must_hold_the_slices_of_every_job_with_slices_left() {
-        assert_eq!(timer_capacity(6, 3), Some(18));
-        assert_eq!(timer_capacity(MAX_SLICES, 1), Some(MAX_SLICES));
-        assert_eq!(timer_capacity(MAX_SLICES, 2), None);
-        assert_eq!(timer_capacity(1, u32::MAX), None);
-        assert_eq!(timer_capacity(u32::MAX, 3), None);
-        // Every frame's input: the latency plus one jobs. Only when the last
-        // is handed out: one, whatever the latency.
-        assert_eq!(jobs_with_slices(Submit::Every, 2), Some(3));
-        assert_eq!(jobs_with_slices(Submit::Every, u32::MAX), None);
-        assert_eq!(jobs_with_slices(Submit::Free, 17), Some(1));
-        assert_eq!(
-            timer_capacity(300, jobs_with_slices(Submit::Free, 17).unwrap()),
-            Some(300)
-        );
-        assert_eq!(
-            timer_capacity(300, jobs_with_slices(Submit::Every, 17).unwrap()),
-            None
-        );
-    }
-
-    /// The scheduler alone, for `frames` frames of a 10 ms budget, expected
-    /// and real, with jobs of `slices` slices each estimated at 1 ms, under
-    /// latency `k` and `submit`: how many inputs were submitted, delivered and
-    /// missed.
-    fn schedule_alone(submit: Submit, slices: u32, k: u32, frames: u64) -> (u64, u64, u64) {
-        let cost = CostModel::new(
-            Micros::new(1_000),
-            Estimator::MeanPlusSigmas {
-                alpha: 1.0,
-                sigmas: 0.0,
-            },
-        )
-        .unwrap();
-        let policy = SyncPolicy::FixedLatency { frames: k };
-        let budget = Budget::new(Micros::new(10_000));
-        let mut scheduler = Scheduler::new(policy, MissPolicy::HoldPrevious, budget);
-        let mut admission = Admission::new(submit);
-        let job: Vec<SliceId> = (0..slices).map(SliceId::new).collect();
-        let (mut submitted, mut delivered, mut missed) = (0, 0, 0);
-        for i in 0..frames {
-            let frame = FrameInfo {
-                index: FrameIndex::new(i),
-                start: TimePoint::new(i * FRAME_PERIOD.get()),
-                period: FRAME_PERIOD,
-            };
-            let new_job = admission.takes_input().then(|| {
-                submitted += 1;
-                let id = scheduler.submit(frame, job.clone(), &cost).unwrap();
-                (id, job.len())
-            });
-            let plan = scheduler.plan_frame(frame, budget, &cost);
-            admission.planned(new_job, &plan);
-            delivered += plan.delivered.len() as u64;
-            missed += plan.missed.len() as u64;
-        }
-        (submitted, delivered, missed)
-    }
-
-    #[test]
-    fn a_job_longer_than_a_frame_misses_most_inputs_when_every_frame_submits_and_none_when_free() {
-        // 45 ms of work at 10 ms a frame is five frames, and latency 5 gives
-        // a job six. Every frame's input: a job whose projection behind the
-        // unfinished work ahead does not fit its six frames is abandoned once
-        // the next frame's input queues behind it, and the inputs that fit are
-        // delivered; the last input, with nothing behind it, is still pending
-        // when the run ends. Before jobs were abandoned each kept job held the
-        // budget to its deadline, the one behind started too late, and this
-        // delivered 1 and missed 114. Until #41 a job was abandoned in the
-        // frame it arrived, the last one too, and this missed 93.
-        assert_eq!(schedule_alone(Submit::Every, 45, 5, 120), (120, 26, 92));
-        // Only once the last job's slices are all handed out: one input every
-        // five frames, and every deadline that arrived is met.
-        assert_eq!(schedule_alone(Submit::Free, 45, 5, 120), (24, 23, 0));
-        // At latency 3 a job gets four frames and needs five. With no job
-        // behind it, it is kept: it runs four frames' slices, so they are
-        // measured, and is missed at its deadline, and the frame after takes
-        // the next input: one in four is submitted, and every one is missed.
-        // Until #41 each was missed in the frame it was submitted, without
-        // running a slice, and every frame took an input: 120 submitted, 120
-        // missed.
-        assert_eq!(schedule_alone(Submit::Free, 45, 3, 120), (30, 0, 30));
     }
 
     #[test]

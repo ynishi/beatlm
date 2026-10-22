@@ -50,12 +50,12 @@ use beatlm::gpu::{MAX_SLICES, SliceTimer};
 use beatlm_core::cost::{CostModel, Estimator, SliceId};
 use beatlm_core::kernel::Program;
 use beatlm_core::time::{FrameIndex, Micros};
+use beatlm_host::frame::timer_capacity;
 use beatlm_host::presets::CALIBRATION_FRAMES;
 use beatlm_host::stats::median;
 use beatlm_host::workload::Workload;
 
 use crate::device::Gpu;
-use crate::engine::timer_capacity;
 use crate::net::{Net, Numbers};
 use crate::pace::Pacer;
 
@@ -71,7 +71,8 @@ pub struct Settings {
     pub bound: Micros,
     /// How many jobs can have slices left at once in the loop, whose timer
     /// must time the slices of all of them in one frame
-    /// (`engine::jobs_with_slices` says how many for each `--submit`).
+    /// ([`jobs_with_slices`](beatlm_host::frame::jobs_with_slices) says how
+    /// many for each `--submit`).
     pub jobs: u32,
 }
 

@@ -12,13 +12,14 @@
 //! The crate documentation ("The depth model") says what each step is for.
 
 use anyhow::{Context, Result, bail, ensure};
-use beatlm::gpu::SliceTimer;
+use beatlm::gpu::{MAX_SLICES, SliceTimer};
 use beatlm::load::Archive;
 use beatlm::load::depth_anything_v2::reference::{self, DepthError};
 use beatlm::load::depth_anything_v2::{Config, inventory};
 use beatlm_core::cost::{CostModel, Estimator, SliceId};
 use beatlm_core::kernel::Program;
 use beatlm_core::time::{FrameIndex, Micros};
+use beatlm_host::frame::timer_capacity;
 use beatlm_host::presets::{CALIBRATION_FRAMES, SLICE_PRIOR};
 use beatlm_host::slots::{Net, Numbers};
 use beatlm_host::workload::Workload;
@@ -153,17 +154,24 @@ pub struct Calibration {
 /// the whole kernels ([`WholeRuns::durations`]), which no estimator touches, so
 /// the parts are the same whichever is chosen.
 ///
+/// `jobs` is how many jobs can have slices left at once in the loop, whose
+/// timer must time the slices of all of them in one frame; the unsplit
+/// program and the split one are each checked against it before the pass
+/// that runs them ([`timer_capacity`]).
+///
 /// # Errors
 ///
 /// A device without timestamp queries, a network or timer that cannot be
-/// built, a kernel or part calibration never measured, a lost device, or
-/// timings that do not come back.
+/// built, a kernel or part calibration never measured, a lost device,
+/// timings that do not come back, or an unsplit or split program with more
+/// slices than the loop's timer can time.
 pub async fn calibrate(
     gpu: &Gpu,
     workload: &Workload,
     whole: &Program,
     numbers: &Numbers,
     estimator: Estimator,
+    jobs: u32,
 ) -> Result<Calibration> {
     ensure!(
         gpu.timestamp_query,
@@ -171,6 +179,15 @@ pub async fn calibrate(
          scheduler plans each job from measured kernel times, and without them every job would be \
          estimated at the prior for good"
     );
+    // No split fixes an unsplit job the loop cannot time, only fewer jobs
+    // with slices left.
+    let kernels = u32::try_from(whole.kernels().len()).unwrap_or(u32::MAX);
+    if timer_capacity(kernels, jobs).is_none() {
+        bail!(
+            "{kernels} kernels for each of {jobs} jobs with slices left are more than the GPU \
+             timer can time ({MAX_SLICES} slices per frame) before any split"
+        );
+    }
     let mut first = WholeRuns::new(whole.kernels().len());
     {
         let net = device::accepted(&gpu.device, "the network to calibrate", || {
@@ -189,6 +206,15 @@ pub async fn calibrate(
     let program = whole
         .split(&parts)
         .context("cannot split the depth model")?;
+    // The unsplit job fit, so the split made it too many.
+    let slices = u32::try_from(program.kernels().len()).context("more parts than a u32 counts")?;
+    if timer_capacity(slices, jobs).is_none() {
+        bail!(
+            "a dispatch bound of {MAX_DISPATCH_US} µs splits a job into {slices} slices; up to \
+             {jobs} jobs can have slices left at once and the timer can time {MAX_SLICES} slices \
+             per frame"
+        );
+    }
 
     let mut cost = CostModel::new(SLICE_PRIOR, estimator).context("cannot build the cost model")?;
     let mut parts_us = vec![Vec::new(); program.kernels().len()];
@@ -214,7 +240,6 @@ pub async fn calibrate(
         })
         .await?;
     }
-    let slices = u32::try_from(program.kernels().len()).context("more parts than a u32 counts")?;
     for part in 0..slices {
         if cost.samples(SliceId::new(part)) == 0 {
             bail!("calibration measured part {part} of the split model no time");

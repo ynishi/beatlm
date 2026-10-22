@@ -117,8 +117,8 @@
 //! **What it changes.** It is the render pass's cost, and the render pass's
 //! cost sets the frame budget the slices share: each frame's budget is the
 //! display's period less the render the forecast expects and the margin
-//! ([`crate::render_cost`]). A cheaper render leaves more of the frame to
-//! slices, so a run at `render_iters=1` is not the native default's budget (the
+//! ([`RenderCost`](beatlm_host::frame::RenderCost)). A cheaper render leaves
+//! more of the frame to slices, so a run at `render_iters=1` is not the native default's budget (the
 //! default's is the one it was measured under) but a larger one, and its
 //! delivery is not comparable with a default run's on that account alone; read
 //! the `gpu_render_alone_us` and `gpu_render_with_slices_us` lines beside it.
@@ -172,7 +172,8 @@
 //! split, reads the median of its whole-kernel measurements and never the cost
 //! model, so it is the same whichever estimator is chosen
 //! ([`crate::depth::WholeRuns::durations`]). The render pass's own cost model
-//! ([`crate::render_cost`]) is not an estimator choice and does not change.
+//! ([`RenderCost`](beatlm_host::frame::RenderCost)) is not an estimator
+//! choice and does not change.
 //!
 //! # Which estimator, measured in a browser
 //!
