@@ -5,29 +5,26 @@
 //! called: [`Engine::tick_sync`] is a plain call, [`Engine::tick_async`] is a
 //! future, and the threaded candidate calls `tick_sync` from a thread of its
 //! own. The decisions, the encoding, the submission and the readback are the
-//! same code in all three, which is what lets their timings be compared. The
-//! engine reads the clock to measure itself; the core and `beatlm::gpu` read
-//! none.
+//! same code in all three, which is what lets their timings be compared: the
+//! frame's step is [`FrameStep`], which the browser host drives too, and the
+//! engine adds the device, the timer and the clock. The engine reads the clock
+//! to measure itself; the step, the core and `beatlm::gpu` read none.
 
-use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use beatlm::gpu::{FrameTiming, MAX_SLICES, SliceTimer, TimerStats};
-use beatlm_core::budget::Budget;
-use beatlm_core::cost::{CostModel, Estimator, FrameScale, SliceId};
+use beatlm::gpu::{MAX_SLICES, SliceTimer, TimerStats};
+use beatlm_core::cost::{CostModel, Estimator, SliceId};
 use beatlm_core::kernel::Program;
-use beatlm_core::schedule::{FramePlan, Scheduler};
 use beatlm_core::sync::{MissPolicy, SyncPolicy};
 use beatlm_core::time::{FrameIndex, FrameInfo, Micros, TimePoint};
-use beatlm_host::frame::{Admission, InFlight, RenderCost, Tag, jobs_with_slices, timer_capacity};
-use beatlm_host::pass_overlap;
-use beatlm_host::presets::{self, RENDER_PRIOR, SLICE_PRIOR, STARTUP_FRAMES};
+use beatlm_host::frame::{InFlight, Tag, jobs_with_slices, timer_capacity};
+use beatlm_host::presets::{self, SLICE_PRIOR};
 use beatlm_host::slots;
-use beatlm_host::stats::frame_ratio;
+use beatlm_host::step::{FrameStep, StepConfig, Submitted, Tally};
 use beatlm_host::workload::{
     DEFAULT_STAGE_STORAGE_BUFFERS, RENDER_HEIGHT, RENDER_WIDTH, RenderOrder, TARGET_FORMAT,
     Workload, written_fits,
@@ -56,12 +53,16 @@ const fn estimator(kind: EstimatorKind) -> Estimator {
     }
 }
 
-/// Everything a run measured.
+/// Everything a run measured: what the frame's step counted ([`Tally`]) and
+/// what the bench measured around it.
 ///
 /// The per-frame vectors hold one sample per frame the engine handled, except
 /// where a field says otherwise.
 #[derive(Default)]
 pub struct Outcome {
+    /// The step's counts and samples, which the report's shared lines are
+    /// written from.
+    pub tally: Tally,
     /// Time from the pacer beginning each frame to the return of
     /// `queue.submit`, in microseconds. On the threaded candidate the clock
     /// starts on the frame-loop thread and stops on the GPU thread.
@@ -82,62 +83,14 @@ pub struct Outcome {
     pub encode_us: Vec<u64>,
     /// Time inside `queue.submit`, in microseconds.
     pub submit_us: Vec<u64>,
-    /// Compute dispatches encoded in each frame: one per slice the plan
-    /// handed out.
-    pub dispatches_per_frame: Vec<u64>,
-    /// Compute dispatches encoded for each delivered job, over every frame
-    /// that ran one of its slices.
-    pub dispatches_per_job: Vec<u64>,
     /// How long after its period's boundary each frame actually began, in
     /// microseconds; nonzero when the previous frame overran or the sleep
     /// overshot.
     pub lateness_us: Vec<u64>,
     /// Frame periods given up because a frame began a whole period late.
     pub dropped: u64,
-    /// Render plus every slice measured in the same frame, per timed frame, in
-    /// microseconds.
-    pub gpu_frame_us: Vec<u64>,
-    /// The longest single compute pass measured in each timed frame that ran
-    /// one, in microseconds: what one dispatch held up the queue for.
-    pub longest_dispatch_us: Vec<u64>,
-    /// Latency in frames of each delivered result.
-    pub latencies: Vec<u64>,
-    /// Inputs submitted as jobs: one per frame with `--submit every`, fewer
-    /// with `--submit free`.
-    pub submitted: u64,
-    /// Results delivered.
-    pub delivered: u64,
-    /// Deadlines that arrived without a complete result.
-    pub missed: u64,
-    /// The part of `missed` that belongs to jobs submitted in the loop's first
-    /// [`STARTUP_FRAMES`] frames, so a cascade of misses while estimates are
-    /// new shows apart from misses in steady state.
-    pub startup_missed: u64,
-    /// Deliveries whose latency was not the promised one.
-    pub violations: u64,
-    /// Jobs still awaiting their deadline when the loop ended.
-    pub pending_at_end: usize,
-    /// Per slice: sum and count of measured microseconds.
-    pub measured: BTreeMap<SliceId, (u64, u64)>,
-    /// Per slice: the cost model's final estimate.
-    pub estimates: BTreeMap<SliceId, Micros>,
-    /// Per timed frame whose slices with a frame estimate were planned at
-    /// more than zero: their measured time over the sum of those estimates
-    /// when the frame was planned ([`CostModel::frame_estimate`]: every slice
-    /// for every estimator but the frame-scaled one, its warm slices for
-    /// that one).
-    pub frame_ratios: Vec<f64>,
-    /// The frame scale of each plan made with a measured one.
-    pub frame_scales: Vec<f64>,
-    /// The frame scale when the run ended.
-    pub frame_scale: FrameScale,
-    /// Frames the cost model folded into its frame scale.
-    pub frames_recorded: u64,
     /// What the timer could not measure.
     pub timer: TimerStats,
-    /// Every timed frame's passes with their timestamps, for the
-    /// `pass_overlap_*` lines (`beatlm_host::pass_overlap`).
-    pub pass_frames: Vec<pass_overlap::Frame>,
     /// Dispatches the competing load submitted, from the one it completed
     /// before the run's first frame to the last one queued when it was stopped
     /// after the run; `None` when the run had no competing load.
@@ -183,9 +136,9 @@ pub struct KernelParts {
 
 /// Decides, encodes, submits and reads back the GPU work of frames.
 ///
-/// It holds the scheduler, the cost model, the timer and the workload of one
-/// run, so a fresh engine is a fresh run on the same device. Whichever thread
-/// calls it is the thread that touches the device.
+/// It holds the frame's step (the scheduler and the cost model), the timer
+/// and the workload of one run, so a fresh engine is a fresh run on the same
+/// device. Whichever thread calls it is the thread that touches the device.
 pub struct Engine<'g> {
     gpu: &'g Gpu,
     workload: Workload,
@@ -195,17 +148,7 @@ pub struct Engine<'g> {
     kernel_parts: Vec<KernelParts>,
     watch: Option<Watch>,
     timer: SliceTimer<Tag>,
-    scheduler: Scheduler,
-    cost: CostModel,
-    /// The render's measurements, which set the budgets.
-    render: RenderCost,
-    slices: Vec<SliceId>,
-    margin: Micros,
-    latency: u32,
-    admission: Admission,
-    /// Dispatches encoded so far for each job that is not yet delivered or
-    /// missed, by submission index.
-    job_dispatches: BTreeMap<u64, u64>,
+    step: FrameStep,
     outcome: Outcome,
 }
 
@@ -362,17 +305,22 @@ impl<'g> Engine<'g> {
                     args.latency
                 )
             })?;
-        let margin = Micros::new(args.margin_us);
-        let scheduler = Scheduler::new(
-            policy,
-            MissPolicy::HoldPrevious,
-            Budget::for_frame(FRAME_PERIOD, RENDER_PRIOR, margin),
-        );
         let cost = match measured_cost {
             Some(cost) => cost,
             None => CostModel::new(SLICE_PRIOR, estimator(args.estimator))
                 .context("cannot build the cost model")?,
         };
+        let step = FrameStep::new(
+            StepConfig {
+                policy,
+                miss: MissPolicy::HoldPrevious,
+                slices,
+                margin: Micros::new(args.margin_us),
+                prior_period: FRAME_PERIOD,
+                submit: args.submit,
+            },
+            cost,
+        );
         let mut engine = Self {
             gpu,
             workload,
@@ -381,14 +329,7 @@ impl<'g> Engine<'g> {
             kernel_parts,
             watch: None,
             timer,
-            scheduler,
-            cost,
-            render: RenderCost::default(),
-            slices: (0..slices).map(SliceId::new).collect(),
-            margin,
-            latency: args.latency,
-            admission: Admission::new(args.submit),
-            job_dispatches: BTreeMap::new(),
+            step,
             outcome: Outcome::default(),
         };
         engine.warm_up()?;
@@ -408,9 +349,9 @@ impl<'g> Engine<'g> {
     /// A scheduler that rejects the frame's job, a timer that cannot time the
     /// frame, or a device that cannot be polled.
     pub fn tick_sync(&mut self, tick: &Tick) -> Result<()> {
-        let plan = self.submit_frame(tick)?;
+        let submitted = self.submit_frame(tick)?;
         self.read_back(wgpu::PollType::Poll)?;
-        self.complete(tick, &plan);
+        self.step.complete(submitted);
         Ok(())
     }
 
@@ -425,9 +366,9 @@ impl<'g> Engine<'g> {
     ///
     /// As [`tick_sync`](Self::tick_sync).
     pub async fn tick_async(&mut self, tick: &Tick) -> Result<()> {
-        let plan = self.submit_frame(tick)?;
+        let submitted = self.submit_frame(tick)?;
         ReadbackTurn { engine: self }.await?;
-        self.complete(tick, &plan);
+        self.step.complete(submitted);
         Ok(())
     }
 
@@ -449,20 +390,19 @@ impl<'g> Engine<'g> {
         }
     }
 
-    /// Polls the device with `poll`, and feeds what has completed to the cost
-    /// model and the report. The frame's map was requested when it was
-    /// submitted.
+    /// Polls the device with `poll`, and feeds what has completed to the
+    /// frame's step. The frame's map was requested when it was submitted.
     fn read_back(&mut self, poll: wgpu::PollType) -> Result<()> {
         self.gpu.device.poll(poll).context("device poll failed")?;
         for timing in self.timer.collect_ready() {
-            self.absorb(timing);
+            self.step.absorb(&timing);
         }
         Ok(())
     }
 
     /// Decides the frame, encodes it and submits it, and records where the CPU
     /// time went.
-    fn submit_frame(&mut self, tick: &Tick) -> Result<FramePlan> {
+    fn submit_frame(&mut self, tick: &Tick) -> Result<Submitted> {
         let frame = FrameInfo {
             index: FrameIndex::new(tick.index),
             start: TimePoint::new(tick.start_us),
@@ -470,26 +410,11 @@ impl<'g> Engine<'g> {
         };
 
         let planning = Instant::now();
-        // This frame's budget and the forecast of the frames to come, at the
-        // bench's fixed period; `RenderCost` says why the two differ.
-        let budget = self.render.budget(FRAME_PERIOD, self.margin);
-        let forecast = self.render.expected(FRAME_PERIOD, self.margin);
-        self.scheduler.set_expected_budget(forecast);
-        let new_job = if self.admission.takes_input() {
-            let job = self
-                .scheduler
-                .submit(frame, self.slices.clone(), &self.cost)
-                .context("the scheduler rejected the frame's job")?;
-            Some(job)
-        } else {
-            None
-        };
-        let plan = self.scheduler.plan_frame(frame, budget, &self.cost);
+        // At the bench's fixed period; every frame's input is owed.
+        let planned = self.step.plan(frame, true)?;
+        let plan = planned.plan();
 
         let encoding = Instant::now();
-        // The estimates the plan was made with; nothing records into the
-        // cost model before the frame is encoded.
-        let cost = &self.cost;
         let mut encoder = self
             .gpu
             .device
@@ -498,8 +423,7 @@ impl<'g> Engine<'g> {
             });
         let mut timestamps = self.timer.begin_frame(frame.index);
         for run in &plan.runs {
-            let writes =
-                timestamps.compute_pass((run.job, run.slice, cost.frame_estimate(run.slice)))?;
+            let writes = timestamps.compute_pass(self.step.tag(run))?;
             match &self.net {
                 Some(net) => {
                     net.encode(&mut encoder, net.slot_of(run.job.get()), run.slice, writes)?;
@@ -529,86 +453,13 @@ impl<'g> Engine<'g> {
         self.outcome
             .submit_us
             .push(micros_between(submitting, submitted));
-        self.outcome
-            .dispatches_per_frame
-            .push(plan.runs.len() as u64);
-        if let FrameScale::Measured(scale) = self.cost.frame_scale() {
-            self.outcome.frame_scales.push(scale);
-        }
         // Counted after the timed intervals, so the bookkeeping is not charged
-        // to the encode time it is compared with. Every slice is one compute
-        // pass with one dispatch, in every workload.
-        if new_job.is_some() {
-            self.outcome.submitted += 1;
-        }
-        self.admission
-            .planned(new_job.map(|job| (job, self.slices.len())), &plan);
-        for run in &plan.runs {
-            *self.job_dispatches.entry(run.job.get()).or_default() += 1;
-        }
+        // to the encode time it is compared with.
+        let submitted_frame = self.step.after_submit(planned);
         self.outcome
             .cpu_us
             .push(micros_between(tick.began, submitted));
-        Ok(plan)
-    }
-
-    /// Delivers the plan's results and counts its misses.
-    fn complete(&mut self, tick: &Tick, plan: &FramePlan) {
-        for delivery in &plan.delivered {
-            let latency = tick.index.saturating_sub(delivery.input.get());
-            self.outcome.latencies.push(latency);
-            self.outcome.delivered += 1;
-            if latency != u64::from(self.latency) {
-                self.outcome.violations += 1;
-            }
-            let dispatches = self.job_dispatches.remove(&delivery.job.get()).unwrap_or(0);
-            self.outcome.dispatches_per_job.push(dispatches);
-        }
-        for missed in &plan.missed {
-            self.job_dispatches.remove(&missed.job.get());
-            if missed.input.get() < STARTUP_FRAMES {
-                self.outcome.startup_missed += 1;
-            }
-        }
-        self.outcome.missed += plan.missed.len() as u64;
-    }
-
-    /// Feeds one frame's measurements to the cost model and the report: each
-    /// slice's, then the frame's ratio over the timed slices that had a frame
-    /// estimate when it was planned: what they were planned at against what
-    /// they measured.
-    fn absorb(&mut self, timing: FrameTiming<Tag>) {
-        self.outcome
-            .pass_frames
-            .push(pass_overlap::Frame::of(&timing, |&(_, slice, _)| slice));
-        let mut gpu = Micros::ZERO;
-        let (mut predicted, mut in_ratio) = (Micros::ZERO, Micros::ZERO);
-        for ((_, slice, planned), duration) in &timing.compute {
-            self.cost.record(*slice, *duration);
-            let entry = self.outcome.measured.entry(*slice).or_insert((0, 0));
-            entry.0 = entry.0.saturating_add(duration.get());
-            entry.1 += 1;
-            gpu = gpu.saturating_add(*duration);
-            if let Some(planned) = planned {
-                predicted = predicted.saturating_add(*planned);
-                in_ratio = in_ratio.saturating_add(*duration);
-            }
-        }
-        if !timing.compute.is_empty() {
-            self.cost.record_frame(predicted, in_ratio);
-            if let Some(ratio) = frame_ratio(predicted, in_ratio) {
-                self.outcome.frame_ratios.push(ratio);
-            }
-        }
-        if let Some(longest) = timing.compute.iter().map(|(_, d)| d.get()).max() {
-            self.outcome.longest_dispatch_us.push(longest);
-        }
-        if let Some(render) = timing.render {
-            self.render.record(render);
-            self.outcome
-                .gpu_frame_us
-                .push(gpu.saturating_add(render).get());
-        }
+        Ok(submitted_frame)
     }
 
     /// Waits for the timings still in flight, then closes the run.
@@ -629,7 +480,6 @@ impl<'g> Engine<'g> {
             }
             self.read_back(wgpu::PollType::wait_indefinitely())?;
         }
-        self.outcome.pending_at_end = self.scheduler.pending();
         self.outcome.timer = self.timer.stats();
         if let (Some(net), Some(counters)) = (&self.net, counters) {
             let plan = net.plan();
@@ -657,13 +507,7 @@ impl<'g> Engine<'g> {
                 counters,
             });
         }
-        for &slice in &self.slices {
-            self.outcome
-                .estimates
-                .insert(slice, self.cost.estimate(slice));
-        }
-        self.outcome.frame_scale = self.cost.frame_scale();
-        self.outcome.frames_recorded = self.cost.frames_recorded();
+        self.outcome.tally = self.step.finish();
         Ok(self.outcome)
     }
 
@@ -770,6 +614,7 @@ impl Future for ReadbackTurn<'_, '_> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use beatlm_core::cost::FrameScale;
 
     #[test]
     fn the_default_estimator_is_the_cores_default() {

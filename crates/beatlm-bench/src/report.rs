@@ -118,22 +118,23 @@ fn write_report(
     }
     // The lines the browser's report shares, at the loop's period
     // (`beatlm_host::report`); `channel_handoff_us` is the bench's own.
+    let t = &outcome.tally;
     report::write_lines(
         out,
         &report::Lines {
             latency: Some(args.latency),
             period: FRAME_PERIOD,
             dropped: outcome.dropped,
-            submitted: outcome.submitted,
-            delivered: outcome.delivered,
-            missed: outcome.missed,
-            startup_missed: outcome.startup_missed,
-            pending_at_end: outcome.pending_at_end,
-            violations: outcome.violations,
+            submitted: t.submitted,
+            delivered: t.delivered,
+            missed: t.missed,
+            startup_missed: t.startup_missed,
+            pending_at_end: t.pending_at_end,
+            violations: t.violations,
             timer: outcome.timer,
-            latencies: &outcome.latencies,
-            dispatches_per_job: &outcome.dispatches_per_job,
-            dispatches_per_frame: &outcome.dispatches_per_frame,
+            latencies: &t.latencies,
+            dispatches_per_job: &t.dispatches_per_job,
+            dispatches_per_frame: &t.dispatches_per_frame,
             after_dispatches: &[],
             lateness_us: &outcome.lateness_us,
             cpu_us: &outcome.cpu_us,
@@ -142,20 +143,20 @@ fn write_report(
             plan_us: &outcome.plan_us,
             encode_us: &outcome.encode_us,
             submit_us: &outcome.submit_us,
-            gpu_frame_us: &outcome.gpu_frame_us,
+            gpu_frame_us: &t.gpu_frame_us,
             after_gpu_frame: &[],
-            longest_dispatch_us: &outcome.longest_dispatch_us,
-            pass_frames: &outcome.pass_frames,
-            frame_ratios: &outcome.frame_ratios,
-            frame_scale: outcome.frame_scale,
-            frames_recorded: outcome.frames_recorded,
-            frame_scales: &outcome.frame_scales,
+            longest_dispatch_us: &t.longest_dispatch_us,
+            pass_frames: &t.pass_frames,
+            frame_ratios: &t.frame_ratios,
+            frame_scale: t.frame_scale,
+            frames_recorded: t.frames_recorded,
+            frame_scales: &t.frame_scales,
         },
     )?;
     if let Some(dispatches) = outcome.background_dispatches {
         writeln!(out, "background_dispatches: {dispatches}")?;
     }
-    report::write_slices(out, &outcome.estimates, &outcome.measured)?;
+    report::write_slices(out, &t.estimates, &t.measured)?;
     if let Some(net) = &outcome.net {
         write_net(out, net)?;
     }
@@ -278,53 +279,56 @@ mod tests {
         use beatlm_core::cost::{FrameScale, SliceId};
         use beatlm_core::time::Micros;
         use beatlm_host::pass_overlap::{Frame, Pass};
+        use beatlm_host::step::Tally;
         let q = 65_536;
         let span = |begin_ns, end_ns| PassSpan { begin_ns, end_ns };
         Outcome {
+            tally: Tally {
+                dispatches_per_frame: vec![4, 4, 3],
+                dispatches_per_job: vec![4, 4],
+                gpu_frame_us: vec![6_000, 17_000, 7_000],
+                longest_dispatch_us: vec![1_500, 1_600],
+                latencies: vec![2, 2, 3],
+                submitted: 3,
+                delivered: 2,
+                missed: 1,
+                startup_missed: 1,
+                violations: 1,
+                pending_at_end: 2,
+                measured: [(SliceId::new(0), (3_000, 2))].into_iter().collect(),
+                estimates: [
+                    (SliceId::new(0), Micros::new(1_600)),
+                    (SliceId::new(1), Micros::new(2_000)),
+                ]
+                .into_iter()
+                .collect(),
+                frame_ratios: vec![1.1, 0.9, 1.25],
+                frame_scales: vec![1.0, 1.2],
+                frame_scale: FrameScale::Measured(1.2),
+                frames_recorded: 70,
+                pass_frames: vec![Frame {
+                    index: 0,
+                    compute: vec![Pass {
+                        slice: SliceId::new(0),
+                        us: 655,
+                        span: span(3 * q, 13 * q),
+                    }],
+                    render: Some(span(10 * q, 41 * q)),
+                }],
+            },
             cpu_us: vec![900, 1_100, 1_000],
             tick_us: vec![1_200, 1_300, 1_250],
             handoff_us: Vec::new(),
             plan_us: vec![50, 60, 55],
             encode_us: vec![100, 110, 105],
             submit_us: vec![30, 40, 35],
-            dispatches_per_frame: vec![4, 4, 3],
-            dispatches_per_job: vec![4, 4],
             lateness_us: vec![0, 10, 500],
             dropped: 1,
-            gpu_frame_us: vec![6_000, 17_000, 7_000],
-            longest_dispatch_us: vec![1_500, 1_600],
-            latencies: vec![2, 2, 3],
-            submitted: 3,
-            delivered: 2,
-            missed: 1,
-            startup_missed: 1,
-            violations: 1,
-            pending_at_end: 2,
-            measured: [(SliceId::new(0), (3_000, 2))].into_iter().collect(),
-            estimates: [
-                (SliceId::new(0), Micros::new(1_600)),
-                (SliceId::new(1), Micros::new(2_000)),
-            ]
-            .into_iter()
-            .collect(),
-            frame_ratios: vec![1.1, 0.9, 1.25],
-            frame_scales: vec![1.0, 1.2],
-            frame_scale: FrameScale::Measured(1.2),
-            frames_recorded: 70,
             timer: TimerStats {
                 frames_skipped: 1,
                 frames_collected: 3,
                 frames_failed: 0,
             },
-            pass_frames: vec![Frame {
-                index: 0,
-                compute: vec![Pass {
-                    slice: SliceId::new(0),
-                    us: 655,
-                    span: span(3 * q, 13 * q),
-                }],
-                render: Some(span(10 * q, 41 * q)),
-            }],
             background_dispatches: Some(42),
             net: None,
         }
