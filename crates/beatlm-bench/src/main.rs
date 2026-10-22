@@ -58,7 +58,16 @@
 //! the options exist for that. Pass durations on a tile-based GPU are measured
 //! between the pass's boundaries, which can include time the pass waited for
 //! earlier work on the queue, so a very short slice following a heavy render
-//! pass measures longer than it ran.
+//! pass measures longer than it ran. Nor do a frame's passes run strictly in
+//! the order encoded: with the depth model on the same adapter the render
+//! pass's span intersected the slices' in every frame, while the slices ran
+//! one after another (`pass_overlap.rs`, "What it found natively", has the
+//! runs), so a sum of a frame's pass durations, such as `gpu_frame_us`, can
+//! count the same time twice. `--render-order after` makes the render pass
+//! read what the slices write, so that it runs after them; `workload.rs`
+//! ("Ordering the render pass after the slices") says how, what that
+//! guarantees, and what it measured. The default, `free`, is the frame as it
+//! was before the option existed.
 //!
 //! # The `net` workload
 //!
@@ -644,7 +653,7 @@
 //! |---|---|
 //! | `run` | which run of `--runs` this is |
 //! | `adapter`, `backend` | what the numbers were measured on; quote them with any number |
-//! | `config` | the options the run used, `mode`, `estimator`, `submit` and `background_load` included (and `background_iters` when the load is on) |
+//! | `config` | the options the run used, `mode`, `render_order`, `estimator`, `submit` and `background_load` included (and `background_iters` when the load is on) |
 //! | `promised_latency_ms` | `--latency` times the frame period: what the host delays its source by |
 //! | `frames` | frames run |
 //! | `frames_dropped` | frame periods given up because a frame began a whole period late; the loop drops them as a display would, rather than running frames back to back to catch up |
@@ -668,6 +677,11 @@
 //! | `gpu_frame_us` | per timed frame, render plus every slice, on the GPU: p50, p99, max |
 //! | `longest_dispatch_us` | per timed frame that ran a slice, the longest single measured compute pass: how long one dispatch held up the queue; p50, p99, max |
 //! | `gpu_frames_over_period` | timed frames whose render plus slices took longer than the frame period, of the timed frames: a real overrun that the estimates were supposed to prevent |
+//! | `pass_overlap_frames` | of the timed frames, those with a timed render and a timed slice, and of those the frames whose render span intersects a slice's by more than the tolerance (`tolerance_ns`: the timestamps' step, at least 1 µs), with the share and the largest intersection seen; H7 of issue #53 (#61) asks whether the render runs beside the slices. `pass_overlap.rs` defines this line and the four after it, and the browser's report has the same five |
+//! | `pass_overlap_us` | per overlapping frame, the time the render shared with the slices taken together: p50, p99, max |
+//! | `pass_order` | where each such frame's render began: before the first slice began, after the last ended (the order encoded), or among them |
+//! | `slice_vs_render_overlap` | each slice measured in a frame with a render, over its slice's median, apart by whether it overlapped the render: how many, and the ratios' mean, p50 and p90 |
+//! | `pass_overlap_compute` | consecutive slices of a frame whose spans intersect by more than the tolerance, of all such pairs, and the frames with one: overlap among the slices, apart from overlap with the render |
 //! | `frame_ratio` | per timed frame that ran slices, their measured GPU time over the sum of their estimates when the frame was planned (`CostModel::frame_estimate`: every slice, except that `frame-scaled` counts only the slices warm in the loop): how many such frames, and min, p50, p90, max; `none` when there were none |
 //! | `frame_scale` | `none` unless `--estimator frame-scaled`; then the frame scale when the run ended (`final`, `warming_up` before the frame window filled), the frames the cost model recorded (`frames_recorded`), and the plans made with a measured scale (`planned_scaled`) with its min, p50, p90 and max over them |
 //! | `background_dispatches` | dispatches the competing load submitted, from the one completed before the first frame to the last one queued when it was stopped; present only with `--background-load` |
@@ -819,6 +833,7 @@ mod net;
 mod pace;
 mod pass_bench;
 mod pass_cost;
+mod pass_overlap;
 #[cfg(test)]
 mod reference;
 mod report;

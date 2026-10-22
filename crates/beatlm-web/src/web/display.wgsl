@@ -37,11 +37,29 @@ const TOP: f32 = 60.0;
 const LEFT_X: f32 = 20.0;
 const RIGHT_X: f32 = 660.0;
 
-@vertex
-fn display_vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
+// A full-screen triangle: three vertices cover the whole canvas.
+fn triangle(vi: u32) -> vec4<f32> {
     let x = f32((vi << 1u) & 2u);
     let y = f32(vi & 2u);
     return vec4<f32>(x * 2.0 - 1.0, y * 2.0 - 1.0, 0.0, 1.0);
+}
+
+@vertex
+fn display_vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
+    return triangle(vi);
+}
+
+// Read by `display_vs_after` only, for `render_order=after`: the first word of
+// the plan's one arena, which every slice writes, bound read-only, so the
+// pass runs after the frame's slices. `render_vs_after` in beatlm-bench's
+// shaders.wgsl is the same, and its `workload.rs` says what that guarantees.
+@group(1) @binding(0) var<storage, read> written: array<u32>;
+
+// `display_vs`, made a reader of `written`, by a shift no rasteriser shows.
+@vertex
+fn display_vs_after(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
+    let p = triangle(vi);
+    return vec4<f32>(p.x + f32(written[0] >> 8u) * 1e-30, p.y, p.z, p.w);
 }
 
 // The pixel of the model's image under canvas position `p` in the square whose

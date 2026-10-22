@@ -540,6 +540,11 @@ pub mod pace;
 // and the bench encode the same passes and report the same lines.
 #[path = "../../beatlm-bench/src/pass_cost.rs"]
 pub mod pass_cost;
+// The bench's reading of whether a frame's render pass overlapped its compute
+// passes, by path, so a page and the bench write the same `pass_overlap_*`
+// lines by the same rules.
+#[path = "../../beatlm-bench/src/pass_overlap.rs"]
+pub mod pass_overlap;
 pub mod render_cost;
 pub mod report;
 // The bench's realisation of a program with one slot per job in flight, by

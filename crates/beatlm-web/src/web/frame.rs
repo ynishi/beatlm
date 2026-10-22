@@ -634,6 +634,11 @@ impl Host {
             .map(|&((_, slice, _), duration)| (slice, duration))
             .collect();
         self.outcome.diagnosis.passes(&passes);
+        self.outcome
+            .pass_frames
+            .push(crate::pass_overlap::Frame::of(&timing, |&(_, slice, _)| {
+                slice
+            }));
         // Only a depth run writes the `tail_*` lines that read them.
         if matches!(self.load, Load::Depth(_)) {
             self.outcome.diagnosis.frames.push(timed(&timing));

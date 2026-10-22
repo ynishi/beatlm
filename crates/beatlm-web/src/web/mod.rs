@@ -93,10 +93,11 @@ fn describe(config: &Config) -> String {
         }
     };
     format!(
-        "{model} frames={} {latency} estimator={} render_iters={}",
+        "{model} frames={} {latency} estimator={} render_iters={} render_order={}",
         config.frames,
         crate::config::estimator_name(config.estimator),
-        config.render_iters
+        config.render_iters,
+        config.render_order.name()
     )
 }
 
@@ -203,7 +204,9 @@ async fn setup(mut config: Config) -> Result<()> {
         Model::Synthetic => {
             let need = config.arena_bytes.map_or(Need::Defaults, Need::Arena);
             let gpu = device::open(page::canvas()?, need).await?;
-            let workload = Workload::new(&gpu.device, DEFAULT_SLICE_ITERS, config.render_iters);
+            let mut workload = Workload::new(&gpu.device, DEFAULT_SLICE_ITERS, config.render_iters);
+            // The synthetic slices write the load's own sink.
+            workload.order_render(&gpu.device, config.render_order, None);
             warm_up(&gpu, &workload).await?;
             (gpu, workload, Load::Synthetic)
         }
@@ -346,6 +349,7 @@ async fn depth_load(
         loaded.side,
         check.depth_range,
         config.render_iters,
+        config.render_order,
     )?;
     let plan = net.plan();
     let report = DepthReport {

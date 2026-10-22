@@ -11,8 +11,13 @@
 //! (`gpu_errors`), and the render pass's GPU time apart in frames with and
 //! without slices (`gpu_render_alone_us`, `gpu_render_with_slices_us`), which
 //! says whether the render's measurement, which the budget takes, counts the
-//! slices; and the diagnosis of the misses ([`crate::diagnosis`]): how many
-//! were abandoned before they started (`missed_unstarted`), after
+//! slices. The five lines that say whether a frame's render pass overlapped
+//! its slices on the GPU (`pass_overlap_frames`, `pass_overlap_us`,
+//! `pass_order`, `slice_vs_render_overlap`, `pass_overlap_compute`) follow
+//! `gpu_frames_over_period` in both hosts' reports, from the bench's own
+//! `pass_overlap.rs` ([`crate::pass_overlap`]). The browser's own lines go on
+//! with the diagnosis of the misses ([`crate::diagnosis`]): how many were
+//! abandoned before they started (`missed_unstarted`), after
 //! (`missed_started`) or missed at their deadline (`missed_at_deadline`), when
 //! jobs started (`jobs_started`), what the projection read for the jobs
 //! abandoned before they started (`unstarted_*`, three of them in full as
@@ -111,7 +116,10 @@ use crate::depth::{
 use crate::diagnosis::{Diagnosis, tail};
 use crate::onbeat::{self, Spread};
 use crate::pace::NOMINAL_PERIOD;
-use crate::stats::{frame_ratio_value, frame_scale_value, histogram, nearest_rank, summarize};
+use crate::pass_overlap;
+use crate::stats::{
+    frame_ratio_value, frame_scale_value, histogram, nearest_rank, share, summarize,
+};
 use crate::workload::{DEFAULT_RENDER_ITERS, DEFAULT_SLICE_ITERS};
 
 /// The two limits a memory plan can need raised, as a device or an adapter
@@ -330,6 +338,10 @@ pub struct Outcome {
     pub estimates: BTreeMap<SliceId, Micros>,
     /// What the timer could not measure.
     pub timer: TimerStats,
+    /// Every timed frame's passes with their timestamps, for the
+    /// `pass_overlap_*` lines ([`crate::pass_overlap`]); recorded for every
+    /// run, the synthetic workload's too.
+    pub pass_frames: Vec<crate::pass_overlap::Frame>,
     /// Frames whose canvas texture could not be acquired, so their render pass
     /// did not run.
     pub canvas_unavailable: u64,
@@ -461,10 +473,11 @@ fn write_report(
     write!(
         out,
         "config: frames={} latency={latency} slices={slices} slice_iters={DEFAULT_SLICE_ITERS} \
-         render_iters={} margin_us={MARGIN_US} estimator={} \
+         render_iters={} render_order={} margin_us={MARGIN_US} estimator={} \
          submit={submit}",
         config.frames,
         config.render_iters,
+        config.render_order.name(),
         estimator_name(config.estimator),
     )?;
     if let Some(bytes) = config.arena_bytes {
@@ -557,6 +570,7 @@ fn write_report(
         gpu_frames_over_period(&outcome.gpu_frame_us, period),
         outcome.gpu_frame_us.len()
     )?;
+    pass_overlap::write_lines(out, &pass_overlap::analyse(&outcome.pass_frames))?;
     for (slice, estimate) in &outcome.estimates {
         let (sum, count) = outcome.measured.get(slice).copied().unwrap_or((0, 0));
         write!(
@@ -806,16 +820,6 @@ fn write_gaps(out: &mut String, name: &str, count_name: &str, gaps_ns: &[i64]) -
             us.len()
         ),
         _ => writeln!(out, "{name}: none"),
-    }
-}
-
-/// `part / whole` to four places, or `none` when `whole` is zero.
-#[allow(clippy::cast_precision_loss)]
-fn share(part: u64, whole: u64) -> String {
-    if whole == 0 {
-        String::from("none")
-    } else {
-        format!("{:.4}", part as f64 / whole as f64)
     }
 }
 
@@ -1174,11 +1178,63 @@ mod tests {
         assert_eq!(
             line(&text, "config"),
             Some(
-                "frames=600 latency=2 slices=4 slice_iters=500 render_iters=50 margin_us=2000 \
-                 estimator=quantile submit=every"
+                "frames=600 latency=2 slices=4 slice_iters=500 render_iters=50 render_order=free \
+                 margin_us=2000 estimator=quantile submit=every"
             )
         );
         assert_eq!(text.lines().last(), Some("status: done"));
+    }
+
+    /// The bench's overlap lines, after `gpu_frames_over_period` as in the
+    /// bench's report, from the frames recorded: one whose render began
+    /// inside its slice, on Chrome's step.
+    #[test]
+    fn the_overlap_lines_follow_the_frame_lines_as_in_the_bench() {
+        use crate::pass_overlap::{Frame, Pass};
+        use beatlm::gpu::PassSpan;
+        let q = 65_536;
+        let span = |begin_ns, end_ns| PassSpan { begin_ns, end_ns };
+        let outcome = Outcome {
+            pass_frames: vec![Frame {
+                compute: vec![Pass {
+                    slice: SliceId::new(0),
+                    us: 655,
+                    span: span(3 * q, 13 * q),
+                }],
+                render: Some(span(10 * q, 41 * q)),
+            }],
+            ..Outcome::default()
+        };
+        let text = report(&Environment::default(), &outcome);
+        let names: Vec<&str> = text
+            .lines()
+            .filter_map(|l| l.split_once(": ").map(|(name, _)| name))
+            .collect();
+        let at = names
+            .iter()
+            .position(|&n| n == "gpu_frames_over_period")
+            .unwrap();
+        assert_eq!(
+            names[at + 1..at + 6],
+            [
+                "pass_overlap_frames",
+                "pass_overlap_us",
+                "pass_order",
+                "slice_vs_render_overlap",
+                "pass_overlap_compute"
+            ]
+        );
+        assert_eq!(
+            line(&text, "pass_overlap_frames"),
+            Some(
+                "frames=1 with_render_and_slices=1 overlapping=1 share=1.0000 \
+                 tolerance_ns=65536 max_intersection_ns=196608"
+            )
+        );
+        assert_eq!(
+            line(&text, "pass_order"),
+            Some("render_before_first_slice=0 render_after_last_slice=0 render_among_slices=1")
+        );
     }
 
     #[test]
@@ -1189,7 +1245,11 @@ mod tests {
             line(&text, "config").unwrap().to_owned()
         };
         // The default is unchanged.
-        assert!(config_of("").contains(" render_iters=50 margin_us=2000 "));
+        assert!(config_of("").contains(" render_iters=50 render_order=free margin_us=2000 "));
+        assert!(config_of("?render_order=after").contains(" render_order=after margin_us="));
+        assert!(
+            config_of("?model=depth&side=266&render_order=after").contains(" render_order=after ")
+        );
         for (query, printed) in [
             ("?render_iters=1", "render_iters=1"),
             ("?render_iters=0", "render_iters=0"),
@@ -1322,8 +1382,8 @@ mod tests {
         assert_eq!(
             line(&text, "config"),
             Some(
-                "frames=600 latency=none slices=4 slice_iters=500 render_iters=50 margin_us=2000 \
-                 estimator=quantile submit=beat sync=onbeat bpm=100 beat_margin_us=100000 \
+                "frames=600 latency=none slices=4 slice_iters=500 render_iters=50 \
+                 render_order=free margin_us=2000 estimator=quantile submit=beat sync=onbeat bpm=100 beat_margin_us=100000 \
                  bpm_change=120@60 beats=300"
             )
         );
@@ -1494,8 +1554,8 @@ mod tests {
         assert_eq!(
             line(&text, "config"),
             Some(
-                "frames=600 latency=10 slices=155 slice_iters=500 render_iters=50 margin_us=2000 \
-                 estimator=quantile submit=free workload=depth size=266 fusion=on \
+                "frames=600 latency=10 slices=155 slice_iters=500 render_iters=50 \
+                 render_order=free margin_us=2000 estimator=quantile submit=free workload=depth size=266 fusion=on \
                  split=on max_dispatch_us=1000"
             )
         );

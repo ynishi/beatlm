@@ -17,6 +17,9 @@ use std::collections::BTreeMap;
 use beatlm_core::cost::SliceId;
 
 use crate::stats::nearest_rank as percentile;
+// Shared with the bench (its `stats.rs`), where the `pass_overlap_*` lines
+// read the same step and ratios.
+pub use crate::stats::{Ratios, step_ns};
 
 /// A measurement is an outlier when it is more than this many times its
 /// slice's median in the loop.
@@ -85,30 +88,6 @@ impl TimedFrame {
     /// frame's recorded work was over.
     fn end_ns(&self) -> Option<u64> {
         self.passes().map(|p| p.end_ns).max()
-    }
-}
-
-/// The median and the 90th percentile of a set of ratios.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Ratios {
-    /// How many ratios.
-    pub samples: usize,
-    /// Their median.
-    pub median: f64,
-    /// Their 90th percentile.
-    pub p90: f64,
-}
-
-impl Ratios {
-    /// The ratios' median and 90th percentile; `None` when there are none.
-    #[must_use]
-    pub fn of(mut values: Vec<f64>) -> Option<Self> {
-        values.sort_by(f64::total_cmp);
-        Some(Self {
-            samples: values.len(),
-            median: percentile(&values, 50)?,
-            p90: percentile(&values, 90)?,
-        })
     }
 }
 
@@ -670,29 +649,6 @@ pub fn binomial_at_least(n: u64, k: u64, p: f64) -> f64 {
         ln_pmf += ((n - i) as f64).ln() - ((i + 1) as f64).ln() + ln_p - ln_q;
     }
     total.min(1.0)
-}
-
-/// The largest step every one of `timestamps` is a whole number of from the
-/// earliest: their differences' greatest common divisor. `None` with fewer
-/// than two distinct timestamps.
-///
-/// A clock that is cut down to a step before it is read shows that step; an
-/// exact one shows a step of a few nanoseconds once there are enough
-/// timestamps.
-#[must_use]
-pub fn step_ns(timestamps: &[u64]) -> Option<u64> {
-    let earliest = *timestamps.iter().min()?;
-    let step = timestamps
-        .iter()
-        .fold(0, |step, &t| gcd(step, t - earliest));
-    (step > 0).then_some(step)
-}
-
-fn gcd(mut a: u64, mut b: u64) -> u64 {
-    while b != 0 {
-        (a, b) = (b, a % b);
-    }
-    a
 }
 
 #[cfg(test)]

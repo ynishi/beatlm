@@ -1,7 +1,9 @@
 //! Order statistics and histograms over the samples a run collects.
 //!
 //! The browser host (`beatlm-web`) compiles this file by path, so its report
-//! and its calibration quote the same statistics as the bench's.
+//! and its calibration quote the same statistics as the bench's, and the
+//! lines both hosts write from timestamps (`pass_overlap.rs`) read the same
+//! timestamp step.
 
 use std::collections::BTreeMap;
 
@@ -39,6 +41,65 @@ pub fn summarize(samples: &[u64]) -> Option<Summary> {
 pub fn nearest_rank<T: Copy>(sorted: &[T], percent: usize) -> Option<T> {
     let rank = (sorted.len() * percent).div_ceil(100).max(1);
     sorted.get(rank - 1).copied()
+}
+
+/// The median and the 90th percentile of a set of ratios, by nearest rank.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Ratios {
+    /// How many ratios.
+    pub samples: usize,
+    /// Their median.
+    pub median: f64,
+    /// Their 90th percentile.
+    pub p90: f64,
+}
+
+impl Ratios {
+    /// The ratios' median and 90th percentile; `None` when there are none.
+    #[must_use]
+    pub fn of(mut values: Vec<f64>) -> Option<Self> {
+        values.sort_by(f64::total_cmp);
+        Some(Self {
+            samples: values.len(),
+            median: nearest_rank(&values, 50)?,
+            p90: nearest_rank(&values, 90)?,
+        })
+    }
+}
+
+/// The largest step every one of `timestamps` is a whole number of from the
+/// earliest: their differences' greatest common divisor. `None` with fewer
+/// than two distinct timestamps.
+///
+/// A clock that is cut down to a step before it is read shows that step; an
+/// exact one shows a step of a few nanoseconds once there are enough
+/// timestamps. With few timestamps the step can be coarser than the clock's.
+#[must_use]
+pub fn step_ns(timestamps: &[u64]) -> Option<u64> {
+    let earliest = *timestamps.iter().min()?;
+    let step = timestamps
+        .iter()
+        .fold(0, |step, &t| gcd(step, t - earliest));
+    (step > 0).then_some(step)
+}
+
+fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
+/// `part / whole` to four places, or `none` when `whole` is zero: the share
+/// both hosts' reports print.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn share(part: u64, whole: u64) -> String {
+    if whole == 0 {
+        String::from("none")
+    } else {
+        format!("{:.4}", part as f64 / whole as f64)
+    }
 }
 
 /// The middle of `samples` once sorted, the upper one when there are two;
@@ -198,6 +259,22 @@ mod tests {
             frame_scale_value(FrameScale::Measured(1.234), 70, &[1.0, 1.234]),
             "final=1.23 frames_recorded=70 planned_scaled=2 min=1.00 p50=1.00 p90=1.23 max=1.23"
         );
+    }
+
+    #[test]
+    fn ratios_take_nearest_rank_percentiles() {
+        let r = Ratios::of(vec![3.0, 1.0, 2.0]).unwrap();
+        assert_eq!((r.samples, r.median, r.p90), (3, 2.0, 3.0));
+        assert_eq!(Ratios::of(Vec::new()), None);
+    }
+
+    #[test]
+    fn the_step_is_the_timestamps_common_divisor() {
+        let q = 65_536;
+        assert_eq!(step_ns(&[5 * q, 9 * q, 12 * q, 5 * q]), Some(q));
+        assert_eq!(step_ns(&[1_000, 1_003, 1_010]), Some(1));
+        assert_eq!(step_ns(&[7, 7]), None);
+        assert_eq!(step_ns(&[]), None);
     }
 
     #[test]

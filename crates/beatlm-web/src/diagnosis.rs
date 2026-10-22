@@ -157,6 +157,44 @@
 //! so H2 is tested only through what it would do to the times; and the
 //! compositor's GPU work, which is in no query.
 //!
+//! # Whether the render runs beside the slices
+//!
+//! The H1 to H4 above are this module's own, from #43; issue #53 numbers its
+//! hypotheses apart, and its H7 (#61) is that Chrome runs a frame's render
+//! pass and its compute passes at the same time, so that they slow each
+//! other: a minimal render about halved the slices' times in Chrome and
+//! changed nothing natively (#55). The negative gaps of
+//! `tail_gap_between_passes_us` and a render that measured faster in frames
+//! with slices (the first section) both fit it. Five lines, written for every
+//! run, the synthetic workload's too (with zero frames when the device has no
+//! timestamps), test it, and the bench
+//! writes the same five from the same file, so a page's compare with a native
+//! run line by line; [`crate::pass_overlap`] defines them, the tolerance an
+//! intersection must exceed (one timestamp step: 65 536 ns in Chrome), and
+//! what timestamps of one submission can and cannot say, the clock they share
+//! being taken, as here, not checked:
+//!
+//! - `pass_overlap_frames`: how many frames with a render and slices had the
+//!   render's span intersect a slice's. H7 predicts many.
+//! - `pass_overlap_us`: how long, per such frame.
+//! - `pass_order`: whether the render began before, among or after the
+//!   slices; the page encodes the slices, then the copy of the delivered
+//!   depth, then the render, so in order every frame is `after`.
+//! - `slice_vs_render_overlap`: slices that overlapped the render against
+//!   those that did not, each over its slice's median. H7's slowdown predicts
+//!   the first above the second.
+//! - `pass_overlap_compute`: consecutive slices that intersect one another,
+//!   which the render does not explain: overlap there as often as with the
+//!   render points at the timestamps rather than at the render.
+//!
+//! Natively the render overlapped the slices in every frame, and slowed the
+//! ones it overlapped at 50 iterations ([`crate::pass_overlap`], "What it
+//! found natively"), so overlap alone does not set Chrome apart; the lines'
+//! figures in Chrome against those are what decide H7. `render_order=after`
+//! ([`crate::config`]) takes the overlap away, so that the same lines and the
+//! slices' times can be compared with it and without; the bench's
+//! `workload.rs` says how and what that guarantees.
+//!
 //! # Planning against the frame's total
 //!
 //! The finding of the lines above, that slow measurements come by frame, is

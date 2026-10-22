@@ -37,7 +37,7 @@ use beatlm::gpu::Arenas;
 use beatlm_core::cost::SliceId;
 use beatlm_core::device::DeviceProfile;
 use beatlm_core::kernel::Program;
-use beatlm_core::memory::{MemoryPlan, TensorDesc, TensorId};
+use beatlm_core::memory::{ArenaId, MemoryPlan, TensorDesc, TensorId};
 
 /// Slot tensors are numbered from these bases, so a program's own tensors and
 /// the two kinds of slot tensor never collide.
@@ -264,6 +264,27 @@ impl Net {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn arenas(&self) -> &Arenas {
         &self.arenas
+    }
+
+    /// The buffer every kernel of the network writes: the plan's one arena,
+    /// which a render pass reads to be ordered after a frame's slices
+    /// (`workload.rs`, "Ordering the render pass after the slices").
+    ///
+    /// # Errors
+    ///
+    /// A plan of more than one arena, whose kernels need not all write one
+    /// buffer, so a read of one would not order the render after every slice.
+    pub fn written(&self) -> Result<&wgpu::Buffer> {
+        let count = self.plan.arenas().len();
+        if count != 1 {
+            bail!(
+                "the render is ordered after the slices through the plan's one arena, and this \
+                 plan has {count}"
+            );
+        }
+        self.arenas
+            .buffer(ArenaId::new(0))
+            .context("the plan's arena has no buffer")
     }
 
     /// The lowered network the kernels were generated from.
