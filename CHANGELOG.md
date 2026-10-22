@@ -103,6 +103,10 @@ and this project adheres to
   record a kernel into an open pass.
 - `beatlm-web` `render_iters`: the render pass's per-pixel loop count for
   synthetic, depth and on-beat runs (default 50, as the bench).
+- `render_order` (`beatlm-bench --render-order`, `beatlm-web render_order`,
+  `free|after`, default `free`): `after` makes the render wait for the frame's
+  slices through a resource dependency; `pass_overlap_*`, `pass_order` and
+  `slice_vs_render_overlap` report how the render and the slices overlap.
 
 ### Changed
 
