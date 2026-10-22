@@ -23,6 +23,13 @@ use beatlm_core::kernel::Program;
 use beatlm_core::schedule::{FramePlan, JobId, Scheduler};
 use beatlm_core::sync::{MissPolicy, SyncPolicy};
 use beatlm_core::time::{FrameIndex, FrameInfo, Micros, TimePoint};
+use beatlm_host::pass_overlap;
+use beatlm_host::slots;
+use beatlm_host::stats::frame_ratio;
+use beatlm_host::workload::{
+    DEFAULT_STAGE_STORAGE_BUFFERS, RENDER_HEIGHT, RENDER_WIDTH, RenderOrder, TARGET_FORMAT,
+    Workload, written_fits,
+};
 
 use crate::args::{Args, EstimatorKind, Submit, WorkloadKind};
 use crate::calibrate::{Settings, calibrate};
@@ -31,13 +38,6 @@ use crate::depth;
 use crate::device::Gpu;
 use crate::net::{self, Net, Numbers};
 use crate::pace::{FRAME_PERIOD, Tick, micros_between};
-use crate::pass_overlap;
-use crate::slots;
-use crate::stats::frame_ratio;
-use crate::workload::{
-    DEFAULT_STAGE_STORAGE_BUFFERS, RENDER_HEIGHT, RENDER_WIDTH, RenderOrder, TARGET_FORMAT,
-    Workload, written_fits,
-};
 
 /// What a slice is assumed to cost until it has been measured.
 const SLICE_PRIOR: Micros = Micros::new(2_000);
@@ -209,7 +209,7 @@ pub struct Outcome {
     /// What the timer could not measure.
     pub timer: TimerStats,
     /// Every timed frame's passes with their timestamps, for the
-    /// `pass_overlap_*` lines (`pass_overlap.rs`).
+    /// `pass_overlap_*` lines (`beatlm_host::pass_overlap`).
     pub pass_frames: Vec<pass_overlap::Frame>,
     /// Dispatches the competing load submitted, from the one it completed
     /// before the run's first frame to the last one queued when it was stopped
@@ -335,7 +335,7 @@ fn planned_program(args: &Args) -> Result<(Program, Numbers)> {
         WorkloadKind::Depth => depth::load(args.size, args.fusion),
         WorkloadKind::Net => {
             let shape = net::DEFAULT_SHAPE;
-            Ok((net::program(&shape, args.fusion)?, Numbers::net(&shape)))
+            Ok((net::program(&shape, args.fusion)?, net::numbers(&shape)))
         }
         WorkloadKind::Synthetic | WorkloadKind::PassCost => {
             anyhow::bail!("the {} workload has no program", args.workload.name())

@@ -23,12 +23,13 @@ rust-test:
 rust-doc:
     RUSTDOCFLAGS="-D warnings -D missing_docs" cargo doc --workspace --no-deps
 
-# The browser is a first-class target: the umbrella and the browser host must
-# build for it on every change, not when someone gets round to the demo. A
-# lint needs no wasm-bindgen command, so CI does not install one.
-# Lints the umbrella and the browser host for wasm32-unknown-unknown.
+# The browser is a first-class target: the umbrella, the code both hosts share
+# and the browser host must build for it on every change, not when someone
+# gets round to the demo. A lint needs no wasm-bindgen command, so CI does not
+# install one.
+# Lints the umbrella, the shared host crate and the browser host for wasm32-unknown-unknown.
 wasm-check:
-    cargo clippy -p beatlm -p beatlm-web --target wasm32-unknown-unknown -- -D warnings
+    cargo clippy -p beatlm -p beatlm-host -p beatlm-web --target wasm32-unknown-unknown -- -D warnings
 
 # The scripts' own tests: what the local server maps a path to and what it
 # refuses. The standard library only; `-B` leaves no bytecode in the tree.

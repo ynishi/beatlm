@@ -9,17 +9,16 @@
 //! cost model.
 //!
 //! Percentiles are nearest-rank, by the same function as the report's other
-//! percentiles (the bench's `stats.rs`), so every one is a value that was
+//! percentiles (`beatlm_host::stats`), so every one is a value that was
 //! observed. A slice's median is its 50th percentile by that rule.
 
 use std::collections::BTreeMap;
 
 use beatlm_core::cost::SliceId;
-
-use crate::stats::nearest_rank as percentile;
-// Shared with the bench (its `stats.rs`), where the `pass_overlap_*` lines
-// read the same step and ratios.
-pub use crate::stats::{Ratios, step_ns};
+use beatlm_host::stats::nearest_rank as percentile;
+// Shared with the bench (`beatlm_host::stats`), where the `pass_overlap_*`
+// lines read the same step and ratios.
+pub use beatlm_host::stats::{Ratios, step_ns};
 
 /// A measurement is an outlier when it is more than this many times its
 /// slice's median in the loop.

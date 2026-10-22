@@ -107,7 +107,7 @@
 //!    the file; every slot's input is the reference input of that side
 //!    (`beatlm::load::depth_anything_v2::reference::input`), so the loop
 //!    computes what the check compares.
-//! 3. **Device.** The bench's `Net` ([`slots`], compiled by path) plans the
+//! 3. **Device.** The shared `Net` ([`beatlm_host::slots`]) plans the
 //!    model with one input and one output slot per job that can be in flight,
 //!    against the baseline profile, before the device exists; the device is
 //!    created with what that plan needs (`beatlm::gpu::required_limits`). At
@@ -294,8 +294,9 @@
 //!
 //! # What a pass costs
 //!
-//! `?model=pass-cost` runs the bench's `pass-cost` workload ([`pass_cost`],
-//! compiled by path, which owns the design and defines the report's lines):
+//! `?model=pass-cost` runs the bench's `pass-cost` workload
+//! ([`beatlm_host::pass_cost`], which owns the design and defines the report's
+//! lines):
 //! no job, no scheduler and no promise, but frames that each encode `P`
 //! dispatches as one pass each with timestamps on every pass (`per-pass`,
 //! what the engine does), on the ends only (`ends`), on every `k`-th
@@ -311,7 +312,8 @@
 //! queries, and with `kernels=depth` it fetches the weights and plans the
 //! model as `model=depth` does, with one slot. The report has the shared
 //! first lines, `config`, `frames`, the `timings_*` lines, `canvas_unavailable`
-//! and `gpu_errors`, then [`pass_cost`]'s lines, then `status: done`.
+//! and `gpu_errors`, then [`beatlm_host::pass_cost`]'s lines, then `status:
+//! done`.
 //!
 //! ```text
 //! http://127.0.0.1:8000/?model=pass-cost&frames=300
@@ -482,7 +484,7 @@
 //!   overlapped a slice. Natively the same order changed neither the
 //!   delivery nor the slices' means and cost a little GPU time per frame (the
 //!   bench's crate documentation, "What it measures", has the run), so
-//!   the bench keeps `free`. The bench's `workload.rs` ("Ordering the render
+//!   the bench keeps `free`. `beatlm_host::workload` ("Ordering the render
 //!   pass after the slices") says how the order is kept, for a plan of any
 //!   number of arenas up to what one shader stage binds; a plan of more is
 //!   refused before the weights are fetched, with `render_order=free` named
@@ -521,15 +523,14 @@
 //!
 //! # What is shared with the bench
 //!
-//! The load is the bench's own: [`workload`] and its `shaders.wgsl`, the
-//! depth model's realisation [`slots`], the pass-cost measurement
-//! [`pass_cost`], and the percentiles of the report and calibration's median,
-//! are compiled from `beatlm-bench`'s files by path, so
-//! the two hosts time the same kernels at the same sizes and quote the same
-//! statistic. The model, its loader and its reference comparison come from
-//! `beatlm::model` and `beatlm::load`, the kernels from `beatlm::codegen`, the
-//! timer, the limits and the arenas from `beatlm::gpu`, and the decisions from
-//! `beatlm_core`.
+//! The load, the depth model's slots, the pass-cost measurement, the
+//! `pass_overlap_*` lines and the report's statistics come from
+//! [`beatlm_host`], the crate both hosts depend on, whose documentation lists
+//! what it holds; so the two hosts time the same kernels at the same sizes and
+//! quote the same statistic. The model, its loader and its reference
+//! comparison come from `beatlm::model` and `beatlm::load`, the kernels from
+//! `beatlm::codegen`, the timer, the limits and the arenas from `beatlm::gpu`,
+//! and the decisions from `beatlm_core`.
 //!
 //! The frame's bookkeeping — the budget and forecast, the admission of an
 //! input, the delivery and miss counts, what each measurement feeds — the
@@ -559,28 +560,8 @@ pub mod depth;
 pub mod diagnosis;
 pub mod onbeat;
 pub mod pace;
-// The bench's measurement of what a compute pass costs, by path, so a page
-// and the bench encode the same passes and report the same lines.
-#[path = "../../beatlm-bench/src/pass_cost.rs"]
-pub mod pass_cost;
-// The bench's reading of whether a frame's render pass overlapped its compute
-// passes, by path, so a page and the bench write the same `pass_overlap_*`
-// lines by the same rules.
-#[path = "../../beatlm-bench/src/pass_overlap.rs"]
-pub mod pass_overlap;
 pub mod render_cost;
 pub mod report;
-// The bench's realisation of a program with one slot per job in flight, by
-// path, so a page and the bench run the depth model through the same `Net`.
-#[path = "../../beatlm-bench/src/slots.rs"]
-pub mod slots;
-// The bench's percentiles and median, by path, so the report and the
-// calibration quote the same statistics.
-#[path = "../../beatlm-bench/src/stats.rs"]
-mod stats;
-// The bench's synthetic load, by path; the file says why it is shared.
-#[path = "../../beatlm-bench/src/workload.rs"]
-pub mod workload;
 
 #[cfg(target_arch = "wasm32")]
 mod web;
@@ -599,10 +580,10 @@ mod tests {
     fn the_display_shader_validates_without_optional_features() {
         let source = include_str!("web/display.wgsl");
         beatlm::codegen::validate("display", source, DeviceFeatures::default()).unwrap();
-        for arenas in 1..=crate::workload::DEFAULT_STAGE_STORAGE_BUFFERS as usize {
+        for arenas in 1..=beatlm_host::workload::DEFAULT_STAGE_STORAGE_BUFFERS as usize {
             let wgsl = format!(
                 "{source}{}",
-                crate::workload::after_vertex(arenas, "display_vs_after")
+                beatlm_host::workload::after_vertex(arenas, "display_vs_after")
             );
             beatlm::codegen::validate("display, render after", &wgsl, DeviceFeatures::default())
                 .unwrap_or_else(|e| panic!("{arenas} arenas: {e}"));

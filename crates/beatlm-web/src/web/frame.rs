@@ -44,6 +44,9 @@ use beatlm_core::cost::{CostModel, Estimator, FrameScale, SliceId};
 use beatlm_core::schedule::{Due, FramePlan, JobId, Scheduler, SliceRun};
 use beatlm_core::sync::{MissPolicy, SyncPolicy};
 use beatlm_core::time::{BeatGrid, FrameIndex, FrameInfo, Micros, TimePoint};
+use beatlm_host::slots::Net;
+use beatlm_host::stats::frame_ratio;
+use beatlm_host::workload::Workload;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
 
@@ -59,9 +62,6 @@ use crate::onbeat::{self, Beats};
 use crate::pace::{FrameStart, NOMINAL_PERIOD, Pace, Pacer, ms_to_us};
 use crate::render_cost::{RENDER_PRIOR, RenderCost};
 use crate::report::{DepthReport, Environment, Outcome, STARTUP_FRAMES, render};
-use crate::slots::Net;
-use crate::stats::frame_ratio;
-use crate::workload::Workload;
 
 /// What a slice is assumed to cost until it has been measured: the bench's.
 pub(super) const SLICE_PRIOR: Micros = Micros::new(2_000);
@@ -640,9 +640,10 @@ impl Host {
         self.outcome.diagnosis.passes(&passes);
         self.outcome
             .pass_frames
-            .push(crate::pass_overlap::Frame::of(&timing, |&(_, slice, _)| {
-                slice
-            }));
+            .push(beatlm_host::pass_overlap::Frame::of(
+                &timing,
+                |&(_, slice, _)| slice,
+            ));
         // Only a depth run writes the `tail_*` lines that read them.
         if matches!(self.load, Load::Depth(_)) {
             self.outcome.diagnosis.frames.push(timed(&timing));

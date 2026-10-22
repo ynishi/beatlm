@@ -1,11 +1,11 @@
 //! The page's host of the bench's `pass-cost` workload
-//! ([`crate::pass_cost`]): the device, the frames from
+//! ([`beatlm_host::pass_cost`]): the device, the frames from
 //! `requestAnimationFrame`, and the CPU clock, `performance.now()`.
 //!
 //! It is a measurement loop like calibration's ([`super::model`]): an `async`
 //! task that awaits each animation frame, collects the timings that have come
 //! back, and runs the next frame only once nothing is in flight, so one frame
-//! is in flight at a time, as natively (`pass_cost.rs` says why). The map
+//! is in flight at a time, as natively (`beatlm_host::pass_cost` says why). The map
 //! completes between callbacks, so a frame whose GPU work fits the period
 //! comes back by the next callback and the frames keep the display's rate;
 //! a longer one gives up the callbacks it overran. Nothing is scheduled.
@@ -13,6 +13,9 @@
 use anyhow::{Context, Result, ensure};
 use beatlm::gpu::SliceTimer;
 use beatlm_core::time::FrameIndex;
+use beatlm_host::pass_cost::{self, Dispatches, Measurements, Settings, Source, Trivial};
+use beatlm_host::slots::{self, Net};
+use beatlm_host::workload::{DEFAULT_RENDER_ITERS, DEFAULT_SLICE_ITERS, Workload};
 
 use super::device::{self, Need};
 use super::model::{self, canvas_texture, lost};
@@ -20,10 +23,7 @@ use super::page;
 use super::wait::next_frame;
 use crate::config::Config;
 use crate::pace::ms_to_us;
-use crate::pass_cost::{self, Dispatches, Measurements, Settings, Source, Trivial};
 use crate::report::{PassCostOutcome, render_pass_cost};
-use crate::slots::{self, Net};
-use crate::workload::{DEFAULT_RENDER_ITERS, DEFAULT_SLICE_ITERS, Workload};
 
 /// How long the page waits for a frame's timings before it gives up, in
 /// milliseconds of `performance.now()`: far past any frame here, so only a

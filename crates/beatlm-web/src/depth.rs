@@ -17,11 +17,11 @@ use beatlm_core::kernel::{Fusion, Program};
 use beatlm_core::memory::{MemoryPlan, TensorId};
 use beatlm_core::schedule::{FramePlan, JobId};
 use beatlm_core::time::Micros;
+use beatlm_host::slots::{self, Numbers};
+use beatlm_host::stats::median;
+use beatlm_host::workload::{DEFAULT_STAGE_STORAGE_BUFFERS, RenderOrder, written_fits};
 
 use crate::pace::NOMINAL_PERIOD;
-use crate::slots::{self, Numbers};
-use crate::stats::median;
-use crate::workload::{DEFAULT_STAGE_STORAGE_BUFFERS, RenderOrder, written_fits};
 
 /// The URL prefix the models directory is served under, relative to the page:
 /// `just serve-web` maps it to the models directory
@@ -117,7 +117,7 @@ impl Graph {
 /// [`RenderOrder::After`] the display reads every arena of the plan in its
 /// vertex stage, and a device created with the limits the plan needs binds
 /// at most [`DEFAULT_STAGE_STORAGE_BUFFERS`] storage buffers there
-/// (`workload.rs`, "Ordering the render pass after the slices"). The page
+/// (`beatlm_host::workload`, "Ordering the render pass after the slices"). The page
 /// asks before it fetches the weights, so a run that cannot be honoured
 /// fails before the download.
 ///
@@ -327,7 +327,7 @@ pub fn still_busy(
 /// (`web/display.rs` says why the screen is held to that).
 ///
 /// The job's output slot still holds it then. A slot's output is live for the
-/// whole program and shares bytes with nothing else (`slots.rs`, "Jobs, slots
+/// whole program and shares bytes with nothing else (`beatlm_host::slots`, "Jobs, slots
 /// and the shared plan"), so only a later job on the same slot could
 /// overwrite it, and none has had a slice by the copy:
 ///

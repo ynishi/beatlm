@@ -47,7 +47,7 @@
 //! never waits. A tick that really waits for a map callback needs the timer to
 //! hand out a future or register a waker, which is a change to `beatlm`.
 //!
-//! The load is two kernels in `shaders.wgsl`. A slice is a compute dispatch of
+//! The load is two kernels in `beatlm-host`'s `shaders.wgsl`. A slice is a compute dispatch of
 //! 65 536 invocations, each running `--slice-iters` rounds of an integer hash.
 //! The render pass draws one full-screen triangle into an offscreen 1280x720
 //! `Rgba8Unorm` texture whose fragment shader runs `--render-iters` rounds of a
@@ -61,11 +61,11 @@
 //! pass measures longer than it ran. Nor do a frame's passes run strictly in
 //! the order encoded: with the depth model on the same adapter the render
 //! pass's span intersected the slices' in every frame, while the slices ran
-//! one after another (`pass_overlap.rs`, "What it found natively", has the
+//! one after another (`beatlm_host::pass_overlap`, "What it found natively", has the
 //! runs), so a sum of a frame's pass durations, such as `gpu_frame_us`, can
 //! count the same time twice. `--render-order after` makes the render pass
 //! read what the slices write, every arena of a planned program's plan, so
-//! that it runs after them; `workload.rs` ("Ordering the render pass after
+//! that it runs after them; `beatlm_host::workload` ("Ordering the render pass after
 //! the slices") says how, what that guarantees, what bounds the arenas it
 //! reads, and what it measured. A plan of more arenas than that is refused
 //! before calibration.
@@ -77,7 +77,7 @@
 //! free`, it changed neither the delivery (119 of 119 delivered in 600
 //! frames, either order) nor the slices' means, and `gpu_frame_us` p50 rose
 //! from 13.1 to 13.8 ms (2026-10-22, one run each; the table in
-//! `workload.rs`). In Chrome on the same machine the render slowed the
+//! `beatlm_host::workload`). In Chrome on the same machine the render slowed the
 //! slices and `after` took that away (`beatlm-web`'s crate documentation has
 //! the figures), which is a browser's reason, not one the native runs show.
 //! Making `after` the default here wants a native measurement that shows a
@@ -505,7 +505,7 @@
 //! encodes `P` dispatches in one of four variants (`--variants`; A
 //! `per-pass`, what the engine does, B `ends`, C `one-pass`, D `every:<k>`)
 //! for each `P` of `--passes`, and reads their span on the GPU and their
-//! encode and submit time on the CPU. `pass_cost.rs` owns the design: what
+//! encode and submit time on the CPU. `beatlm_host::pass_cost` owns the design: what
 //! each variant isolates, the order of the frames, what is derived and from
 //! what, and why `--render` is off by default. The browser host runs the same
 //! file (`beatlm-web`, "What a pass costs").
@@ -691,7 +691,7 @@
 //! | `gpu_frame_us` | per timed frame, render plus every slice, on the GPU: p50, p99, max |
 //! | `longest_dispatch_us` | per timed frame that ran a slice, the longest single measured compute pass: how long one dispatch held up the queue; p50, p99, max |
 //! | `gpu_frames_over_period` | timed frames whose render plus slices took longer than the frame period, of the timed frames: a real overrun that the estimates were supposed to prevent |
-//! | `pass_overlap_frames` | of the timed frames, those with a timed render and a timed slice, and of those the frames whose render span intersects a slice's by more than the tolerance (`tolerance_ns`: the timestamps' step, at least 1 µs), with the share and the largest intersection seen; H7 of issue #53 (#61) asks whether the render runs beside the slices. `pass_overlap.rs` defines this line and the five after it, and the browser's report has the same six |
+//! | `pass_overlap_frames` | of the timed frames, those with a timed render and a timed slice, and of those the frames whose render span intersects a slice's by more than the tolerance (`tolerance_ns`: the timestamps' step, at least 1 µs), with the share and the largest intersection seen; H7 of issue #53 (#61) asks whether the render runs beside the slices. `beatlm_host::pass_overlap` defines this line and the five after it, and the browser's report has the same six |
 //! | `pass_overlap_us` | per overlapping frame, the time the render shared with the slices taken together: p50, p99, max |
 //! | `pass_order` | where each such frame's render began: before the first slice began, after the last ended (the order encoded), or among them |
 //! | `slice_vs_render_overlap` | each slice measured in a frame with a render, over its slice's median, apart by whether it overlapped the render: how many, and the ratios' mean, p50 and p90 |
@@ -709,7 +709,7 @@
 //! | `wgpu_counters_populated` | `net` and `depth` only: whether the backend sets wgpu's buffer counter; when false the loop's buffer creation is unmeasured and the report says so |
 //! | `loop_*` | `net` and `depth` only: a counter's reading before the first frame and after the last, and the change; for buffers also the least and most seen at a frame boundary |
 //! | `pass_cost_config` | `pass-cost` only, after `run`, `adapter`, `backend`, `config` (`workload=pass-cost`, `frames`, `render_iters`, and `size` and `fusion` with `--kernels depth`), `frames`, `frames_dropped` and the `timings_*` lines, which are the only other lines its report has: the timed frames per cell, the cells, their order, and the settings |
-//! | `pass_cost[variant,P]` | `pass-cost` only: the cell's timed frames and span, and the per-pass figures derived from it; `pass_cost.rs` defines each |
+//! | `pass_cost[variant,P]` | `pass-cost` only: the cell's timed frames and span, and the per-pass figures derived from it; `beatlm_host::pass_cost` defines each |
 //! | `pass_cost_cpu[variant,P]` | `pass-cost` only: the cell's encode and submit times and their per-pass figures |
 //!
 //! The process exits non-zero when `latency_violations` is not zero in any run.
@@ -748,7 +748,7 @@
 //!
 //! `--background-load` opens a second device on the same adapter, with its own
 //! queue and no timestamp queries, and a thread (`load.rs`) that keeps one
-//! dispatch queued behind the one running. The kernel is `shaders.wgsl`'s slice
+//! dispatch queued behind the one running. The kernel is `beatlm-host`'s `shaders.wgsl`'s slice
 //! kernel over 16 384 workgroups (1 048 576 invocations, sixteen times a
 //! slice's) at `--background-iters` loop iterations per invocation, default
 //! 4000. It starts, and has completed one dispatch, before the engine is built,
@@ -847,17 +847,12 @@ mod load;
 mod net;
 mod pace;
 mod pass_bench;
-mod pass_cost;
-mod pass_overlap;
 #[cfg(test)]
 mod reference;
 mod report;
 mod run;
-mod slots;
-mod stats;
 #[cfg(test)]
 mod vit;
-mod workload;
 
 use std::process::ExitCode;
 

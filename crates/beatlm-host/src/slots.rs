@@ -1,11 +1,10 @@
 //! A lowered program realised on a device with one input and one output slot
 //! per job in flight: [`Net`], and the [`Numbers`] it is realised with.
 //!
-//! The `net` workload (`net.rs`) and the `depth` workload (`depth.rs`) both
-//! run through [`Net`]. The browser host (`beatlm-web`) compiles this file by
-//! path for the depth model, so a page and the bench realise a program with
-//! the same slots, bind groups and memory plan; that is why nothing here names
-//! a bench type.
+//! The bench's `net` workload (`net.rs`) and `depth` workload (`depth.rs`)
+//! both run through [`Net`]. The browser host (`beatlm-web`) uses this module
+//! for the depth model, so a page and the bench realise a program with the
+//! same slots, bind groups and memory plan.
 //!
 //! # Jobs, slots and the shared plan
 //!
@@ -48,20 +47,20 @@ const OUTPUT_BASE: u32 = 2 << 16;
 pub const MAX_SLOTS: u32 = 1 << 16;
 
 /// The input tensor of slot `slot`; slot 0's is the graph's input.
-pub(crate) fn input_id(slot: u32) -> TensorId {
+pub fn input_id(slot: u32) -> TensorId {
     TensorId::new(INPUT_BASE.saturating_add(slot))
 }
 
 /// The output tensor of slot `slot`; slot 0's is the graph's output.
-pub(crate) fn output_id(slot: u32) -> TensorId {
+pub fn output_id(slot: u32) -> TensorId {
     TensorId::new(OUTPUT_BASE.saturating_add(slot))
 }
 
 /// What a program is realised with besides its kernels: which of its tensors
 /// are a job's input and output, every weight's numbers, and each slot's
-/// input. The network's are `Numbers::net` (`net.rs`); the depth model's come
-/// from its weights file (`depth.rs`), so both run through one [`Net`] with
-/// the same slots and bind groups.
+/// input. The network's are `net::numbers` (the bench's `net.rs`); the depth
+/// model's come from its weights file (each host's `depth.rs`), so both run
+/// through one [`Net`] with the same slots and bind groups.
 pub struct Numbers {
     /// The graph's input, which is slot 0's.
     pub input: TensorId,
@@ -97,7 +96,7 @@ impl Numbers {
 /// The program's tensors with one input and one output stand-in for each slot
 /// after the first, all for the memory plan. A stand-in's id that the program
 /// already uses is refused by `Program::stand_in`.
-pub(crate) fn tensors(program: &Program, numbers: &Numbers, slots: u32) -> Result<Vec<TensorDesc>> {
+pub fn tensors(program: &Program, numbers: &Numbers, slots: u32) -> Result<Vec<TensorDesc>> {
     let mut all = program.tensors().to_vec();
     for slot in 1..slots {
         all.push(program.stand_in(numbers.input, numbers.input_of(slot))?);
@@ -260,7 +259,6 @@ impl Net {
     /// The buffers the plan's arenas are, for reading a slot's tensors: the
     /// bench's tests read an output back, and the browser host's display binds
     /// a slot's input and output to draw them.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn arenas(&self) -> &Arenas {
         &self.arenas
     }

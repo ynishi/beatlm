@@ -5,9 +5,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use beatlm_core::kernel::Fusion;
-
-use crate::pass_cost::{self, DEFAULT_DEPTH_SIDE, Dispatches};
-use crate::workload::{DEFAULT_RENDER_ITERS, DEFAULT_SLICE_ITERS, RenderOrder};
+use beatlm_host::pass_cost::{self, DEFAULT_DEPTH_SIDE, Dispatches};
+use beatlm_host::workload::{DEFAULT_RENDER_ITERS, DEFAULT_SLICE_ITERS, RenderOrder};
 
 /// The usage text, printed for `--help` and after a bad option.
 pub const USAGE: &str = "\
@@ -167,7 +166,7 @@ impl Mode {
 /// Which load the slices of a job run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkloadKind {
-    /// The busy-loop kernel standing in for a slice (`workload.rs`).
+    /// The busy-loop kernel standing in for a slice (`beatlm_host::workload`).
     Synthetic,
     /// The planned network of generated kernels (`net.rs`): one slice per
     /// kernel, so the job has [`crate::net::kernel_count`] slices for the
@@ -177,8 +176,9 @@ pub enum WorkloadKind {
     /// per kernel like the network: [`crate::depth::kernel_count`] slices for
     /// `--size` and `--fusion`.
     Depth,
-    /// The measurement of what a compute pass costs (`pass_cost.rs`): no job,
-    /// no scheduler, no promise, so the loop's options do not apply.
+    /// The measurement of what a compute pass costs
+    /// (`beatlm_host::pass_cost`): no job, no scheduler, no promise, so the
+    /// loop's options do not apply.
     PassCost,
 }
 
@@ -222,7 +222,7 @@ pub struct Args {
     /// Loop iterations per pixel of the render pass.
     pub render_iters: u32,
     /// Whether the loop's render pass waits for the frame's slices
-    /// (`workload.rs` says how); [`RenderOrder::Free`] unless asked, where
+    /// (`beatlm_host::workload` says how); [`RenderOrder::Free`] unless asked, where
     /// the browser host's default is `after` (the crate documentation, "What
     /// it measures", says why).
     pub render_order: RenderOrder,

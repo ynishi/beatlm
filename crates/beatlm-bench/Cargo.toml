@@ -14,6 +14,7 @@ homepage.workspace     = true
 anyhow      = { workspace = true }
 beatlm      = { workspace = true }
 beatlm-core = { workspace = true }
+beatlm-host = { workspace = true }
 pollster    = { workspace = true }
 # `counters` makes wgpu keep live counts of the objects it creates, which the
 # `net` workload reads to check that the steady-state loop allocates nothing.

@@ -1,11 +1,11 @@
-//! The native host of the `pass-cost` workload (`pass_cost.rs`): the frames,
+//! The native host of the `pass-cost` workload (`beatlm_host::pass_cost`): the frames,
 //! paced on the bench's 60 Hz grid, and the CPU clock.
 //!
 //! Each frame is paced as the loop's are (`pace.rs`), so the GPU is as idle
-//! between frames as in the loop, and runs the cell `pass_cost.rs` assigns it.
+//! between frames as in the loop, and runs the cell `beatlm_host::pass_cost` assigns it.
 //! After its submission the frame waits for the device and collects its own
 //! timings, as calibration's frames do, so one frame is in flight at a time
-//! (`pass_cost.rs` says why). The wait comes after the CPU times are read.
+//! (`beatlm_host::pass_cost` says why). The wait comes after the CPU times are read.
 //! Nothing here schedules: the frame's work is fixed by its cell.
 
 use std::time::Instant;
@@ -13,14 +13,14 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use beatlm::gpu::{SliceTimer, TimerStats};
 use beatlm_core::time::FrameIndex;
+use beatlm_host::pass_cost::{self, Dispatches, Measurements, Source, Trivial};
+use beatlm_host::slots::Net;
+use beatlm_host::workload::Workload;
 
 use crate::args::Args;
 use crate::device::Gpu;
 use crate::engine::offscreen_target;
 use crate::pace::Pacer;
-use crate::pass_cost::{self, Dispatches, Measurements, Source, Trivial};
-use crate::slots::Net;
-use crate::workload::Workload;
 
 /// What a run of the workload measured.
 pub struct PassOutcome {

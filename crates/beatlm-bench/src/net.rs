@@ -41,7 +41,7 @@
 //! # Jobs, slots and the shared plan
 //!
 //! A job of the network runs through [`Net`], with one input and one output
-//! slot per job that can be in flight; `slots.rs` owns that rule and the
+//! slot per job that can be in flight; `beatlm_host::slots` owns that rule and the
 //! shared memory plan it rests on, for the depth model as for this network.
 //!
 //! Two simplifications are the workload's, not the engine's:
@@ -66,8 +66,8 @@ use beatlm_core::kernel::{
 };
 use beatlm_core::memory::TensorId;
 
-pub use crate::slots::{Net, Numbers};
-use crate::slots::{input_id, output_id};
+pub use beatlm_host::slots::{Net, Numbers};
+use beatlm_host::slots::{input_id, output_id};
 
 const W1: TensorId = TensorId::new(0);
 const B1: TensorId = TensorId::new(1);
@@ -390,17 +390,17 @@ pub fn dump_wgsl(dir: &Path, fusion: Fusion) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-impl Numbers {
-    /// The network's at `shape`: [`Data`]'s weights, and each slot's input
-    /// from its own seed.
-    pub fn net(shape: &Shape) -> Self {
-        let shape = *shape;
-        Self {
-            input: input_id(0),
-            output: output_id(0),
-            weights: Data::generate(&shape).weights,
-            slot_input: Box::new(move |slot| Data::input(&shape, slot)),
-        }
+/// The network's [`Numbers`] at `shape`: [`Data`]'s weights, and each slot's
+/// input from its own seed.
+// A free function, not `Numbers::net`: `Numbers` is `beatlm-host`'s, and a
+// type's inherent methods live in the crate that defines it.
+pub fn numbers(shape: &Shape) -> Numbers {
+    let shape = *shape;
+    Numbers {
+        input: input_id(0),
+        output: output_id(0),
+        weights: Data::generate(&shape).weights,
+        slot_input: Box::new(move |slot| Data::input(&shape, slot)),
     }
 }
 
@@ -410,7 +410,6 @@ mod tests {
     use super::*;
     use crate::harness::{assert_close, device, read, run_on_gpu};
     use crate::reference;
-    use crate::slots::tensors;
     use beatlm_core::budget::Budget;
     use beatlm_core::cost::{CostModel, Estimator, SliceId};
     use beatlm_core::kernel::Variant;
@@ -418,6 +417,7 @@ mod tests {
     use beatlm_core::schedule::Scheduler;
     use beatlm_core::sync::{MissPolicy, SyncPolicy};
     use beatlm_core::time::{FrameIndex, FrameInfo, Micros, TimePoint};
+    use beatlm_host::slots::tensors;
     use std::collections::{BTreeMap, BTreeSet};
 
     // Shapes that are not multiples of any tile or workgroup size, so the
@@ -711,7 +711,7 @@ mod tests {
             let net = Net::new(
                 &device,
                 &queue,
-                &Numbers::net(&shape),
+                &numbers(&shape),
                 1,
                 program(&shape, fusion).unwrap(),
             )
@@ -734,7 +734,7 @@ mod tests {
             Net::new(
                 &device,
                 &queue,
-                &Numbers::net(&TEST_SHAPE),
+                &numbers(&TEST_SHAPE),
                 1,
                 program(&TEST_SHAPE, fusion).unwrap(),
             )
@@ -761,21 +761,15 @@ mod tests {
         for fusion in [Fusion::On, Fusion::Off] {
             let whole_program = program(&shape, fusion).unwrap();
             let kernels = whole_program.kernels().len();
-            let whole = Net::new(
-                &device,
-                &queue,
-                &Numbers::net(&shape),
-                1,
-                whole_program.clone(),
-            )
-            .unwrap();
+            let whole =
+                Net::new(&device, &queue, &numbers(&shape), 1, whole_program.clone()).unwrap();
             let whole_out = run_job(&device, &queue, &whole);
             // Counts that do and do not divide the kernels' sizes, and ones
             // past what they allow.
             for counts in [[2_u32, 3, 5, 7, 4, 3, 9, 11, 2, 6], [64; 10]] {
                 let split = whole_program.split(&counts[..kernels]).unwrap();
                 assert!(split.kernels().len() > kernels);
-                let net = Net::new(&device, &queue, &Numbers::net(&shape), 1, split).unwrap();
+                let net = Net::new(&device, &queue, &numbers(&shape), 1, split).unwrap();
                 let got = run_job(&device, &queue, &net);
                 let what = format!("network split {:?}, fusion {fusion:?}", &counts[..kernels]);
                 assert_close(&got, &want, &what);
@@ -818,7 +812,7 @@ mod tests {
             Some(parts) => whole.split(parts).unwrap(),
             None => whole,
         };
-        let net = Net::new(&device, &queue, &Numbers::net(&shape), slots, program).unwrap();
+        let net = Net::new(&device, &queue, &numbers(&shape), slots, program).unwrap();
 
         let mut cost = CostModel::new(
             Micros::new(100),
@@ -908,7 +902,7 @@ mod tests {
         let program = program(&TEST_SHAPE, Fusion::On).unwrap();
         assert_eq!(program.kernels().len(), 6);
         let plan = MemoryPlan::new(
-            &tensors(&program, &Numbers::net(&TEST_SHAPE), 3).unwrap(),
+            &tensors(&program, &numbers(&TEST_SHAPE), 3).unwrap(),
             &DeviceProfile::webgpu_baseline(),
         )
         .unwrap();
@@ -1020,7 +1014,7 @@ mod tests {
         }
         assert_eq!(fused.role(D2), Some(TensorRole::Activation));
         let bytes = |p: &Program| {
-            let all = tensors(p, &Numbers::net(&DEFAULT_SHAPE), 3).unwrap();
+            let all = tensors(p, &numbers(&DEFAULT_SHAPE), 3).unwrap();
             MemoryPlan::new(&all, &DeviceProfile::webgpu_baseline())
                 .unwrap()
                 .total_bytes()
@@ -1032,7 +1026,7 @@ mod tests {
     fn the_default_shape_plans_and_reuses_memory() {
         for fusion in [Fusion::On, Fusion::Off] {
             let p = program(&DEFAULT_SHAPE, fusion).unwrap();
-            let all = tensors(&p, &Numbers::net(&DEFAULT_SHAPE), 3).unwrap();
+            let all = tensors(&p, &numbers(&DEFAULT_SHAPE), 3).unwrap();
             let plan = MemoryPlan::new(&all, &DeviceProfile::webgpu_baseline()).unwrap();
             let summed: u64 = plan.placements().map(|(_, p)| p.size).sum();
             assert!(plan.total_bytes() < summed);
@@ -1088,7 +1082,7 @@ mod tests {
     #[test]
     fn slot_tensors_live_for_the_whole_program_and_share_nothing() {
         let p = program(&DEFAULT_SHAPE, Fusion::On).unwrap();
-        let all = tensors(&p, &Numbers::net(&DEFAULT_SHAPE), 3).unwrap();
+        let all = tensors(&p, &numbers(&DEFAULT_SHAPE), 3).unwrap();
         let plan = MemoryPlan::new(&all, &DeviceProfile::webgpu_baseline()).unwrap();
         let last = u32::try_from(p.kernels().len() - 1).unwrap();
         let io: Vec<_> = (0..3)

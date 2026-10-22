@@ -3,12 +3,13 @@
 
 use std::fmt::Write as _;
 
+use beatlm_host::pass_overlap;
+use beatlm_host::stats::{frame_ratio_value, frame_scale_value, histogram, summarize};
+
 use crate::args::{Args, WorkloadKind, fusion_name};
 use crate::engine::{NetReport, Outcome};
 use crate::pace::FRAME_PERIOD;
 use crate::pass_bench::PassOutcome;
-use crate::pass_overlap;
-use crate::stats::{frame_ratio_value, frame_scale_value, histogram, summarize};
 
 /// Where the run happened.
 pub struct Environment {
@@ -28,7 +29,7 @@ pub fn render(env: &Environment, args: &Args, run: u32, outcome: &Outcome) -> St
 
 /// Renders run number `run` (counting from 1) of `args.runs` of the
 /// `pass-cost` workload: the lines every report starts with, then the
-/// workload's own (`pass_cost.rs` defines them).
+/// workload's own (`beatlm_host::pass_cost` defines them).
 pub fn render_pass_cost(env: &Environment, args: &Args, run: u32, outcome: &PassOutcome) -> String {
     let mut out = String::new();
     // Writing to a String cannot fail.
@@ -56,7 +57,7 @@ fn write_pass_cost(
     )?;
     if matches!(
         args.pass_cost.dispatches,
-        crate::pass_cost::Dispatches::Depth { .. }
+        beatlm_host::pass_cost::Dispatches::Depth { .. }
     ) {
         write!(
             out,
@@ -316,7 +317,7 @@ mod tests {
 
     #[test]
     fn the_config_line_prints_the_render_order() {
-        use crate::workload::RenderOrder;
+        use beatlm_host::workload::RenderOrder;
         let env = Environment {
             adapter: String::from("adapter"),
             backend: String::from("backend"),

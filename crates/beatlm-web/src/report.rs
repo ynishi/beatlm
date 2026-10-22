@@ -4,7 +4,7 @@
 //!
 //! The lines the two hosts share have the bench's names and formats
 //! (`beatlm-bench`'s `report.rs`), so a browser report and a native one compare
-//! line by line; percentiles come from the bench's own `stats.rs`. The lines
+//! line by line; percentiles come from `beatlm_host::stats`, as the bench's do. The lines
 //! only a browser has say where it ran (`user_agent`, `date`), what the device
 //! was given (`timestamp_query`, the limits), what the display did
 //! (`display_period_us`, `callback_interval_us`) and what went wrong on the GPU
@@ -16,8 +16,8 @@
 //! `pass_order`, `slice_vs_render_overlap`, `pass_overlap_compute`), and the
 //! one that says whether the next frame's slices began before its render
 //! ended (`pass_overlap_next_frame`), follow
-//! `gpu_frames_over_period` in both hosts' reports, from the bench's own
-//! `pass_overlap.rs` ([`crate::pass_overlap`]). The browser's own lines go on
+//! `gpu_frames_over_period` in both hosts' reports, from the module both
+//! compile ([`beatlm_host::pass_overlap`]). The browser's own lines go on
 //! with the diagnosis of the misses ([`crate::diagnosis`]): how many were
 //! abandoned before they started (`missed_unstarted`), after
 //! (`missed_started`) or missed at their deadline (`missed_at_deadline`), when
@@ -110,6 +110,11 @@ use beatlm::load::depth_anything_v2::reference::{
 };
 use beatlm_core::cost::SliceId;
 use beatlm_core::time::Micros;
+use beatlm_host::pass_overlap;
+use beatlm_host::stats::{
+    frame_ratio_value, frame_scale_value, histogram, nearest_rank, share, summarize,
+};
+use beatlm_host::workload::{DEFAULT_RENDER_ITERS, DEFAULT_SLICE_ITERS};
 
 use crate::config::{Config, MARGIN_US, Model, SLICES, estimator_name};
 use crate::depth::{
@@ -118,11 +123,6 @@ use crate::depth::{
 use crate::diagnosis::{Diagnosis, tail};
 use crate::onbeat::{self, Spread};
 use crate::pace::NOMINAL_PERIOD;
-use crate::pass_overlap;
-use crate::stats::{
-    frame_ratio_value, frame_scale_value, histogram, nearest_rank, share, summarize,
-};
-use crate::workload::{DEFAULT_RENDER_ITERS, DEFAULT_SLICE_ITERS};
 
 /// The two limits a memory plan can need raised, as a device or an adapter
 /// reports them.
@@ -341,9 +341,9 @@ pub struct Outcome {
     /// What the timer could not measure.
     pub timer: TimerStats,
     /// Every timed frame's passes with their timestamps, for the
-    /// `pass_overlap_*` lines ([`crate::pass_overlap`]); recorded for every
+    /// `pass_overlap_*` lines ([`beatlm_host::pass_overlap`]); recorded for every
     /// run, the synthetic workload's too.
-    pub pass_frames: Vec<crate::pass_overlap::Frame>,
+    pub pass_frames: Vec<beatlm_host::pass_overlap::Frame>,
     /// Frames whose canvas texture could not be acquired, so their render pass
     /// did not run.
     pub canvas_unavailable: u64,
@@ -384,13 +384,13 @@ pub struct PassCostOutcome {
 
 /// Renders the summary of a finished `model=pass-cost` run: the lines every
 /// report starts with, then the bench's lines for the workload
-/// ([`crate::pass_cost`] defines them), then `status: done`.
+/// ([`beatlm_host::pass_cost`] defines them), then `status: done`.
 #[must_use]
 pub fn render_pass_cost(
     env: &Environment,
     config: &Config,
-    settings: &crate::pass_cost::Settings,
-    measurements: &crate::pass_cost::Measurements,
+    settings: &beatlm_host::pass_cost::Settings,
+    measurements: &beatlm_host::pass_cost::Measurements,
     outcome: &PassCostOutcome,
 ) -> String {
     let mut out = String::new();
@@ -403,8 +403,8 @@ fn write_pass_cost(
     out: &mut String,
     env: &Environment,
     config: &Config,
-    settings: &crate::pass_cost::Settings,
-    measurements: &crate::pass_cost::Measurements,
+    settings: &beatlm_host::pass_cost::Settings,
+    measurements: &beatlm_host::pass_cost::Measurements,
     outcome: &PassCostOutcome,
 ) -> std::fmt::Result {
     write_environment(out, env)?;
@@ -415,7 +415,7 @@ fn write_pass_cost(
     )?;
     // As the bench's line has them with `--kernels depth`; the page always
     // fuses.
-    if let crate::pass_cost::Dispatches::Depth { side } = settings.dispatches {
+    if let beatlm_host::pass_cost::Dispatches::Depth { side } = settings.dispatches {
         write!(out, " size={side} fusion=on")?;
     }
     writeln!(out)?;
@@ -1192,8 +1192,8 @@ mod tests {
     /// inside its slice, on Chrome's step.
     #[test]
     fn the_overlap_lines_follow_the_frame_lines_as_in_the_bench() {
-        use crate::pass_overlap::{Frame, Pass};
         use beatlm::gpu::PassSpan;
+        use beatlm_host::pass_overlap::{Frame, Pass};
         let q = 65_536;
         let span = |begin_ns, end_ns| PassSpan { begin_ns, end_ns };
         let outcome = Outcome {
@@ -1444,7 +1444,8 @@ mod tests {
         let Model::PassCost(settings) = &config.model else {
             panic!("expected pass-cost");
         };
-        let measurements = crate::pass_cost::Measurements::new(settings.cells(), config.frames);
+        let measurements =
+            beatlm_host::pass_cost::Measurements::new(settings.cells(), config.frames);
         let env = Environment {
             adapter: "Apple M1 Pro".to_owned(),
             timestamp_query: true,

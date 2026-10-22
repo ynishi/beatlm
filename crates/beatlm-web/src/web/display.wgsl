@@ -3,7 +3,7 @@
 // tensors in the memory plan, over the whole canvas.
 //
 // Every pixel first runs the synthetic render's loop (`render_fs` in
-// beatlm-bench's shaders.wgsl, the same iterations), so the pass costs what
+// beatlm-host's shaders.wgsl, the same iterations), so the pass costs what
 // the bench's render pass costs beside the depth model, and the frame budget
 // is the one the native default was measured under. The loop's result feeds
 // the colour at a weight no 8-bit target shows, so it cannot be removed.
@@ -52,7 +52,7 @@ fn display_vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
 // `display_vs_after`, for `render_order=after`, is `display_vs` made a reader
 // of the first word of every arena of the plan, the buffers the slices write,
 // so the pass runs after the frame's slices. It is appended to this text by
-// beatlm-bench's `workload::after_vertex`, which binds one per arena and
+// beatlm-host's `workload::after_vertex`, which binds one per arena and
 // generates the synthetic render's `render_vs_after` the same way; its
 // `workload.rs` says what that guarantees.
 
