@@ -1,0 +1,37 @@
+run: 1/1
+adapter: Test Adapter
+backend: Metal
+config: mode=sync runs=1 frames=600 latency=2 slices=4 slice_iters=500 render_iters=50 render_order=free margin_us=2000 estimator=quantile submit=every background_load=off
+promised_latency_ms: 33.3
+frames: 0
+frames_dropped: 0
+submitted: 0
+delivered: 0
+missed: 0
+startup_missed: 0
+delivery_rate: none
+pending_at_end: 0
+latency_violations: 0
+timings_collected: 0
+timings_skipped: 0
+timings_failed: 0
+dispatches_per_job: none
+dispatches_per_frame: none
+frame_start_lateness_us: none
+cpu_start_to_submit_us: none
+cpu_start_to_tick_end_us: none
+channel_handoff_us: none
+cpu_plan_us: none
+cpu_encode_us: none
+cpu_queue_submit_us: none
+gpu_frame_us: none
+longest_dispatch_us: none
+gpu_frames_over_period: 0 of 0
+pass_overlap_frames: frames=0 with_render_and_slices=0 overlapping=0 share=none tolerance_ns=1000 max_intersection_ns=0
+pass_overlap_us: none
+pass_order: render_before_first_slice=0 render_after_last_slice=0 render_among_slices=0
+slice_vs_render_overlap: overlapped_samples=0 overlapped_ratio_mean=none overlapped_ratio_p50=none overlapped_ratio_p90=none not_overlapped_samples=0 not_overlapped_ratio_mean=none not_overlapped_ratio_p50=none not_overlapped_ratio_p90=none
+pass_overlap_compute: pairs=0 overlapping=0 share=none frames_with_pairs=0 frames_overlapping=0 max_intersection_ns=0
+pass_overlap_next_frame: pairs=0 first_slice_before_render_end=0 share=none first_slice_at_render_end=0 first_slice_after_render_end=0 tolerance_ns=1000 before_us_p50=none before_us_max=none after_us_p50=none after_us_max=none
+frame_ratio: none
+frame_scale: none

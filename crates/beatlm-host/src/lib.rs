@@ -27,6 +27,8 @@
 //!   timestamps;
 //! - [`presets`]: the cost model's estimators and priors, the margin, and the
 //!   windows and frame counts derived from the default estimator's window;
+//! - [`report`]: the report lines both hosts write, from `promised_latency_ms`
+//!   to `frame_scale` and the `slice[i]` lines, in one order;
 //! - [`stats`]: the percentiles, the median and the ratio lines both reports
 //!   and calibration quote, and the fewest measurements a slice's median is
 //!   read from.
@@ -56,8 +58,8 @@
 //! a dependency on it would turn on in the browser build too.
 //!
 //! The rest of the frame's bookkeeping that both hosts do (the budget and
-//! forecast, the admission of an input, the delivery and miss counts, the
-//! report's shared lines) is written in each host; `beatlm-web`'s crate
+//! forecast, the admission of an input, the delivery and miss counts) is
+//! written in each host; `beatlm-web`'s crate
 //! documentation ("What is shared with the bench") says why.
 //!
 //! The crate is not published (`publish = false`): its API is the two hosts'
@@ -69,6 +71,7 @@
 pub mod pass_cost;
 pub mod pass_overlap;
 pub mod presets;
+pub mod report;
 pub mod slots;
 pub mod stats;
 pub mod workload;

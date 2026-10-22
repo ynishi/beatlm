@@ -675,8 +675,8 @@
 //! | `frames_dropped` | frame periods given up because a frame began a whole period late; the loop drops them as a display would, rather than running frames back to back to catch up |
 //! | `submitted` | inputs run as jobs: one per frame with `--submit every`, fewer with `--submit free` |
 //! | `delivered`, `missed` | results delivered on their frame, and deadlines that arrived without a complete result |
-//! | `delivery_rate` | `delivered` over `delivered` plus `missed`: the share of deadlines that arrived with their result; `none` when no deadline arrived |
 //! | `startup_missed` | the part of `missed` that belongs to jobs submitted in the loop's first [`STARTUP_FRAMES`](beatlm_host::presets::STARTUP_FRAMES) frames, so a cascade of misses while estimates are new shows apart from misses in steady state |
+//! | `delivery_rate` | `delivered` over `delivered` plus `missed`: the share of deadlines that arrived with their result; `none` when no deadline arrived |
 //! | `pending_at_end` | jobs submitted whose deadline was after the last frame |
 //! | `latency_violations` | deliveries whose latency was not `--latency`; the L1 promise broke when this is not zero |
 //! | `timings_collected`, `timings_skipped`, `timings_failed` | frames whose GPU timing was read, was not taken because the readback ring was full, and was lost to a failed map |

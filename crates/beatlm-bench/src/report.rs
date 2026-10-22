@@ -3,8 +3,7 @@
 
 use std::fmt::Write as _;
 
-use beatlm_host::pass_overlap;
-use beatlm_host::stats::{frame_ratio_value, frame_scale_value, histogram, summarize};
+use beatlm_host::report;
 
 use crate::args::{Args, WorkloadKind, fusion_name};
 use crate::engine::{NetReport, Outcome};
@@ -69,9 +68,7 @@ fn write_pass_cost(
     writeln!(out)?;
     writeln!(out, "frames: {}", outcome.frames)?;
     writeln!(out, "frames_dropped: {}", outcome.dropped)?;
-    writeln!(out, "timings_collected: {}", outcome.timer.frames_collected)?;
-    writeln!(out, "timings_skipped: {}", outcome.timer.frames_skipped)?;
-    writeln!(out, "timings_failed: {}", outcome.timer.frames_failed)?;
+    report::write_timings(out, outcome.timer)?;
     outcome.measurements.write_report(out, &args.pass_cost)
 }
 
@@ -119,106 +116,50 @@ fn write_report(
     } else {
         writeln!(out)?;
     }
-    writeln!(
+    // The lines the browser's report shares, at the loop's period
+    // (`beatlm_host::report`); `channel_handoff_us` is the bench's own.
+    report::write_lines(
         out,
-        "promised_latency_ms: {:.1}",
-        promised_latency_ms(args.latency)
-    )?;
-    writeln!(out, "frames: {}", outcome.cpu_us.len())?;
-    writeln!(out, "frames_dropped: {}", outcome.dropped)?;
-    writeln!(out, "submitted: {}", outcome.submitted)?;
-    writeln!(out, "delivered: {}", outcome.delivered)?;
-    writeln!(out, "missed: {}", outcome.missed)?;
-    writeln!(out, "startup_missed: {}", outcome.startup_missed)?;
-    match delivery_rate(outcome.delivered, outcome.missed) {
-        Some(rate) => writeln!(out, "delivery_rate: {rate:.4}")?,
-        None => writeln!(out, "delivery_rate: none")?,
-    }
-    writeln!(out, "pending_at_end: {}", outcome.pending_at_end)?;
-    writeln!(out, "latency_violations: {}", outcome.violations)?;
-    writeln!(out, "timings_collected: {}", outcome.timer.frames_collected)?;
-    writeln!(out, "timings_skipped: {}", outcome.timer.frames_skipped)?;
-    writeln!(out, "timings_failed: {}", outcome.timer.frames_failed)?;
-    for (frames, count) in histogram(outcome.latencies.iter().copied()) {
-        writeln!(out, "latency_frames[{frames}]: {count}")?;
-    }
-    write_summary(out, "dispatches_per_job", &outcome.dispatches_per_job)?;
-    write_summary(out, "dispatches_per_frame", &outcome.dispatches_per_frame)?;
-    write_summary(out, "frame_start_lateness_us", &outcome.lateness_us)?;
-    write_summary(out, "cpu_start_to_submit_us", &outcome.cpu_us)?;
-    write_summary(out, "cpu_start_to_tick_end_us", &outcome.tick_us)?;
-    write_summary(out, "channel_handoff_us", &outcome.handoff_us)?;
-    write_summary(out, "cpu_plan_us", &outcome.plan_us)?;
-    write_summary(out, "cpu_encode_us", &outcome.encode_us)?;
-    write_summary(out, "cpu_queue_submit_us", &outcome.submit_us)?;
-    write_summary(out, "gpu_frame_us", &outcome.gpu_frame_us)?;
-    write_summary(out, "longest_dispatch_us", &outcome.longest_dispatch_us)?;
-    let over = gpu_frames_over_period(&outcome.gpu_frame_us);
-    writeln!(
-        out,
-        "gpu_frames_over_period: {over} of {}",
-        outcome.gpu_frame_us.len()
-    )?;
-    pass_overlap::write_lines(out, &pass_overlap::analyse(&outcome.pass_frames))?;
-    writeln!(
-        out,
-        "frame_ratio: {}",
-        frame_ratio_value(&outcome.frame_ratios)
-    )?;
-    writeln!(
-        out,
-        "frame_scale: {}",
-        frame_scale_value(
-            outcome.frame_scale,
-            outcome.frames_recorded,
-            &outcome.frame_scales
-        )
+        &report::Lines {
+            latency: Some(args.latency),
+            period: FRAME_PERIOD,
+            dropped: outcome.dropped,
+            submitted: outcome.submitted,
+            delivered: outcome.delivered,
+            missed: outcome.missed,
+            startup_missed: outcome.startup_missed,
+            pending_at_end: outcome.pending_at_end,
+            violations: outcome.violations,
+            timer: outcome.timer,
+            latencies: &outcome.latencies,
+            dispatches_per_job: &outcome.dispatches_per_job,
+            dispatches_per_frame: &outcome.dispatches_per_frame,
+            after_dispatches: &[],
+            lateness_us: &outcome.lateness_us,
+            cpu_us: &outcome.cpu_us,
+            tick_us: &outcome.tick_us,
+            after_tick: &[("channel_handoff_us", &outcome.handoff_us)],
+            plan_us: &outcome.plan_us,
+            encode_us: &outcome.encode_us,
+            submit_us: &outcome.submit_us,
+            gpu_frame_us: &outcome.gpu_frame_us,
+            after_gpu_frame: &[],
+            longest_dispatch_us: &outcome.longest_dispatch_us,
+            pass_frames: &outcome.pass_frames,
+            frame_ratios: &outcome.frame_ratios,
+            frame_scale: outcome.frame_scale,
+            frames_recorded: outcome.frames_recorded,
+            frame_scales: &outcome.frame_scales,
+        },
     )?;
     if let Some(dispatches) = outcome.background_dispatches {
         writeln!(out, "background_dispatches: {dispatches}")?;
     }
-    for (slice, estimate) in &outcome.estimates {
-        let (sum, count) = outcome.measured.get(slice).copied().unwrap_or((0, 0));
-        write!(
-            out,
-            "slice[{}]: estimate_us={} measured_samples={}",
-            slice.get(),
-            estimate.get(),
-            count
-        )?;
-        match sum.checked_div(count) {
-            Some(mean) => writeln!(out, " measured_mean_us={mean}")?,
-            None => writeln!(out, " measured_mean_us=none")?,
-        }
-    }
+    report::write_slices(out, &outcome.estimates, &outcome.measured)?;
     if let Some(net) = &outcome.net {
         write_net(out, net)?;
     }
     Ok(())
-}
-
-/// Delivered over delivered plus missed: the share of deadlines that arrived
-/// with their result. `None` when no deadline arrived.
-#[allow(clippy::cast_precision_loss)]
-fn delivery_rate(delivered: u64, missed: u64) -> Option<f64> {
-    let total = delivered.saturating_add(missed);
-    (total > 0).then(|| delivered as f64 / total as f64)
-}
-
-/// The promised latency of `frames` frames at the loop's period, in
-/// milliseconds: what the host delays its source by.
-#[allow(clippy::cast_precision_loss)]
-fn promised_latency_ms(frames: u32) -> f64 {
-    f64::from(frames) * FRAME_PERIOD.get() as f64 / 1_000.0
-}
-
-/// Timed frames whose render plus slices took longer than the frame period: an
-/// overrun the estimates were supposed to prevent.
-fn gpu_frames_over_period(gpu_frame_us: &[u64]) -> usize {
-    gpu_frame_us
-        .iter()
-        .filter(|&&us| us > FRAME_PERIOD.get())
-        .count()
 }
 
 /// The memory plan and the allocation readings of the `net` and `depth`
@@ -303,13 +244,6 @@ fn write_net(out: &mut String, net: &NetReport) -> std::fmt::Result {
     Ok(())
 }
 
-fn write_summary(out: &mut String, name: &str, samples: &[u64]) -> std::fmt::Result {
-    match summarize(samples) {
-        Some(s) => writeln!(out, "{name}: p50={} p99={} max={}", s.p50, s.p99, s.max),
-        None => writeln!(out, "{name}: none"),
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -337,27 +271,85 @@ mod tests {
         }
     }
 
-    #[test]
-    fn delivery_rate_is_the_delivered_share_of_the_deadlines_that_arrived() {
-        assert_eq!(delivery_rate(0, 0), None);
-        assert_eq!(delivery_rate(3, 1), Some(0.75));
-        assert_eq!(delivery_rate(0, 5), Some(0.0));
-        assert_eq!(delivery_rate(5, 0), Some(1.0));
+    /// A run with every line the synthetic workload writes, the
+    /// `background_dispatches` line included, at fixed numbers.
+    fn full_outcome() -> Outcome {
+        use beatlm::gpu::{PassSpan, TimerStats};
+        use beatlm_core::cost::{FrameScale, SliceId};
+        use beatlm_core::time::Micros;
+        use beatlm_host::pass_overlap::{Frame, Pass};
+        let q = 65_536;
+        let span = |begin_ns, end_ns| PassSpan { begin_ns, end_ns };
+        Outcome {
+            cpu_us: vec![900, 1_100, 1_000],
+            tick_us: vec![1_200, 1_300, 1_250],
+            handoff_us: Vec::new(),
+            plan_us: vec![50, 60, 55],
+            encode_us: vec![100, 110, 105],
+            submit_us: vec![30, 40, 35],
+            dispatches_per_frame: vec![4, 4, 3],
+            dispatches_per_job: vec![4, 4],
+            lateness_us: vec![0, 10, 500],
+            dropped: 1,
+            gpu_frame_us: vec![6_000, 17_000, 7_000],
+            longest_dispatch_us: vec![1_500, 1_600],
+            latencies: vec![2, 2, 3],
+            submitted: 3,
+            delivered: 2,
+            missed: 1,
+            startup_missed: 1,
+            violations: 1,
+            pending_at_end: 2,
+            measured: [(SliceId::new(0), (3_000, 2))].into_iter().collect(),
+            estimates: [
+                (SliceId::new(0), Micros::new(1_600)),
+                (SliceId::new(1), Micros::new(2_000)),
+            ]
+            .into_iter()
+            .collect(),
+            frame_ratios: vec![1.1, 0.9, 1.25],
+            frame_scales: vec![1.0, 1.2],
+            frame_scale: FrameScale::Measured(1.2),
+            frames_recorded: 70,
+            timer: TimerStats {
+                frames_skipped: 1,
+                frames_collected: 3,
+                frames_failed: 0,
+            },
+            pass_frames: vec![Frame {
+                index: 0,
+                compute: vec![Pass {
+                    slice: SliceId::new(0),
+                    us: 655,
+                    span: span(3 * q, 13 * q),
+                }],
+                render: Some(span(10 * q, 41 * q)),
+            }],
+            background_dispatches: Some(42),
+            net: None,
+        }
     }
 
+    /// The report's names, order and formatting, held to the text in
+    /// `report/`: a run with every value present, and an empty one where
+    /// each value that can be absent says `none`.
     #[test]
-    fn the_promised_latency_is_the_frames_at_the_period() {
-        assert_eq!(promised_latency_ms(0), 0.0);
-        assert!((promised_latency_ms(5) - 83.335).abs() < 1e-9);
-    }
-
-    #[test]
-    fn a_frame_is_over_only_when_it_exceeds_the_period() {
-        let period = FRAME_PERIOD.get();
-        assert_eq!(gpu_frames_over_period(&[]), 0);
+    fn the_report_is_the_golden_text() {
+        let env = Environment {
+            adapter: String::from("Test Adapter"),
+            backend: String::from("Metal"),
+        };
+        let args = Args {
+            background_load: true,
+            ..Args::default()
+        };
         assert_eq!(
-            gpu_frames_over_period(&[period - 1, period, period + 1, period * 2]),
-            2
+            render(&env, &args, 1, &full_outcome()),
+            include_str!("report/full.txt")
+        );
+        assert_eq!(
+            render(&env, &Args::default(), 1, &Outcome::default()),
+            include_str!("report/empty.txt")
         );
     }
 }

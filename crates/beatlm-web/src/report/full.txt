@@ -1,0 +1,73 @@
+run: 1/1
+adapter: Test Adapter
+backend: webgpu
+user_agent: Test Browser/1.0
+date: 2026-01-01T00:00:00Z
+timestamp_query: available
+adapter_limits: max_storage_buffer_binding_size=1073741824 max_buffer_size=2147483648
+device_limits: max_storage_buffer_binding_size=134217728 max_buffer_size=268435456
+config: frames=600 latency=2 slices=4 slice_iters=500 render_iters=50 render_order=after margin_us=2000 estimator=quantile submit=every
+latency_asked_ms: 33.0
+latency_period_us: 16667
+display_period_us: 16667
+promised_latency_ms: 33.3
+frames: 3
+frames_dropped: 1
+submitted: 3
+delivered: 2
+missed: 1
+startup_missed: 1
+delivery_rate: 0.6667
+pending_at_end: 2
+latency_violations: 1
+timings_collected: 3
+timings_skipped: 1
+timings_failed: 0
+latency_frames[2]: 2
+latency_frames[3]: 1
+dispatches_per_job: p50=4 p99=4 max=4
+dispatches_per_frame: p50=4 p99=4 max=4
+callback_interval_us: p50=16700 p99=33400 max=33400
+frame_start_lateness_us: p50=10 p99=500 max=500
+cpu_start_to_submit_us: p50=1000 p99=1100 max=1100
+cpu_start_to_tick_end_us: p50=1250 p99=1300 max=1300
+cpu_plan_us: p50=55 p99=60 max=60
+cpu_encode_us: p50=105 p99=110 max=110
+cpu_queue_submit_us: p50=35 p99=40 max=40
+gpu_frame_us: p50=7000 p99=17000 max=17000
+gpu_render_alone_us: p50=400 p99=400 max=400
+gpu_render_with_slices_us: p50=500 p99=650 max=650
+longest_dispatch_us: p50=1500 p99=1600 max=1600
+gpu_frames_over_period: 1 of 3
+pass_overlap_frames: frames=1 with_render_and_slices=1 overlapping=1 share=1.0000 tolerance_ns=65536 max_intersection_ns=196608
+pass_overlap_us: p50=197 p99=197 max=197
+pass_order: render_before_first_slice=0 render_after_last_slice=0 render_among_slices=1
+slice_vs_render_overlap: overlapped_samples=0 overlapped_ratio_mean=none overlapped_ratio_p50=none overlapped_ratio_p90=none not_overlapped_samples=0 not_overlapped_ratio_mean=none not_overlapped_ratio_p50=none not_overlapped_ratio_p90=none
+pass_overlap_compute: pairs=0 overlapping=0 share=none frames_with_pairs=0 frames_overlapping=0 max_intersection_ns=0
+pass_overlap_next_frame: pairs=0 first_slice_before_render_end=0 share=none first_slice_at_render_end=0 first_slice_after_render_end=0 tolerance_ns=65536 before_us_p50=none before_us_max=none after_us_p50=none after_us_max=none
+frame_ratio: frames=3 min=0.90 p50=1.10 p90=1.25 max=1.25
+frame_scale: final=1.20 frames_recorded=70 planned_scaled=2 min=1.00 p50=1.00 p90=1.20 max=1.20
+slice[0]: estimate_us=1600 measured_samples=2 measured_mean_us=1500
+slice[1]: estimate_us=2000 measured_samples=0 measured_mean_us=none
+missed_unstarted: 1
+missed_started: 0
+missed_at_deadline: 0
+jobs_started: 3 first_frame=0 last_frame=3
+missed_unstarted_frames: 2 first_frame=7 last_frame=9
+unstarted_now_budget_us: p50=1000 p99=9000 max=9000
+unstarted_expected_budget_us: p50=1500 p99=12000 max=12000
+unstarted_largest_estimate_us: p50=2000 p99=3000 max=3000
+unstarted_estimate_sum_us: p50=8000 p99=8000 max=8000
+unstarted_frames_left: p50=1 p99=1 max=1
+unstarted_projected_end_frame: p50=8 p99=8 max=8
+unstarted_slice_fits_no_frame: 1
+unstarted_sample: frame=7 now_budget_us=9000 expected_budget_us=12000 largest_estimate_us=2000 estimate_sum_us=8000 frames_left=1 projected_end_frame=8
+unstarted_sample: frame=9 now_budget_us=1000 expected_budget_us=1500 largest_estimate_us=3000 estimate_sum_us=8000 frames_left=1 projected_end_frame=none
+timing_lag_frames: p50=2 p99=3 max=3
+first_pass_us: p50=1700 p99=1800 max=1800
+later_pass_us: p50=1450 p99=1500 max=1500
+first_pass_over_later_mean: median=1.20 slices=2
+job_estimate_us: loop_start=8000 loop_end=6400
+canvas_unavailable: 1
+gpu_errors: 0
+status: done

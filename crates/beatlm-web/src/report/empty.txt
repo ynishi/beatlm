@@ -1,0 +1,65 @@
+run: 1/1
+adapter: unreported
+backend: unreported
+user_agent: unreported
+date: unreported
+timestamp_query: unavailable; no GPU pass is timed, so gpu_frame_us, longest_dispatch_us and the slice measurements are none, and the budget and the slice estimates stay at their priors
+adapter_limits: max_storage_buffer_binding_size=0 max_buffer_size=0
+device_limits: max_storage_buffer_binding_size=0 max_buffer_size=0
+config: frames=600 latency=0 slices=4 slice_iters=500 render_iters=50 render_order=after margin_us=2000 estimator=quantile submit=every
+display_period_us: none
+promised_latency_ms: 0.0
+frames: 0
+frames_dropped: 0
+submitted: 0
+delivered: 0
+missed: 0
+startup_missed: 0
+delivery_rate: none
+pending_at_end: 0
+latency_violations: 0
+timings_collected: 0
+timings_skipped: 0
+timings_failed: 0
+dispatches_per_job: none
+dispatches_per_frame: none
+callback_interval_us: none
+frame_start_lateness_us: none
+cpu_start_to_submit_us: none
+cpu_start_to_tick_end_us: none
+cpu_plan_us: none
+cpu_encode_us: none
+cpu_queue_submit_us: none
+gpu_frame_us: none
+gpu_render_alone_us: none
+gpu_render_with_slices_us: none
+longest_dispatch_us: none
+gpu_frames_over_period: 0 of 0
+pass_overlap_frames: frames=0 with_render_and_slices=0 overlapping=0 share=none tolerance_ns=1000 max_intersection_ns=0
+pass_overlap_us: none
+pass_order: render_before_first_slice=0 render_after_last_slice=0 render_among_slices=0
+slice_vs_render_overlap: overlapped_samples=0 overlapped_ratio_mean=none overlapped_ratio_p50=none overlapped_ratio_p90=none not_overlapped_samples=0 not_overlapped_ratio_mean=none not_overlapped_ratio_p50=none not_overlapped_ratio_p90=none
+pass_overlap_compute: pairs=0 overlapping=0 share=none frames_with_pairs=0 frames_overlapping=0 max_intersection_ns=0
+pass_overlap_next_frame: pairs=0 first_slice_before_render_end=0 share=none first_slice_at_render_end=0 first_slice_after_render_end=0 tolerance_ns=1000 before_us_p50=none before_us_max=none after_us_p50=none after_us_max=none
+frame_ratio: none
+frame_scale: none
+missed_unstarted: 0
+missed_started: 0
+missed_at_deadline: 0
+jobs_started: 0
+missed_unstarted_frames: 0
+unstarted_now_budget_us: none
+unstarted_expected_budget_us: none
+unstarted_largest_estimate_us: none
+unstarted_estimate_sum_us: none
+unstarted_frames_left: none
+unstarted_projected_end_frame: none
+unstarted_slice_fits_no_frame: 0
+timing_lag_frames: none
+first_pass_us: none
+later_pass_us: none
+first_pass_over_later_mean: none
+job_estimate_us: loop_start=0 loop_end=0
+canvas_unavailable: 0
+gpu_errors: 0
+status: done

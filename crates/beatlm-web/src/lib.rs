@@ -525,7 +525,7 @@
 //! # What is shared with the bench
 //!
 //! The load, the depth model's slots, the pass-cost measurement, the
-//! `pass_overlap_*` lines and the report's statistics come from
+//! report's shared lines and its statistics come from
 //! [`beatlm_host`], the crate both hosts depend on, whose documentation lists
 //! what it holds; so the two hosts time the same kernels at the same sizes and
 //! quote the same statistic. The model, its loader and its reference
@@ -534,9 +534,9 @@
 //! and the decisions from `beatlm_core`.
 //!
 //! The frame's bookkeeping — the budget and forecast, the admission of an
-//! input, the delivery and miss counts, what each measurement feeds — the
-//! report's shared lines and calibration's two passes follow the bench's
-//! `engine.rs`, `report.rs` and `calibrate.rs`, and a change to one is owed to
+//! input, the delivery and miss counts, what each measurement feeds — and
+//! calibration's two passes follow the bench's `engine.rs` and
+//! `calibrate.rs`, and a change to one is owed to
 //! the other. They are written twice because the
 //! bench's engine reads `std::time::Instant` and blocks on the device for its
 //! warm-up and drain, neither of which exists in a page, and carries the
