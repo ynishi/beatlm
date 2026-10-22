@@ -151,6 +151,11 @@ and this project adheres to
   statistics) moved into a new unpublished crate, `beatlm-host`, which the
   bench and the page depend on instead of compiling the bench's files by
   `#[path]`. No behaviour or report line changed.
+- The cost-model tuning both hosts share (window, quantile, alpha, sigmas,
+  cap, priors, margin, and the startup, calibration and render windows
+  derived from the window) and the four bare estimator presets live once in
+  `beatlm_host::presets`; the per-slice sample cutoff is one
+  `beatlm_host::stats::MIN_SAMPLES`. Every value is unchanged.
 
 ### Fixed
 
