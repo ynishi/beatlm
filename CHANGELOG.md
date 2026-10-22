@@ -98,11 +98,6 @@ and this project adheres to
   clock (`bpm`, `bpm_change`, `margin_ms`, `beats`), started by a click, with
   beat landing error and tempo-change lines in the report.
 
-### Fixed
-
-- `beatlm-web`: a depth result reaches the screen only in the frame that
-  delivers it; a later job on the same slot could show its depth before then.
-
 ### Changed
 
 - Design is documented in the crate docs; the separate ADR directory is gone.
@@ -133,3 +128,8 @@ and this project adheres to
 - A job projected to miss its deadline is abandoned at once only when another
   job waits behind it; a lone one keeps running and is decided at its
   deadline, so its slices are measured and estimates can come down.
+
+### Fixed
+
+- `beatlm-web`: a depth result reaches the screen only in the frame that
+  delivers it; a later job on the same slot could show its depth before then.
