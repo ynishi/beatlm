@@ -58,8 +58,9 @@ remove the worktree once the branch is merged.
 ## Verification
 
 `just check` is the definition of green, and CI is where it runs. It formats,
-lints with warnings denied, tests, lints the umbrella crate and the browser
-host for `wasm32-unknown-unknown`, and runs `cargo deny`. The browser build is part of
+lints with warnings denied, tests, lints the umbrella crate, the code both
+hosts share (`beatlm-host`) and the browser host for `wasm32-unknown-unknown`,
+and runs `cargo deny`. The browser build is part of
 green on every change: a target that is only checked when someone gets round to
 the demo is a target that is broken when they do.
 

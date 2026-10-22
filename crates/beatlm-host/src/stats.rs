@@ -1,9 +1,8 @@
 //! Order statistics and histograms over the samples a run collects.
 //!
-//! The browser host (`beatlm-web`) compiles this file by path, so its report
-//! and its calibration quote the same statistics as the bench's, and the
-//! lines both hosts write from timestamps (`pass_overlap.rs`) read the same
-//! timestamp step.
+//! Both hosts use this module, so the browser host's report and calibration
+//! quote the same statistics as the bench's, and the lines both hosts write
+//! from timestamps (`pass_overlap.rs`) read the same timestamp step.
 
 use std::collections::BTreeMap;
 
@@ -105,9 +104,9 @@ pub fn share(part: u64, whole: u64) -> String {
 /// The middle of `samples` once sorted, the upper one when there are two;
 /// `None` when there are none.
 ///
-/// It is the statistic calibration's decision reads (`calibrate.rs`): it
-/// ignores a few slow frames at either end without a window, a deviation or a
-/// quantile to choose.
+/// It is the statistic calibration's decision reads (the bench's
+/// `calibrate.rs`): it ignores a few slow frames at either end without a
+/// window, a deviation or a quantile to choose.
 pub fn median(samples: &mut [u64]) -> Option<Micros> {
     samples.sort_unstable();
     samples.get(samples.len() / 2).copied().map(Micros::new)
@@ -125,9 +124,6 @@ pub fn histogram<I: IntoIterator<Item = u64>>(values: I) -> BTreeMap<u64, u64> {
 /// A frame's measured slice time over what its slices were planned at, the
 /// ratio the frame-scaled estimate reads; `None` when they were planned at
 /// zero.
-// The browser host calls it from its wasm32-only frame loop, so a native
-// build of `beatlm-web` compiles it unused.
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[allow(clippy::cast_precision_loss)]
 pub fn frame_ratio(predicted: Micros, measured: Micros) -> Option<f64> {
     // Microsecond counts this size are exact in an f64.

@@ -5,7 +5,8 @@
 //! does, so the cost model can be compared under noise it did not make. The
 //! second device shares the adapter but no resource, queue or timer with the
 //! run; it never reads a timestamp. The kernel is the slice kernel of
-//! `shaders.wgsl` at a larger iteration count, so one number tunes how long the
+//! `shaders.wgsl` (`beatlm_host::workload::SHADERS`) at a larger iteration
+//! count, so one number tunes how long the
 //! load holds the GPU per dispatch.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,6 +14,7 @@ use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
 
 use anyhow::{Context, Result, anyhow};
+use beatlm_host::workload::SHADERS;
 use wgpu::util::DeviceExt;
 
 use crate::device::Gpu;
@@ -50,7 +52,7 @@ impl BackgroundLoad {
 
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("beatlm-bench background shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(SHADERS.into()),
         });
         let mut params = Vec::with_capacity(16);
         for word in [iters, 0, 0, 0] {

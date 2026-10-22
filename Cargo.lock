@@ -63,6 +63,7 @@ dependencies = [
  "anyhow",
  "beatlm",
  "beatlm-core",
+ "beatlm-host",
  "pollster",
  "wgpu",
 ]
@@ -75,12 +76,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "beatlm-host"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "beatlm",
+ "beatlm-core",
+ "wgpu",
+]
+
+[[package]]
 name = "beatlm-web"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "beatlm",
  "beatlm-core",
+ "beatlm-host",
  "js-sys",
  "wasm-bindgen",
  "wasm-bindgen-futures",

@@ -5,7 +5,7 @@
 //!
 //! Each step is the native one's, from the same code: the reader and the
 //! inventory check of `beatlm::load`, the graph of `beatlm::model`, the core's
-//! lowering, split and memory plan, the bench's `Net` (`slots.rs`), and
+//! lowering, split and memory plan, the shared `Net` (`beatlm_host::slots`), and
 //! `beatlm::load::depth_anything_v2::reference` for the input, the error
 //! measures and the tolerances. What changes is how the page waits: on the
 //! event loop, between animation frames, where native code polls the device.
@@ -19,6 +19,8 @@ use beatlm::load::depth_anything_v2::{Config, inventory};
 use beatlm_core::cost::{CostModel, Estimator, SliceId};
 use beatlm_core::kernel::Program;
 use beatlm_core::time::{FrameIndex, Micros};
+use beatlm_host::slots::{Net, Numbers};
+use beatlm_host::workload::Workload;
 
 use super::device::{self, Gpu};
 use super::fetch;
@@ -27,8 +29,6 @@ use super::wait::{self, callback, next_frame};
 use crate::depth::{self, CALIBRATION_FRAMES, MAX_DISPATCH_US, WholeRuns};
 use crate::pace::ms_to_us;
 use crate::report::Check;
-use crate::slots::{Net, Numbers};
-use crate::workload::Workload;
 
 /// How long calibration waits for one frame's timings before it gives up, in
 /// microseconds: a minute. It is there so a run whose timings never come back

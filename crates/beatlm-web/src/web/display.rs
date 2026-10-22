@@ -35,9 +35,9 @@
 //! Under `render_order=after`, the page's default ([`crate::config`]), the
 //! pass waits for the slices in every frame, not only in a delivery frame:
 //! its vertex stage reads the first word of every arena of the plan, the
-//! buffers the slices write, through `display_vs_after`, which the bench's
-//! `workload::after_vertex` appends to `display.wgsl` with one binding per
-//! arena, and one bind group made here. The bench's `workload.rs` ("Ordering
+//! buffers the slices write, through `display_vs_after`, which
+//! `beatlm_host::workload::after_vertex` appends to `display.wgsl` with one binding per
+//! arena, and one bind group made here. `beatlm_host::workload` ("Ordering
 //! the render pass after the slices") says why every arena, what bounds
 //! their number, and what the order guarantees; the page refuses a plan of
 //! too many before it fetches the weights (`crate::depth::check_render_order`),
@@ -54,10 +54,11 @@
 
 use anyhow::{Context, Result};
 use beatlm::load::depth_anything_v2::reference::{MEAN, STD};
+use beatlm_host::slots::{Net, Numbers};
+use beatlm_host::workload::{
+    RenderOrder, TARGET_FORMAT, after_module, written_bind_group, written_fits,
+};
 use wgpu::util::DeviceExt;
-
-use crate::slots::{Net, Numbers};
-use crate::workload::{RenderOrder, TARGET_FORMAT, after_module, written_bind_group, written_fits};
 
 /// The render pass that shows the source and the depth delivered last.
 pub struct Display {
@@ -74,7 +75,7 @@ pub struct Display {
     blank: wgpu::BindGroup,
     /// Under [`RenderOrder::After`], group 1: every arena of the plan, the
     /// buffers the slices write, which the vertex shader reads
-    /// (`workload.rs` says why all of them).
+    /// (`beatlm_host::workload` says why all of them).
     written: Option<wgpu::BindGroup>,
 }
 

@@ -165,8 +165,7 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use beatlm_core::time::{BeatGrid, Micros, TimeError, TimePoint};
-
-use crate::stats::nearest_rank;
+use beatlm_host::stats::nearest_rank;
 
 /// The tempo when `bpm` is not given, in beats per minute: a beat of 600 ms.
 pub const DEFAULT_BPM: f64 = 100.0;

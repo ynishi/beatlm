@@ -20,6 +20,7 @@ crate-type = ["cdylib", "rlib"]
 anyhow      = { workspace = true }
 beatlm      = { workspace = true }
 beatlm-core = { workspace = true }
+beatlm-host = { workspace = true }
 wgpu        = { workspace = true }
 
 # Only the browser build talks to the page, so the native workspace build

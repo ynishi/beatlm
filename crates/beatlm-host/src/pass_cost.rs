@@ -7,10 +7,11 @@
 //! per pass, paid on the GPU between or around the dispatches, is paid 155
 //! times. This workload measures that cost; it schedules nothing, estimates
 //! nothing and promises nothing. It is a measurement loop like calibration
-//! (`calibrate.rs`): every frame encodes a fixed pattern and reads its time.
+//! (the bench's `calibrate.rs`): every frame encodes a fixed pattern and reads
+//! its time.
 //!
-//! The browser host (`beatlm-web`) compiles this file by path, so a page and
-//! the bench encode the same passes and report the same lines. It reads no
+//! Both hosts use this module, so a page and the bench encode the same passes
+//! and report the same lines. It reads no
 //! clock: each host measures its CPU times with its own clock and hands them
 //! in, as the hosts do with everything else they share.
 //!
@@ -39,8 +40,9 @@
 //!
 //! **Why the render pass is off by default.** With `render` on, each frame
 //! ends with the synthetic render pass, untimed, as the loop's frames do, to
-//! keep the GPU as busy per frame as there (`calibrate.rs` says why an idle
-//! GPU measures short). It made the passes before it slower, not faster: on an
+//! keep the GPU as busy per frame as there (the bench's `calibrate.rs` says
+//! why an idle GPU measures short). It made the passes before it slower, not
+//! faster: on an
 //! Apple M1 Pro (Metal, wgpu 30.0.1, 2026-10-22, 100 frames per cell, one run
 //! each) one trivial pass spanned 152 us at the median with it and 16 us
 //! without, and 32 dispatches in one pass 1786 us against 190 us. That is
@@ -77,7 +79,7 @@
 //!
 //! # What is derived
 //!
-//! From the medians (nearest rank, the bench's `stats.rs`) of the cells'
+//! From the medians (nearest rank, `stats.rs`) of the cells'
 //! spans, per pass:
 //!
 //! - **`per_pass_us`** (variants A, B, D) and **`per_dispatch_us`** (C):
@@ -766,7 +768,7 @@ impl Measurements {
 }
 
 /// `p50=… p99=… max=…` of nanosecond samples in microseconds to one decimal,
-/// by nearest rank as the bench's `summarize`; `none` when there are none.
+/// by nearest rank, as `stats::summarize`; `none` when there are none.
 fn summary_us(samples_ns: &[u64]) -> String {
     match summarize(samples_ns) {
         Some(s) => format!("p50={} p99={} max={}", us1(s.p50), us1(s.p99), us1(s.max)),

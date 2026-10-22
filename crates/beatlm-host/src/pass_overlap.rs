@@ -4,8 +4,8 @@
 //! and where the next frame's first compute pass began against the render's
 //! end, `pass_overlap_next_frame`.
 //!
-//! The browser host (`beatlm-web`) compiles this file by path, so a page and
-//! the bench write these lines by the same rules and in the same format, and
+//! Both hosts use this module, so a page and the bench write these lines by
+//! the same rules and in the same format, and
 //! a browser report compares with a native one line by line. It is pure: a
 //! host hands it what its timer returned ([`Frame::of`]), and nothing here
 //! feeds the scheduler or the cost model.

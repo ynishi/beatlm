@@ -50,13 +50,13 @@ use beatlm::gpu::{MAX_SLICES, SliceTimer};
 use beatlm_core::cost::{CostModel, Estimator, SliceId};
 use beatlm_core::kernel::Program;
 use beatlm_core::time::{FrameIndex, Micros};
+use beatlm_host::stats::median;
+use beatlm_host::workload::Workload;
 
 use crate::device::Gpu;
 use crate::engine::{COST_WINDOW, timer_capacity};
 use crate::net::{Net, Numbers};
 use crate::pace::Pacer;
-use crate::stats::median;
-use crate::workload::Workload;
 
 /// Timed frames of whole jobs in each calibration pass, after one untimed
 /// frame: twice the quantile estimator's window, so that the half the

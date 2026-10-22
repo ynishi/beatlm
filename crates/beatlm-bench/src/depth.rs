@@ -33,8 +33,7 @@ use beatlm::load::{Archive, read_file};
 use beatlm::model::Builder;
 use beatlm::model::depth_anything_v2::{DepthModel, model};
 use beatlm_core::kernel::{Fusion, Program};
-
-use crate::slots::Numbers;
+use beatlm_host::slots::Numbers;
 
 /// The model's weights file, under `BEATLM_MODELS_DIR` or the workspace's
 /// `models/`.

@@ -15,10 +15,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use anyhow::{Context, Result, bail};
 use beatlm::gpu::{Arenas, profile, required_limits};
 use beatlm_core::memory::{DType, MemoryPlan, TensorDesc, TensorId};
+use beatlm_host::workload::{RENDER_HEIGHT, RENDER_WIDTH, TARGET_FORMAT};
 
 use super::page;
 use crate::report::SizeLimits;
-use crate::workload::{RENDER_HEIGHT, RENDER_WIDTH, TARGET_FORMAT};
 
 /// Errors the device reported outside an error scope since it was created.
 ///

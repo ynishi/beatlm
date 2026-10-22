@@ -16,6 +16,8 @@ mod wait;
 use anyhow::{Context, Result};
 use beatlm_core::sync::SyncPolicy;
 use beatlm_core::time::Micros;
+use beatlm_host::slots::Net;
+use beatlm_host::workload::{DEFAULT_SLICE_ITERS, Workload};
 use wasm_bindgen::prelude::wasm_bindgen;
 
 use crate::config::{self, Config, Latency, Model};
@@ -23,8 +25,6 @@ use crate::depth;
 use crate::onbeat;
 use crate::pace::{Pace, Pacer, WINDOW, ms_to_us};
 use crate::report::{DepthReport, Environment};
-use crate::slots::Net;
-use crate::workload::{DEFAULT_SLICE_ITERS, Workload};
 use device::Need;
 use frame::{DepthLoad, Load, OnBeatRun, Run};
 

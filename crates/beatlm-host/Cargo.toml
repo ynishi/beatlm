@@ -1,0 +1,22 @@
+[package]
+name          = "beatlm-host"
+description   = "What beatlm's two hosts both compile: the synthetic load, the depth model's slots, the pass-cost measurement and the report's statistics, reading no clock"
+publish       = false
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+authors.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+
+[dependencies]
+anyhow      = { workspace = true }
+beatlm      = { workspace = true }
+beatlm-core = { workspace = true }
+# Without `counters`: the bench turns that feature on in its own build, and the
+# browser host's must stay without it (the WebGPU backend keeps no counters).
+wgpu        = { workspace = true }
+
+[lints]
+workspace = true

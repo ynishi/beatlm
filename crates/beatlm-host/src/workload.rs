@@ -6,11 +6,10 @@
 //! sized to fill the GPU, so a slice's time grows with its iteration count and
 //! not with how few invocations it launches.
 //!
-//! The browser host (`beatlm-web`) compiles this file by path, so a browser run
-//! and a native run time the same kernels at the same sizes and their reports
-//! can be compared. That is why nothing here names a bench type, and why the
-//! render target is the caller's: the bench draws into an offscreen texture,
-//! the browser into its canvas, both of [`TARGET_FORMAT`] and
+//! Both hosts use this module, so a browser run and a native run time the same
+//! kernels at the same sizes and their reports can be compared. That is why
+//! the render target is the caller's: the bench draws into an offscreen
+//! texture, the browser into its canvas, both of [`TARGET_FORMAT`] and
 //! [`RENDER_WIDTH`] by [`RENDER_HEIGHT`].
 //!
 //! # Ordering the render pass after the slices
@@ -25,7 +24,7 @@
 //! synthetic slices all write this load's `sink`; the depth model's kernels
 //! write the arenas of its plan, and `Net::written` (`slots.rs`) hands out
 //! all of them. Each host chooses its default: the bench keeps `free`
-//! (`main.rs`, "What it measures", says why), the browser host uses
+//! (its `main.rs`, "What it measures", says why), the browser host uses
 //! `after` (`beatlm-web`'s crate documentation has its measurements).
 //!
 //! Every arena, rather than only those a frame's slices write or the one the
@@ -123,6 +122,11 @@ pub const RENDER_HEIGHT: u32 = 720;
 /// The render target's format, which the render pipeline is built for. A
 /// WebGPU canvas can always be configured with it.
 pub const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
+/// The WGSL of both kernels, `shaders.wgsl`. Besides this load, the bench's
+/// competing background load (`load.rs`) runs its slice kernel on a device of
+/// its own, which is why the text is public.
+pub const SHADERS: &str = include_str!("shaders.wgsl");
 
 /// Loop iterations per slice-kernel invocation that put one slice at 0.8 to
 /// 1.4 ms on an Apple M1 Pro (Metal); see the `beatlm-bench` crate
@@ -320,7 +324,7 @@ impl Workload {
     pub fn new(device: &wgpu::Device, slice_iters: u32, render_iters: u32) -> Self {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("beatlm-bench shaders"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(SHADERS.into()),
         });
 
         let mut params = Vec::with_capacity(16);
@@ -413,7 +417,7 @@ impl Workload {
                 let module = after_module(
                     device,
                     "beatlm-bench shaders, render after",
-                    include_str!("shaders.wgsl"),
+                    SHADERS,
                     written.len(),
                     "render_vs_after",
                 );
@@ -549,7 +553,7 @@ mod tests {
     /// of buffers a device with the default limits can bind.
     #[test]
     fn the_synthetic_shaders_validate_without_optional_features() {
-        let source = include_str!("shaders.wgsl");
+        let source = SHADERS;
         let features = beatlm_core::device::DeviceFeatures::default();
         beatlm::codegen::validate("synthetic", source, features).unwrap();
         for buffers in 1..=DEFAULT_STAGE_STORAGE_BUFFERS as usize {

@@ -13,11 +13,11 @@
 //! - `model`: the job, `synthetic` (the default; the bench's busy-loop slices)
 //!   or `depth` (Depth Anything V2 Small, [`crate::depth`]); or `pass-cost`,
 //!   no job at all but the bench's measurement of what a compute pass costs
-//!   ([`crate::pass_cost`]), with parameters of its own (below).
+//!   ([`beatlm_host::pass_cost`]), with parameters of its own (below).
 //! - `side`: the depth model's input side in pixels, a positive multiple of 14
 //!   up to 518 (default [`NATIVE_DEFAULT_SIDE`]).
 //!   Only with `model=depth`, or `model=pass-cost&kernels=depth` (default
-//!   [`crate::pass_cost::DEFAULT_DEPTH_SIDE`] there).
+//!   [`beatlm_host::pass_cost::DEFAULT_DEPTH_SIDE`] there).
 //! - `latency`: the promised latency in frames, which the display's period
 //!   turns into time.
 //! - `latency_ms`: the promised latency in milliseconds, a decimal; the page
@@ -45,7 +45,7 @@
 //!   and slowed them, and ordering it after them took that away (the crate
 //!   documentation, "What differs from the native bench, and why", has the
 //!   measurements and why the bench keeps `free`); `free` is the frame as it
-//!   was before, kept to compare against. The bench's `workload.rs`
+//!   was before, kept to compare against. `beatlm_host::workload`
 //!   ("Ordering the render pass after the slices") says how and what it
 //!   guarantees. With the depth model the display is the pass that reads
 //!   them, every arena of the plan, and a plan of more arenas than the
@@ -96,7 +96,7 @@
 //! # The render_iters parameter
 //!
 //! The render pass of a loop run repeats the synthetic per-pixel loop
-//! (`render_fs` in the bench's `shaders.wgsl`; the depth model's display,
+//! (`render_fs` in `beatlm-host`'s `shaders.wgsl`; the depth model's display,
 //! `web/display.wgsl`, carries the same loop before it draws the image and the
 //! depth), `render_iters` times per pixel; the budget's prior for the render
 //! at the default of 50 is the bench's [`crate::render_cost::RENDER_PRIOR`].
@@ -291,14 +291,14 @@
 use anyhow::{Context, Result, anyhow, bail};
 use beatlm_core::cost::{CostModel, Estimator, MAX_WINDOW};
 use beatlm_core::time::Micros;
+use beatlm_host::pass_cost::{self, DEFAULT_DEPTH_SIDE, Dispatches};
+use beatlm_host::workload::{DEFAULT_RENDER_ITERS, RenderOrder};
 
 use crate::depth::{MAX_SIDE, NATIVE_DEFAULT_LATENCY, NATIVE_DEFAULT_SIDE, PATCH};
 use crate::onbeat::{
     DEFAULT_BPM, DEFAULT_MARGIN, MAX_BEATS, MAX_BPM, MAX_CHANGE_AFTER_S, MAX_MARGIN, MIN_BPM,
     Tempo, TempoChange,
 };
-use crate::pass_cost::{self, DEFAULT_DEPTH_SIDE, Dispatches};
-use crate::workload::{DEFAULT_RENDER_ITERS, RenderOrder};
 
 /// Frames a run lasts when `frames` is not given: the bench's default.
 pub const DEFAULT_FRAMES: u64 = 600;

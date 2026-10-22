@@ -7,6 +7,10 @@ members = [
     # The umbrella: what a user depends on. Turns the core's decisions into
     # GPU work through wgpu, and owns the translation from outside formats.
     "crates/beatlm",
+    # What both hosts compile, and only that: the synthetic load, the depth
+    # model's slots, the pass-cost measurement and the report's statistics.
+    # Reads no clock, so it builds for wasm too. Not published.
+    "crates/beatlm-host",
     # A headless host: drives the umbrella with a synthetic GPU load and reports
     # what it measured. Not published.
     "crates/beatlm-bench",
@@ -27,6 +31,7 @@ homepage     = "https://github.com/ynishi/beatlm"
 [workspace.dependencies]
 beatlm-core = { path = "crates/beatlm-core", version = "0.1.0" }
 beatlm      = { path = "crates/beatlm", version = "0.1.0" }
+beatlm-host = { path = "crates/beatlm-host", version = "0.1.0" }
 thiserror   = "2"
 anyhow      = "1"
 pollster    = "1"
