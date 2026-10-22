@@ -137,3 +137,5 @@ and this project adheres to
 
 - `beatlm-web`: a depth result reaches the screen only in the frame that
   delivers it; a later job on the same slot could show its depth before then.
+- The lock no longer resolves the yanked `tokio` 1.54.0 (via
+  `wasm-bindgen-futures`); it pins 1.53.2.
