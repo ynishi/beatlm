@@ -65,7 +65,8 @@ pub const STARTUP_FRAMES: u64 = 2 * WINDOW as u64;
 /// frame: twice [`WINDOW`], so the half the decision reads is as long as the
 /// window the loop's estimate reads, and starts after the GPU has run the
 /// paced load for half a second at 60 Hz (a quarter at 120 Hz). An estimator with a longer window starts the
-/// loop with the counted half, `CALIBRATION_FRAMES / 2` measurements of each
+/// loop with the counted half ([`counted`](crate::calibration::counted)),
+/// `CALIBRATION_FRAMES / 2` measurements of each
 /// part, and fills the rest from the loop.
 pub const CALIBRATION_FRAMES: u64 = 2 * WINDOW as u64;
 

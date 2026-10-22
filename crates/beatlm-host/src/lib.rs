@@ -29,6 +29,8 @@
 //! - [`frame`]: the rules the step is made of: the label a timed slice
 //!   carries, the render's budget and forecast, the admission of an input,
 //!   and the timer's capacity;
+//! - [`calibration`]: which of a calibration pass's measurements count, and
+//!   the first pass's per-kernel medians;
 //! - [`pass_cost`]: the `pass-cost` workload's encoding, cells and lines;
 //! - [`pass_overlap`]: the `pass_overlap_*` lines, read from a frame's
 //!   timestamps;
@@ -56,9 +58,9 @@
 //!
 //! **What a host keeps is what only it has**: its clock and pacing, its
 //! device, timer and surface, how it waits (the bench blocks on the device for
-//! its warm-up and drain, a page cannot), its I/O and the report lines only it
-//! writes. What it does with the frame's plan and timings between those is
-//! the [`step`]'s.
+//! its warm-up, calibration and drain, a page cannot), its I/O and the report
+//! lines only it writes. What it does with the frame's plan and timings
+//! between those is the [`step`]'s.
 //!
 //! # Why a crate of its own
 //!
@@ -76,6 +78,7 @@
 // Also set as a workspace lint; see the same attribute in `beatlm-core`.
 #![warn(missing_docs)]
 
+pub mod calibration;
 pub mod frame;
 pub mod pass_cost;
 pub mod pass_overlap;
