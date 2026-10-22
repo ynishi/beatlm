@@ -187,10 +187,15 @@ and this project adheres to
 - `SliceTimer::invalidate_submitted`: a host that learns the device rejected
   a submitted command buffer marks what it submitted, and those frames are
   counted in `timings_failed` instead of reporting an earlier lap's
-  timestamps. `beatlm-web` marks them when `gpu_errors` has grown before it
-  collects; an error the browser reports later, or not at all, still lets
-  the frame be read. Natively a rejected command buffer still panics in
-  wgpu's default handler.
+  timestamps. `beatlm-web` still marks them when an error outside every
+  frame's scope (below) has been reported before it collects. Natively a
+  rejected command buffer still panics in wgpu's default handler.
+- `beatlm-web` puts a validation error scope around each frame's `finish`
+  and `submit` and holds the frame (`SliceTimer::submitted_held`,
+  `HeldFrame`) until the scope settles: a frame the device rejected is never
+  read, and only that frame loses its timing. `SliceTimer::collect_ready`
+  returns frames in submission order across calls. `gpu_errors` counts a
+  rejected frame once.
 
 - `beatlm-web`: a depth result reaches the screen only in the frame that
   delivers it; a later job on the same slot could show its depth before then.
