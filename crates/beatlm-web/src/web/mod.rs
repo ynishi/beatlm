@@ -14,7 +14,6 @@ mod pass_cost;
 mod wait;
 
 use anyhow::{Context, Result};
-use beatlm_core::cost::Estimator;
 use beatlm_core::sync::SyncPolicy;
 use beatlm_core::time::Micros;
 use wasm_bindgen::prelude::wasm_bindgen;
@@ -25,7 +24,7 @@ use crate::onbeat;
 use crate::pace::{Pace, Pacer, WINDOW, ms_to_us};
 use crate::report::{DepthReport, Environment};
 use crate::slots::{self, Net};
-use crate::workload::{DEFAULT_RENDER_ITERS, DEFAULT_SLICE_ITERS, Workload};
+use crate::workload::{DEFAULT_SLICE_ITERS, Workload};
 use device::Need;
 use frame::{DepthLoad, Load, OnBeatRun, Run};
 
@@ -94,9 +93,10 @@ fn describe(config: &Config) -> String {
         }
     };
     format!(
-        "{model} frames={} {latency} estimator={}",
+        "{model} frames={} {latency} estimator={} render_iters={}",
         config.frames,
-        crate::config::estimator_name(config.estimator)
+        crate::config::estimator_name(config.estimator),
+        config.render_iters
     )
 }
 
@@ -203,7 +203,7 @@ async fn setup(mut config: Config) -> Result<()> {
         Model::Synthetic => {
             let need = config.arena_bytes.map_or(Need::Defaults, Need::Arena);
             let gpu = device::open(page::canvas()?, need).await?;
-            let workload = Workload::new(&gpu.device, DEFAULT_SLICE_ITERS, DEFAULT_RENDER_ITERS);
+            let workload = Workload::new(&gpu.device, DEFAULT_SLICE_ITERS, config.render_iters);
             warm_up(&gpu, &workload).await?;
             (gpu, workload, Load::Synthetic)
         }
@@ -222,9 +222,9 @@ async fn setup(mut config: Config) -> Result<()> {
             };
             let plan = slots::memory_plan(&loaded.program, &loaded.numbers, slots)?;
             let gpu = device::open(page::canvas()?, Need::Plan(plan)).await?;
-            let workload = Workload::new(&gpu.device, DEFAULT_SLICE_ITERS, DEFAULT_RENDER_ITERS);
+            let workload = Workload::new(&gpu.device, DEFAULT_SLICE_ITERS, config.render_iters);
             warm_up(&gpu, &workload).await?;
-            let load = depth_load(&gpu, &workload, loaded, slots, url, config.estimator).await?;
+            let load = depth_load(&gpu, &workload, loaded, slots, url, &config).await?;
             (gpu, workload, load)
         }
     };
@@ -308,7 +308,7 @@ async fn depth_load(
     mut loaded: model::Loaded,
     slots: u32,
     weights_url: String,
-    estimator: Estimator,
+    config: &Config,
 ) -> Result<Load> {
     page::show(&format!(
         "status: calibrating {} kernels at {} pixels over {} frames, twice",
@@ -316,8 +316,14 @@ async fn depth_load(
         loaded.side,
         depth::CALIBRATION_FRAMES + 1
     ));
-    let calibration =
-        model::calibrate(gpu, workload, &loaded.program, &loaded.numbers, estimator).await?;
+    let calibration = model::calibrate(
+        gpu,
+        workload,
+        &loaded.program,
+        &loaded.numbers,
+        config.estimator,
+    )
+    .await?;
     let net = device::accepted(&gpu.device, "the depth model's network", || {
         Net::new(
             &gpu.device,
@@ -339,7 +345,7 @@ async fn depth_load(
         &loaded.numbers,
         loaded.side,
         check.depth_range,
-        DEFAULT_RENDER_ITERS,
+        config.render_iters,
     )?;
     let plan = net.plan();
     let report = DepthReport {
