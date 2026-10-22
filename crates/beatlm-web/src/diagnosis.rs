@@ -81,8 +81,10 @@
 //! none of them changes what is scheduled or estimated. [`tail`] computes
 //! them and defines their terms: an *outlier* is a measurement above
 //! [`tail::OUTLIER_FACTOR`] times its slice's median in the loop, and every
-//! per-slice figure is over the slices measured [`tail::MIN_SAMPLES`] times or
-//! more. The explanations:
+//! per-slice figure, outliers included, is over the slices
+//! [`tail::slice_medians`] keeps, except that `tail_quantization`, the
+//! timestamp step's own statistic, also keeps a slice whose median is 0, as
+//! [`tail::slice_medians`] says. The explanations:
 //!
 //! - **H1, the first pass waits.** A frame's first compute pass's begin and
 //!   end can enclose time it spent queued behind earlier GPU work, the
@@ -106,7 +108,8 @@
 //!   the step's; the median over slices of one step over the 90th percentile,
 //!   the most the step can add to it; and of one step over the excess of the
 //!   final estimate above the mean, capped at 1, the share of that excess the
-//!   step can account for. A duration is a difference of two timestamps cut
+//!   step can account for, over the slices [`tail::measured_enough`],
+//!   median 0 included. A duration is a difference of two timestamps cut
 //!   to the step, so it is off by less than one step. H4.
 //! - `tail_slice_spread`: over the slices, the median and the 90th percentile
 //!   of each one's p90 / p50, and the median of its max / p50: how heavy the
