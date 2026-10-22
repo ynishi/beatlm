@@ -119,6 +119,9 @@ pub async fn run(config: &Config, settings: &Settings) -> Result<()> {
         let Some(&cell) = cells.get(index) else {
             continue;
         };
+        // Before the encode span, so the push is not charged to the cell's
+        // `encode` time, which the native bench's has no push in.
+        let submission = device::Submission::open(&gpu.device);
         let encoding = performance.now();
         let mut encoder = gpu
             .device
@@ -144,7 +147,7 @@ pub async fn run(config: &Config, settings: &Settings) -> Result<()> {
         let submitting = performance.now();
         gpu.queue.submit([commands]);
         let submitted = performance.now();
-        timer.submitted(resolved);
+        submission.submitted(Some(&mut timer), Some(resolved));
         if let Some((texture, _)) = canvas {
             gpu.queue.present(texture);
         }
@@ -159,6 +162,12 @@ pub async fn run(config: &Config, settings: &Settings) -> Result<()> {
     }
     outcome.frames = total;
     outcome.timer = timer.stats();
+    // A frame the timer did not time is not in its count in flight, so its
+    // scope may still be settling; `gpu_errors` waits for every frame's.
+    let settling = performance.now();
+    while device::scopes_pending() > 0 && performance.now() - settling <= TIMING_TIMEOUT_MS {
+        next_frame().await?;
+    }
     outcome.gpu_errors = device::gpu_errors();
     page::show(&render_pass_cost(
         &env,
@@ -171,8 +180,8 @@ pub async fn run(config: &Config, settings: &Settings) -> Result<()> {
 }
 
 /// Records every frame whose timing has come back, under the cell its passes
-/// are labelled with; frames the device may have rejected are marked first
-/// ([`device::ErrorWatch`]).
+/// are labelled with; a frame the device may have rejected is never among
+/// them ([`device::ErrorWatch`]).
 fn collect(
     errors: &mut device::ErrorWatch,
     timer: &mut SliceTimer<usize>,

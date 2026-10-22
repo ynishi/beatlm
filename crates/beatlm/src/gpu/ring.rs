@@ -19,9 +19,32 @@
 //! completed into [`Collect::Drop`], whatever the map read. The slot is not
 //! freed before its map completes: a buffer with a map pending cannot take
 //! the next lap's copy.
+//!
+//! And the fourth, for a host that learns of a rejection per submission:
+//! **a held slot is collected only once the host has accepted it.**
+//! [`Ring::submit_held`] moves the slot to [`Phase::Held`] and hands out a
+//! [`Verdict`]; [`Ring::settle`] moves the slot to [`Phase::Mapping`] once
+//! the verdict accepts it and to [`Phase::Invalid`] once it rejects it, and a
+//! verdict dropped unsettled rejects. Until then [`collect`] waits on it,
+//! whatever its map did. Each hold has a cell of its own, so a verdict
+//! settled after its slot was invalidated, freed and taken by a later frame
+//! reaches nothing.
+//!
+//! And the fifth: **slots are read in the order they were handed back as
+//! submitted.** [`Ring::ready`] holds back a slot it would read while a slot
+//! submitted before it may still be read: one [`Phase::Held`], or one in
+//! [`Phase::Mapping`] whose map has not completed. A slot that will not be
+//! read, [`Phase::Invalid`] or with a failed map, holds back nothing, and is
+//! dropped whatever is before it. Submission order is the queue's order, so
+//! it is the order the frames ran in; a host that feeds the results to a
+//! model that reads the last one as the latest gets them in that order.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+
+const VERDICT_PENDING: u8 = 0;
+const VERDICT_ACCEPTED: u8 = 1;
+const VERDICT_REJECTED: u8 = 2;
 
 /// Where a slot is in the life of one frame's readback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +60,9 @@ pub(crate) enum Phase {
     /// The host has said the encoder was submitted; the map is requested and
     /// has not been collected.
     Mapping,
+    /// The map is requested, and the host's [`Verdict`] on the submission
+    /// is outstanding; not collected until [`Ring::settle`] moves it on.
+    Held,
     /// The map is requested, and the host has since said the frame's
     /// submission is not to be trusted; the slot is dropped unread once the
     /// map completes.
@@ -73,12 +99,13 @@ pub(crate) enum Collect {
 ///
 /// Only a slot in [`Phase::Mapping`] whose map succeeded is read. An
 /// [`Phase::Invalid`] slot is dropped once its map completes, so that its
-/// buffer is no longer pending when the next lap copies into it. A slot in
-/// any other phase has no map to collect.
+/// buffer is no longer pending when the next lap copies into it. A
+/// [`Phase::Held`] slot waits for its verdict, and a slot in any other phase
+/// has no map to collect.
 pub(crate) fn collect(phase: Phase, map: Map) -> Collect {
     match (phase, map) {
         (Phase::Mapping | Phase::Invalid, Map::Pending)
-        | (Phase::Free | Phase::Recording | Phase::Encoded, _) => Collect::Wait,
+        | (Phase::Free | Phase::Recording | Phase::Encoded | Phase::Held, _) => Collect::Wait,
         (Phase::Mapping, Map::Ok) => Collect::Read,
         (Phase::Invalid, Map::Ok) => Collect::Drop { unmap: true },
         (Phase::Mapping | Phase::Invalid, Map::Failed) => Collect::Drop { unmap: false },
@@ -112,6 +139,42 @@ impl Drop for Ticket {
     }
 }
 
+/// The host's word on one held submission, which [`Ring::submit_held`] hands
+/// out: accepted, or rejected, which is also what dropping it unsettled says.
+///
+/// It holds no borrow of the ring, so the host settles it from wherever it
+/// learns the outcome.
+#[derive(Debug)]
+pub(crate) struct Verdict {
+    /// The hold's cell, shared with the ring; `None` once settled.
+    cell: Option<Arc<AtomicU8>>,
+}
+
+impl Verdict {
+    /// The device ran the submission: the slot may be read.
+    pub(crate) fn accept(mut self) {
+        self.settle(VERDICT_ACCEPTED);
+    }
+
+    /// The device may have rejected the submission: the slot is dropped
+    /// unread.
+    pub(crate) fn reject(mut self) {
+        self.settle(VERDICT_REJECTED);
+    }
+
+    fn settle(&mut self, verdict: u8) {
+        if let Some(cell) = self.cell.take() {
+            cell.store(verdict, Ordering::Release);
+        }
+    }
+}
+
+impl Drop for Verdict {
+    fn drop(&mut self) {
+        self.settle(VERDICT_REJECTED);
+    }
+}
+
 /// A fixed ring of slots handed out in order.
 #[derive(Debug)]
 pub(crate) struct Ring {
@@ -120,6 +183,14 @@ pub(crate) struct Ring {
     /// the slot is [`Phase::Encoded`], and cleared each time a ticket for the
     /// slot is handed out, so one allocation per slot serves every frame.
     abandoned: Vec<Arc<AtomicBool>>,
+    /// The cell of each [`Phase::Held`] slot's [`Verdict`], `None` in every
+    /// other phase. A cell per hold, not per slot, which is what keeps a
+    /// late verdict away from the slot's next frame.
+    verdicts: Vec<Option<Arc<AtomicU8>>>,
+    /// When each slot was last handed back as submitted, as a count of
+    /// submissions; meaningful only from [`Phase::Mapping`] on.
+    submitted: Vec<u64>,
+    submissions: u64,
     cursor: usize,
 }
 
@@ -133,6 +204,9 @@ impl Ring {
             abandoned: (0..depth)
                 .map(|_| Arc::new(AtomicBool::new(false)))
                 .collect(),
+            verdicts: vec![None; depth],
+            submitted: vec![0; depth],
+            submissions: 0,
             cursor: 0,
         }
     }
@@ -196,24 +270,98 @@ impl Ring {
         *phase = Phase::Mapping;
         // Handed back: its drop must not mark the slot abandoned.
         ticket.abandoned = None;
+        self.submissions = self.submissions.saturating_add(1);
+        if let Some(order) = self.submitted.get_mut(slot) {
+            *order = self.submissions;
+        }
         Some(slot)
     }
 
-    /// Moves every slot in [`Phase::Mapping`] to [`Phase::Invalid`] and
-    /// returns how many moved. Slots not yet handed back as submitted are
-    /// left as they are.
+    /// [`submit`](Self::submit), but the slot moves to [`Phase::Held`] and
+    /// is collected only once the returned [`Verdict`] accepts it
+    /// ([`settle`](Self::settle)). `None` where `submit` returns `None`.
+    pub(crate) fn submit_held(&mut self, ticket: Ticket) -> Option<(usize, Verdict)> {
+        let slot = self.submit(ticket)?;
+        let cell = Arc::new(AtomicU8::new(VERDICT_PENDING));
+        if let (Some(phase), Some(held)) = (self.phases.get_mut(slot), self.verdicts.get_mut(slot))
+        {
+            *phase = Phase::Held;
+            *held = Some(Arc::clone(&cell));
+        }
+        Some((slot, Verdict { cell: Some(cell) }))
+    }
+
+    /// Moves every [`Phase::Held`] slot whose verdict has come: to
+    /// [`Phase::Mapping`] when accepted, to [`Phase::Invalid`] when rejected.
+    /// Slots whose verdict is outstanding stay held.
+    pub(crate) fn settle(&mut self) {
+        for (phase, held) in self.phases.iter_mut().zip(&mut self.verdicts) {
+            if *phase != Phase::Held {
+                continue;
+            }
+            let verdict = held
+                .as_ref()
+                .map_or(VERDICT_REJECTED, |cell| cell.load(Ordering::Acquire));
+            *phase = match verdict {
+                VERDICT_ACCEPTED => Phase::Mapping,
+                VERDICT_PENDING => continue,
+                _ => Phase::Invalid,
+            };
+            *held = None;
+        }
+    }
+
+    /// Moves every slot in [`Phase::Mapping`] or [`Phase::Held`] to
+    /// [`Phase::Invalid`] and returns how many moved; a held slot's verdict
+    /// no longer matters. Slots not yet handed back as submitted are left as
+    /// they are.
     pub(crate) fn invalidate(&mut self) -> usize {
         let mut moved = 0;
-        for phase in &mut self.phases {
-            if *phase == Phase::Mapping {
+        for (phase, held) in self.phases.iter_mut().zip(&mut self.verdicts) {
+            if matches!(*phase, Phase::Mapping | Phase::Held) {
                 *phase = Phase::Invalid;
+                *held = None;
                 moved += 1;
             }
         }
         moved
     }
 
+    /// What to do with each slot that can be collected now, oldest
+    /// submission first, given `map(slot)`, where each slot's map stands.
+    ///
+    /// A slot [`collect`] would read is left out while a slot submitted
+    /// before it is [`Phase::Held`] or waits on its map in
+    /// [`Phase::Mapping`] (the module's fifth rule); slots to drop are never
+    /// left out. `map` is asked once per slot past submission. Nothing is
+    /// allocated when nothing can be collected.
+    pub(crate) fn ready(&self, map: impl Fn(usize) -> Map) -> Vec<(usize, Collect)> {
+        let mut ready = Vec::new();
+        // The oldest submission that may still be read and cannot be yet.
+        let mut barrier = u64::MAX;
+        for (i, &phase) in self.phases.iter().enumerate() {
+            if !matches!(phase, Phase::Mapping | Phase::Held | Phase::Invalid) {
+                continue;
+            }
+            let order = self.order(i);
+            match collect(phase, map(i)) {
+                Collect::Wait if phase != Phase::Invalid => barrier = barrier.min(order),
+                Collect::Wait => {}
+                verdict => ready.push((i, verdict)),
+            }
+        }
+        ready.retain(|&(i, verdict)| verdict != Collect::Read || self.order(i) < barrier);
+        ready.sort_by_key(|&(i, _)| self.order(i));
+        ready
+    }
+
+    /// When `slot` was handed back as submitted; 0 for one the ring lacks.
+    fn order(&self, slot: usize) -> u64 {
+        self.submitted.get(slot).copied().unwrap_or(0)
+    }
+
     /// The phase of `slot`, `None` for a slot the ring does not have.
+    #[cfg(test)]
     pub(crate) fn phase(&self, slot: usize) -> Option<Phase> {
         self.phases.get(slot).copied()
     }
@@ -223,9 +371,13 @@ impl Ring {
         if let Some(phase) = self.phases.get_mut(slot) {
             *phase = Phase::Free;
         }
+        if let Some(held) = self.verdicts.get_mut(slot) {
+            *held = None;
+        }
     }
 
     /// The slots currently in `phase`, in slot order.
+    #[cfg(test)]
     pub(crate) fn slots_in(&self, phase: Phase) -> impl Iterator<Item = usize> + '_ {
         self.phases
             .iter()
@@ -429,7 +581,7 @@ mod tests {
         assert_eq!(collect(Phase::Invalid, Map::Pending), Wait);
         assert_eq!(collect(Phase::Invalid, Map::Ok), Drop { unmap: true });
         assert_eq!(collect(Phase::Invalid, Map::Failed), Drop { unmap: false });
-        for phase in [Phase::Free, Phase::Recording, Phase::Encoded] {
+        for phase in [Phase::Free, Phase::Recording, Phase::Encoded, Phase::Held] {
             for map in [Map::Pending, Map::Ok, Map::Failed] {
                 assert_eq!(collect(phase, map), Wait, "{phase:?} {map:?}");
             }
@@ -514,6 +666,225 @@ mod tests {
         assert_eq!(collect(ring.phase(again).unwrap(), Map::Ok), Collect::Read);
         assert_eq!(submit_one(&mut ring), b);
         assert_eq!(ring.phase(b), Some(Phase::Mapping));
+    }
+
+    /// Claims, encodes and submits one frame held for a verdict.
+    fn hold_one(ring: &mut Ring) -> (usize, Verdict) {
+        let slot = ring.claim().unwrap();
+        let ticket = ring.encode(slot).unwrap();
+        ring.submit_held(ticket).unwrap()
+    }
+
+    #[test]
+    fn a_held_slot_waits_for_its_verdict_whatever_its_map_did() {
+        let mut ring = Ring::new(2);
+        let (slot, verdict) = hold_one(&mut ring);
+        assert_eq!(ring.phase(slot), Some(Phase::Held));
+        assert_eq!(ring.in_flight(), 1);
+        ring.settle();
+        assert_eq!(ring.phase(slot), Some(Phase::Held));
+        for map in [Map::Pending, Map::Ok, Map::Failed] {
+            assert_eq!(collect(ring.phase(slot).unwrap(), map), Collect::Wait);
+        }
+        verdict.accept();
+        // Nothing moves until the ring is asked to settle.
+        assert_eq!(ring.phase(slot), Some(Phase::Held));
+        ring.settle();
+        assert_eq!(ring.phase(slot), Some(Phase::Mapping));
+        assert_eq!(collect(ring.phase(slot).unwrap(), Map::Ok), Collect::Read);
+    }
+
+    #[test]
+    fn a_rejected_or_dropped_verdict_invalidates_only_its_own_slot() {
+        let mut ring = Ring::new(3);
+        let (rejected, rejected_verdict) = hold_one(&mut ring);
+        let (dropped, dropped_verdict) = hold_one(&mut ring);
+        let (accepted, accepted_verdict) = hold_one(&mut ring);
+        rejected_verdict.reject();
+        drop(dropped_verdict);
+        accepted_verdict.accept();
+        ring.settle();
+        assert_eq!(ring.phase(rejected), Some(Phase::Invalid));
+        assert_eq!(ring.phase(dropped), Some(Phase::Invalid));
+        assert_eq!(ring.phase(accepted), Some(Phase::Mapping));
+        assert_eq!(
+            collect(ring.phase(rejected).unwrap(), Map::Ok),
+            Collect::Drop { unmap: true }
+        );
+        assert_eq!(
+            collect(ring.phase(accepted).unwrap(), Map::Ok),
+            Collect::Read
+        );
+    }
+
+    /// Every map completed.
+    fn all_ok(_: usize) -> Map {
+        Map::Ok
+    }
+
+    #[test]
+    fn a_later_frame_waits_while_an_earlier_one_is_held() {
+        let mut ring = Ring::new(3);
+        let (earlier, verdict) = hold_one(&mut ring);
+        let (later, later_verdict) = hold_one(&mut ring);
+        later_verdict.accept();
+        ring.settle();
+        assert_eq!(ring.phase(later), Some(Phase::Mapping));
+        // Readable on its own, but the earlier frame may still be read.
+        assert!(ring.ready(all_ok).is_empty());
+        // Across calls too: still nothing until the earlier one settles.
+        ring.settle();
+        assert!(ring.ready(all_ok).is_empty());
+        verdict.accept();
+        ring.settle();
+        assert_eq!(
+            ring.ready(all_ok),
+            vec![(earlier, Collect::Read), (later, Collect::Read)]
+        );
+    }
+
+    #[test]
+    fn a_later_frame_waits_while_an_earlier_map_is_pending() {
+        let mut ring = Ring::new(3);
+        let earlier = submit_one(&mut ring);
+        let later = submit_one(&mut ring);
+        let map =
+            |pending: usize| move |i: usize| if i == pending { Map::Pending } else { Map::Ok };
+        assert!(ring.ready(map(earlier)).is_empty());
+        // The other way round, the earlier frame is read and the later waits
+        // for its own map.
+        assert_eq!(ring.ready(map(later)), vec![(earlier, Collect::Read)]);
+        assert_eq!(
+            ring.ready(all_ok),
+            vec![(earlier, Collect::Read), (later, Collect::Read)]
+        );
+    }
+
+    #[test]
+    fn a_rejected_earlier_frame_holds_back_nothing() {
+        let mut ring = Ring::new(3);
+        let (earlier, verdict) = hold_one(&mut ring);
+        let (later, later_verdict) = hold_one(&mut ring);
+        later_verdict.accept();
+        verdict.reject();
+        ring.settle();
+        assert_eq!(
+            ring.ready(all_ok),
+            vec![
+                (earlier, Collect::Drop { unmap: true }),
+                (later, Collect::Read)
+            ]
+        );
+        // Not even while its map is pending: it will never be read.
+        let pending_earlier = |i: usize| if i == earlier { Map::Pending } else { Map::Ok };
+        assert_eq!(ring.ready(pending_earlier), vec![(later, Collect::Read)]);
+        // Nor once it has been dropped.
+        ring.release(earlier);
+        assert_eq!(ring.ready(all_ok), vec![(later, Collect::Read)]);
+    }
+
+    #[test]
+    fn a_failed_earlier_map_holds_back_nothing() {
+        let mut ring = Ring::new(3);
+        let earlier = submit_one(&mut ring);
+        let later = submit_one(&mut ring);
+        let failed_earlier = |i: usize| if i == earlier { Map::Failed } else { Map::Ok };
+        assert_eq!(
+            ring.ready(failed_earlier),
+            vec![
+                (earlier, Collect::Drop { unmap: false }),
+                (later, Collect::Read)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_frame_held_later_holds_back_only_what_follows_it() {
+        let mut ring = Ring::new(3);
+        let earlier = submit_one(&mut ring);
+        let (held, _verdict) = hold_one(&mut ring);
+        let later = submit_one(&mut ring);
+        assert_eq!(held, 1);
+        assert_eq!(ring.ready(all_ok), vec![(earlier, Collect::Read)]);
+        assert_eq!(ring.phase(later), Some(Phase::Mapping));
+    }
+
+    #[test]
+    fn unheld_frames_are_ready_in_submission_order_as_their_maps_complete() {
+        let mut ring = Ring::new(3);
+        let a = ring.claim().unwrap();
+        let a = ring.encode(a).unwrap();
+        let b = ring.claim().unwrap();
+        let b = ring.encode(b).unwrap();
+        let c = ring.claim().unwrap();
+        let c = ring.encode(c).unwrap();
+        // Handed back out of claim order: the queue runs them as submitted.
+        let c = ring.submit(c).unwrap();
+        let a = ring.submit(a).unwrap();
+        let b = ring.submit(b).unwrap();
+        assert!(ring.ready(|_| Map::Pending).is_empty());
+        assert_eq!(
+            ring.ready(all_ok),
+            vec![(c, Collect::Read), (a, Collect::Read), (b, Collect::Read)]
+        );
+        // Collected one call at a time, as maps complete in queue order.
+        let done = |upto: usize| {
+            move |i: usize| {
+                if i == upto || i == c {
+                    Map::Ok
+                } else {
+                    Map::Pending
+                }
+            }
+        };
+        assert_eq!(ring.ready(done(c)), vec![(c, Collect::Read)]);
+        ring.release(c);
+        assert_eq!(ring.ready(done(a)), vec![(a, Collect::Read)]);
+        ring.release(a);
+        assert_eq!(ring.ready(all_ok), vec![(b, Collect::Read)]);
+    }
+
+    #[test]
+    fn a_held_slot_keeps_the_cursor_as_a_mapping_one_does() {
+        let mut ring = Ring::new(2);
+        let (first, verdict) = hold_one(&mut ring);
+        let _second = submit_one(&mut ring);
+        // The cursor is back at the held slot, which is not free.
+        assert_eq!(ring.claim(), None);
+        verdict.accept();
+        ring.settle();
+        ring.release(first);
+        assert_eq!(ring.claim(), Some(first));
+    }
+
+    #[test]
+    fn invalidation_takes_held_slots_and_a_late_verdict_reaches_nothing() {
+        let mut ring = Ring::new(1);
+        let (slot, late) = hold_one(&mut ring);
+        assert_eq!(ring.invalidate(), 1);
+        assert_eq!(ring.phase(slot), Some(Phase::Invalid));
+        ring.release(slot);
+        // The slot's next frame is held in turn, and the first frame's
+        // verdict, settled now, must neither accept nor reject it.
+        let (again, verdict) = hold_one(&mut ring);
+        assert_eq!(again, slot);
+        late.accept();
+        ring.settle();
+        assert_eq!(ring.phase(again), Some(Phase::Held));
+        verdict.reject();
+        ring.settle();
+        assert_eq!(ring.phase(again), Some(Phase::Invalid));
+    }
+
+    #[test]
+    fn a_held_ticket_from_another_ring_is_refused() {
+        let mut mine = Ring::new(1);
+        let mut theirs = Ring::new(1);
+        let slot = theirs.claim().unwrap();
+        let foreign = theirs.encode(slot).unwrap();
+        assert!(mine.submit_held(foreign).is_none());
+        assert_eq!(mine.slots_in(Phase::Held).count(), 0);
+        assert_eq!(theirs.in_flight(), 0);
     }
 
     #[test]

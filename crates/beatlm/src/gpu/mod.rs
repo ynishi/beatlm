@@ -32,7 +32,9 @@
 //!   slot maps on an earlier frame's timestamps all the same. The host that
 //!   learns of a rejection marks what it submitted, and the timer frees those
 //!   slots unread and counts them failed
-//!   ([`SliceTimer::invalidate_submitted`] has the rule).
+//!   ([`SliceTimer::invalidate_submitted`] has the rule); a host that learns
+//!   the outcome per submission holds each frame until it accepts it
+//!   ([`HeldFrame`] has that rule).
 //!
 //! Memory is the other thing this module realises. [`profile`] is the one place
 //! wgpu's limits and features are read, and becomes the core's
@@ -55,6 +57,6 @@ pub use arenas::{ArenaError, Arenas};
 pub use limits::{LimitsError, required_limits};
 pub use profile::profile;
 pub use timer::{
-    FrameTimestamps, FrameTiming, MAX_SLICES, PassSpan, RING_DEPTH, ResolvedFrame, SliceTimer,
-    TimerError, TimerStats,
+    FrameTimestamps, FrameTiming, HeldFrame, MAX_SLICES, PassSpan, RING_DEPTH, ResolvedFrame,
+    SliceTimer, TimerError, TimerStats,
 };

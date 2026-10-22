@@ -62,7 +62,9 @@
 //! never misread as a later frame's ([`gpu`] has the rule, and why the step is
 //! the host's). A host that learns the device rejected a submission marks
 //! what it submitted before collecting again
-//! ([`gpu::SliceTimer::invalidate_submitted`]).
+//! ([`gpu::SliceTimer::invalidate_submitted`]), or, learning it per
+//! submission, holds each frame until it accepts it
+//! ([`gpu::SliceTimer::submitted_held`]).
 //!
 //! ## Concurrency model
 //!

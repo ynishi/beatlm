@@ -7,7 +7,7 @@
 //! `queue.submit` carrying that encoder, the host hands it to
 //! [`SliceTimer::submitted`], which requests the map. Once the host has polled
 //! the device, [`SliceTimer::collect_ready`] returns every frame whose map has
-//! completed, oldest first.
+//! completed, in the order they were submitted.
 //!
 //! **Only a frame handed back as submitted is read.** The timer cannot see
 //! whether an encoder reached the queue, and a map of a slot whose copy never
@@ -21,7 +21,9 @@
 //! either, and its map succeeds the same way. The host that learns of a
 //! rejection marks what it submitted with
 //! [`SliceTimer::invalidate_submitted`], which has the rule, and a marked frame
-//! is never decoded.
+//! is never decoded. A host that learns the outcome of each submission on its
+//! own, later, hands the frame back with [`SliceTimer::submitted_held`]
+//! instead, and the frame is collected only once its [`HeldFrame`] accepts it.
 //!
 //! Queries are allocated in the order passes are requested, two per pass, so the
 //! queries a frame resolves are always the contiguous prefix it wrote. A frame
@@ -34,7 +36,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use beatlm_core::time::{FrameIndex, Micros};
 use thiserror::Error;
 
-use super::ring::{Collect, Map, Phase, Ring, Ticket, collect};
+use super::ring::{Collect, Map, Ring, Ticket, Verdict};
 
 /// How many frames of timing can be in flight at once.
 ///
@@ -136,8 +138,9 @@ pub struct TimerStats {
     /// Frames whose timing was collected.
     pub frames_collected: u64,
     /// Frames handed back as submitted whose timing was lost: their map
-    /// failed, or the host marked them with
-    /// [`SliceTimer::invalidate_submitted`].
+    /// failed, the host marked them with
+    /// [`SliceTimer::invalidate_submitted`], or their [`HeldFrame`] rejected
+    /// them.
     pub frames_failed: u64,
 }
 
@@ -152,7 +155,6 @@ struct Slot<T> {
     readback: wgpu::Buffer,
     done: Arc<AtomicU8>,
     frame: FrameIndex,
-    order: u64,
     entries: Vec<Entry<T>>,
 }
 
@@ -187,7 +189,6 @@ pub struct SliceTimer<T> {
     ring: Ring,
     period_ns: f32,
     max_slices: u32,
-    sequence: u64,
     stats: TimerStats,
 }
 
@@ -247,7 +248,6 @@ impl<T> SliceTimer<T> {
                 }),
                 done: Arc::new(AtomicU8::new(MAP_PENDING)),
                 frame: FrameIndex::new(0),
-                order: 0,
                 entries: Vec::new(),
             })
             .collect();
@@ -259,7 +259,6 @@ impl<T> SliceTimer<T> {
             ring: Ring::new(RING_DEPTH),
             period_ns,
             max_slices,
-            sequence: 0,
             stats: TimerStats::default(),
         })
     }
@@ -274,10 +273,8 @@ impl<T> SliceTimer<T> {
         let claimed = self.ring.claim();
         match claimed {
             Some(i) => {
-                self.sequence = self.sequence.saturating_add(1);
                 if let Some(slot) = self.slots.get_mut(i) {
                     slot.frame = frame;
-                    slot.order = self.sequence;
                     slot.entries.clear();
                 }
             }
@@ -311,9 +308,35 @@ impl<T> SliceTimer<T> {
         let Some(ticket) = resolved.ticket else {
             return;
         };
-        let Some(i) = self.ring.submit(ticket) else {
-            return;
-        };
+        if let Some(i) = self.ring.submit(ticket) {
+            self.request_map(i);
+        }
+    }
+
+    /// [`submitted`](Self::submitted), for a host that learns later whether
+    /// the device accepted this submission: the frame is held, and collected
+    /// only once the returned [`HeldFrame`] accepts it.
+    ///
+    /// The map is requested now, as `submitted` requests it, so holding costs
+    /// no latency once the verdict comes before the map completes. A held
+    /// frame also holds back the frames handed back after it, which
+    /// [`collect_ready`](Self::collect_ready) returns in submission order;
+    /// a rejected one holds back nothing. Like any frame in flight, a held
+    /// frame keeps its slot, and a later frame that needs the slot goes
+    /// untimed ([`TimerStats::frames_skipped`]).
+    ///
+    /// `None` for a frame that was not timed, or was resolved by another
+    /// timer, which is ignored as `submitted` ignores it: there is nothing to
+    /// hold.
+    #[must_use = "a HeldFrame dropped unsettled rejects its frame, whose timing is then lost"]
+    pub fn submitted_held(&mut self, resolved: ResolvedFrame) -> Option<HeldFrame> {
+        let (i, verdict) = self.ring.submit_held(resolved.ticket?)?;
+        self.request_map(i);
+        Some(HeldFrame { verdict })
+    }
+
+    /// Requests the map of slot `i`, just handed back as submitted.
+    fn request_map(&mut self, i: usize) {
         let Some(slot) = self.slots.get(i) else {
             self.ring.release(i);
             return;
@@ -329,31 +352,31 @@ impl<T> SliceTimer<T> {
             });
     }
 
-    /// Returns the timing of every frame whose map has completed, oldest first,
-    /// and frees their slots.
+    /// Returns the timing of every frame whose map has completed, in the
+    /// order the frames were handed back as submitted, and frees their slots.
     ///
-    /// It never blocks and never polls the device: a frame whose map has not
-    /// completed stays in flight for a later call. See the type documentation
-    /// for how to poll without waiting.
+    /// **Frames come out in submission order, across calls as within one.**
+    /// A frame that could be read waits while a frame handed back before it
+    /// may still be read: one whose map has not completed, or a held frame
+    /// whose [`HeldFrame`] has not settled. A frame that will not be read (its
+    /// map failed, it was marked by
+    /// [`invalidate_submitted`](Self::invalidate_submitted), its `HeldFrame`
+    /// rejected it) holds back nothing. The order is the queue's, so a host
+    /// that reads the last timing it absorbed as the latest frame's is right
+    /// to.
+    ///
+    /// It never blocks and never polls the device: a frame that is not ready,
+    /// or waits on one before it, stays in flight for a later call. See the
+    /// type documentation for how to poll without waiting.
     pub fn collect_ready(&mut self) -> Vec<FrameTiming<T>> {
-        let decide = |i: usize| -> Collect {
-            let map = match self.slots.get(i).map(|s| s.done.load(Ordering::Acquire)) {
-                Some(MAP_OK) => Map::Ok,
-                Some(MAP_FAILED) => Map::Failed,
-                _ => Map::Pending,
-            };
-            self.ring
-                .phase(i)
-                .map_or(Collect::Wait, |phase| collect(phase, map))
+        self.ring.settle();
+        let slots = &self.slots;
+        let map = |i: usize| match slots.get(i).map(|s| s.done.load(Ordering::Acquire)) {
+            Some(MAP_OK) => Map::Ok,
+            Some(MAP_FAILED) => Map::Failed,
+            _ => Map::Pending,
         };
-        let mut ready: Vec<(usize, Collect)> = self
-            .ring
-            .slots_in(Phase::Mapping)
-            .chain(self.ring.slots_in(Phase::Invalid))
-            .map(|i| (i, decide(i)))
-            .filter(|&(_, verdict)| verdict != Collect::Wait)
-            .collect();
-        ready.sort_by_key(|&(i, _)| self.slots.get(i).map_or(0, |s| s.order));
+        let ready = self.ring.ready(map);
 
         let mut out = Vec::with_capacity(ready.len());
         for (i, verdict) in ready {
@@ -407,15 +430,18 @@ impl<T> SliceTimer<T> {
     /// decoded: its slot is freed once its map completes and the frame is
     /// counted in [`TimerStats::frames_failed`], whatever the map read.
     ///
-    /// It marks everything submitted and uncollected, not one frame, because
-    /// that is what a host can know when the error reaches it after the
-    /// submission (a browser's `uncapturederror`, or an error scope popped
-    /// later): the rejected frame is among them, and the valid frames marked
-    /// with it lose their timing, never have it misread. Natively an error
-    /// scope around `finish` and `queue.submit` pops at once, so a host can
-    /// call this straight after `submitted`, which marks the rejected frame
-    /// and the frames still in flight before it. Frames resolved but not yet
-    /// handed back are not marked.
+    /// It marks everything submitted and uncollected, held frames included,
+    /// not one frame, because that is what a host can know when an error
+    /// reaches it without saying which submission raised it (a browser's
+    /// `uncapturederror`): the rejected frame is among them, and the valid
+    /// frames marked with it lose their timing, never have it misread. A host
+    /// that knows which submission an error belongs to (an error scope around
+    /// that submission alone) holds the frame with
+    /// [`submitted_held`](Self::submitted_held) and rejects only it. Natively
+    /// an error scope around `finish` and `queue.submit` pops at once, so a
+    /// host can call this straight after `submitted`, which marks the
+    /// rejected frame and the frames still in flight before it. Frames
+    /// resolved but not yet handed back are not marked.
     pub fn invalidate_submitted(&mut self) -> usize {
         self.ring.invalidate()
     }
@@ -527,7 +553,9 @@ impl<'a, T> FrameTimestamps<'a, T> {
     /// host hands back once `encoder` is submitted.
     ///
     /// Call it after the last timed pass of the frame, then submit the encoder,
-    /// then pass the result to [`SliceTimer::submitted`]. Dropping the result
+    /// then pass the result to [`SliceTimer::submitted`], or, for a host that
+    /// learns later whether the device accepted this one submission, to
+    /// [`SliceTimer::submitted_held`] ([`HeldFrame`] has the rule). Dropping the result
     /// instead — with the encoder, on an error path — frees the slot without
     /// reading it.
     pub fn resolve(mut self, encoder: &mut wgpu::CommandEncoder) -> ResolvedFrame {
@@ -597,7 +625,8 @@ impl<T> Drop for FrameTimestamps<'_, T> {
 ///
 /// What the value proves is that the host submitted, not that the device ran
 /// the commands; a host that learns the device rejected them says so through
-/// [`SliceTimer::invalidate_submitted`].
+/// [`SliceTimer::invalidate_submitted`], or hands the value back with
+/// [`SliceTimer::submitted_held`] and rejects the [`HeldFrame`].
 ///
 /// It holds no borrow of the timer, so the host keeps using the timer while
 /// it holds one; a frame that was not timed returns one that holds nothing.
@@ -613,6 +642,43 @@ impl ResolvedFrame {
     #[must_use]
     pub fn is_timed(&self) -> bool {
         self.ticket.is_some()
+    }
+}
+
+/// A submitted frame the timer will not collect until the host says the
+/// device accepted it: what [`SliceTimer::submitted_held`] returns.
+///
+/// **A held frame is read only once it is accepted.** [`accept`](Self::accept)
+/// lets [`SliceTimer::collect_ready`] read it once its map has completed, in
+/// submission order, so an accepted frame also waits on the frames before it
+/// and an unsettled one holds back those after it;
+/// [`reject`](Self::reject), or dropping the value unsettled, has the
+/// frame dropped unread once its map completes and counted in
+/// [`TimerStats::frames_failed`], as a frame marked by
+/// [`SliceTimer::invalidate_submitted`] is. A drop means "rejected" for the
+/// reason a dropped [`ResolvedFrame`] means "not submitted": a frame whose
+/// outcome the host lost loses its timing and is never misread.
+///
+/// It holds no borrow of the timer, and it is `Send`, so the host settles it
+/// from wherever it learns the outcome, such as the task awaiting an error
+/// scope's promise. A value settled after its frame was marked invalid
+/// changes nothing, not even a later frame in the same slot.
+#[derive(Debug)]
+#[must_use = "accept it once the device accepted the submission, or the frame's timing is dropped"]
+pub struct HeldFrame {
+    verdict: Verdict,
+}
+
+impl HeldFrame {
+    /// The device accepted the submission: the frame may be read.
+    pub fn accept(self) {
+        self.verdict.accept();
+    }
+
+    /// The device may have rejected the submission: the frame is dropped
+    /// unread and counted failed.
+    pub fn reject(self) {
+        self.verdict.reject();
     }
 }
 
@@ -1008,6 +1074,89 @@ mod tests {
         let stats = timer.stats();
         assert_eq!(stats.frames_failed, 1);
         assert_eq!(stats.frames_collected, 2 * RING_DEPTH as u64 + 1);
+        assert_eq!(stats.frames_skipped, 0);
+    }
+
+    /// Needs a real adapter: frames held with their own error scope are read
+    /// only once accepted and in submission order, the one the device
+    /// rejected is dropped unread on its own, and the frames beside it keep
+    /// their timing.
+    #[test]
+    #[ignore = "needs a GPU adapter with TIMESTAMP_QUERY"]
+    fn a_held_frame_is_read_only_once_accepted() {
+        let (device, queue) = timed_device();
+        let mut timer: SliceTimer<u32> = SliceTimer::new(&device, &queue, 2).unwrap();
+        // One frame: the scope around finish and submit only, popped straight
+        // after; `reject` records a dispatch with no pipeline.
+        let held = |timer: &mut SliceTimer<u32>, index: u64, reject: bool| {
+            let mut encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            let mut frame = timer.begin_frame(FrameIndex::new(index));
+            let writes = frame.compute_pass(100 + index as u32).unwrap();
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: None,
+                    timestamp_writes: writes,
+                });
+                if reject {
+                    pass.dispatch_workgroups(1, 1, 1);
+                }
+            }
+            let resolved = frame.resolve(&mut encoder);
+            let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+            queue.submit([encoder.finish()]);
+            let error = scope.pop();
+            let held = timer.submitted_held(resolved).unwrap();
+            (held, pollster::block_on(error))
+        };
+
+        // A lap of the ring, so the rejected frame's slot holds real
+        // timestamps for its map to succeed on.
+        for index in 0..RING_DEPTH as u64 {
+            let (frame, error) = held(&mut timer, index, false);
+            assert!(error.is_none(), "{error:?}");
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            // Mapped but not accepted: not read.
+            assert!(timer.collect_ready().is_empty());
+            frame.accept();
+            let ready = timer.collect_ready();
+            assert_eq!(ready.len(), 1);
+            assert_eq!(ready[0].frame, FrameIndex::new(index));
+        }
+
+        // The rejected frame lands on the first slot again, between two
+        // valid ones; every map completes before any verdict is given.
+        let first = RING_DEPTH as u64;
+        let (before, error) = held(&mut timer, first, false);
+        assert!(error.is_none(), "{error:?}");
+        let (rejected, error) = held(&mut timer, first + 1, true);
+        assert!(error.is_some(), "the command buffer was not rejected");
+        let (after, error) = held(&mut timer, first + 2, false);
+        assert!(error.is_none(), "{error:?}");
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        assert!(timer.collect_ready().is_empty());
+        assert_eq!(timer.in_flight(), 3);
+
+        // The later valid frame, accepted first, waits for the held one
+        // before it: frames come out in submission order.
+        after.accept();
+        assert!(timer.collect_ready().is_empty());
+        assert_eq!(timer.in_flight(), 3);
+        // The rejected frame in the middle holds back nothing: once the
+        // first is accepted, both valid frames come out, oldest first.
+        rejected.reject();
+        before.accept();
+        let ready = timer.collect_ready();
+        assert_eq!(ready.len(), 2, "{ready:?}");
+        assert_eq!(ready[0].frame, FrameIndex::new(first));
+        assert_eq!(ready[0].compute[0].0, 100 + first as u32);
+        assert_eq!(ready[1].frame, FrameIndex::new(first + 2));
+        assert_eq!(ready[1].compute[0].0, 100 + first as u32 + 2);
+        assert_eq!(timer.in_flight(), 0);
+
+        let stats = timer.stats();
+        assert_eq!(stats.frames_failed, 1);
+        assert_eq!(stats.frames_collected, RING_DEPTH as u64 + 2);
         assert_eq!(stats.frames_skipped, 0);
     }
 }

@@ -456,13 +456,12 @@
 //! `timings_skipped` counts it, as natively. `Device::poll` is not
 //! called: in a browser it does nothing. A command buffer the device rejects
 //! is not fatal here, as it is natively, and reaches the page only as an
-//! error counted in `gpu_errors`; before each collection, everything
-//! submitted and uncollected when that count has grown is marked
-//! ([`SliceTimer::invalidate_submitted`](beatlm::gpu::SliceTimer::invalidate_submitted))
-//! and lands in `timings_failed`. `web::device::ErrorWatch` says when the
-//! count is seen in time, and why the specification does not promise it is:
-//! a rejected frame whose error arrives after its map completed, or is never
-//! raised, is still read.
+//! error, counted in `gpu_errors`; the frame is kept from the cost model and
+//! lands in `timings_failed`. Each frame is held until an error scope around
+//! its own submission settles ([`HeldFrame`](beatlm::gpu::HeldFrame)), and
+//! an error outside every frame's scope marks everything in flight
+//! ([`SliceTimer::invalidate_submitted`](beatlm::gpu::SliceTimer::invalidate_submitted)).
+//! `web::device::ErrorWatch` has the rule and what it guarantees and costs.
 //!
 //! # What differs from the native bench, and why
 //!
