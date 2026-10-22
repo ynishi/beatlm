@@ -27,6 +27,12 @@
 //!   [`ResolvedFrame`] that the host hands back after `queue.submit`, and one
 //!   dropped instead — with its encoder, on an error path — frees its slot
 //!   unread: a frame's timing may be lost, never misread.
+//! - **A frame the host marks as rejected is never decoded.** Submitted is
+//!   not accepted: a command buffer the device rejects never runs, and its
+//!   slot maps on an earlier frame's timestamps all the same. The host that
+//!   learns of a rejection marks what it submitted, and the timer frees those
+//!   slots unread and counts them failed
+//!   ([`SliceTimer::invalidate_submitted`] has the rule).
 //!
 //! Memory is the other thing this module realises. [`profile`] is the one place
 //! wgpu's limits and features are read, and becomes the core's

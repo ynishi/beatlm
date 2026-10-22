@@ -60,7 +60,9 @@
 //! that encoder. Only frames handed back that way are read; an encoder dropped
 //! instead of submitted takes its frame's timing with it, which is lost and
 //! never misread as a later frame's ([`gpu`] has the rule, and why the step is
-//! the host's).
+//! the host's). A host that learns the device rejected a submission marks
+//! what it submitted before collecting again
+//! ([`gpu::SliceTimer::invalidate_submitted`]).
 //!
 //! ## Concurrency model
 //!

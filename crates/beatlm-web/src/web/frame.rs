@@ -167,6 +167,8 @@ pub struct Host {
     period: Option<Micros>,
     /// `None` when the device has no timestamp queries.
     timer: Option<SliceTimer<Tag>>,
+    /// What tells the timer the device rejected a frame.
+    errors: device::ErrorWatch,
     /// The scheduler, the cost model and what they counted. Its admission is
     /// the load's rule; on beat, an input is also owed and its slot free.
     step: FrameStep,
@@ -271,6 +273,7 @@ impl Host {
             asked: run.asked,
             period: run.period,
             timer,
+            errors: device::ErrorWatch::from_now(),
             step,
             pacer: Pacer::with_prior(run.frames, prior),
             performance,
@@ -476,9 +479,11 @@ impl Host {
     ///
     /// `Device::poll` is not called: in a browser it does nothing, and the map
     /// callbacks have run from the event loop before this callback began.
+    /// Frames the device may have rejected are marked first
+    /// ([`device::ErrorWatch`]).
     fn read_back(&mut self) {
         let ready = match &mut self.timer {
-            Some(timer) => timer.collect_ready(),
+            Some(timer) => self.errors.collect_ready(timer),
             None => return,
         };
         for timing in ready {

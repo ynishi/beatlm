@@ -88,6 +88,7 @@ pub async fn run(config: &Config, settings: &Settings) -> Result<()> {
     let mut timer: SliceTimer<usize> =
         SliceTimer::new(&gpu.device, &gpu.queue, settings.capacity())
             .context("cannot build the pass-cost timer")?;
+    let mut errors = device::ErrorWatch::from_now();
     let performance = page::window()?
         .performance()
         .context("the page has no performance clock")?;
@@ -103,7 +104,7 @@ pub async fn run(config: &Config, settings: &Settings) -> Result<()> {
     while n < total || timer.in_flight() > 0 {
         next_frame().await?;
         lost()?;
-        collect(&mut timer, &mut measurements);
+        collect(&mut errors, &mut timer, &mut measurements);
         if timer.in_flight() > 0 {
             if performance.now() - submitted_at > TIMING_TIMEOUT_MS {
                 anyhow::bail!("frame {}'s timings did not come back", n.saturating_sub(1));
@@ -170,9 +171,14 @@ pub async fn run(config: &Config, settings: &Settings) -> Result<()> {
 }
 
 /// Records every frame whose timing has come back, under the cell its passes
-/// are labelled with.
-fn collect(timer: &mut SliceTimer<usize>, measurements: &mut Measurements) {
-    for timing in timer.collect_ready() {
+/// are labelled with; frames the device may have rejected are marked first
+/// ([`device::ErrorWatch`]).
+fn collect(
+    errors: &mut device::ErrorWatch,
+    timer: &mut SliceTimer<usize>,
+    measurements: &mut Measurements,
+) {
+    for timing in errors.collect_ready(timer) {
         if let Some(&(index, _)) = timing.compute.first() {
             measurements.record_spans(index, &timing.compute_spans);
         }

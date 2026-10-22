@@ -442,6 +442,10 @@ impl<'g> Engine<'g> {
         // Straight after the submit, with nothing that can fail in between,
         // so a submitted frame always comes back to the timer; after the
         // instant is taken, so the map request is not charged to the submit.
+        // A command buffer the device rejects never gets here: the device
+        // keeps wgpu's default error handler, which panics in `finish` or
+        // `submit` when no error scope is open, so the bench has no rejected
+        // frame to mark (`SliceTimer::invalidate_submitted`).
         self.timer.submitted(resolved);
 
         self.outcome

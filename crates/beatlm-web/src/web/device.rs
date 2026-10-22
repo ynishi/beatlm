@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::{Context, Result, bail};
-use beatlm::gpu::{Arenas, profile, required_limits};
+use beatlm::gpu::{Arenas, FrameTiming, SliceTimer, profile, required_limits};
 use beatlm_core::memory::{DType, MemoryPlan, TensorDesc, TensorId};
 use beatlm_host::workload::{RENDER_HEIGHT, RENDER_WIDTH, TARGET_FORMAT};
 
@@ -34,6 +34,60 @@ static DEVICE_LOST: Mutex<Option<String>> = Mutex::new(None);
 /// How many errors the device has reported so far.
 pub fn gpu_errors() -> u64 {
     GPU_ERRORS.load(Ordering::Relaxed)
+}
+
+/// How the page learns that the device rejected a frame it submitted: from
+/// [`GPU_ERRORS`], with no work in the frame.
+///
+/// A rejected submission reaches the page only as an `uncapturederror`, which
+/// does not say which submission it was. A check of the count just before
+/// [`SliceTimer::collect_ready`] marks whatever the timer was handed since
+/// ([`SliceTimer::invalidate_submitted`]) once the handler has counted the
+/// error; valid frames among it lose their timing, and `gpu_errors` in the
+/// report says why.
+///
+/// That narrows the window in which a rejected frame is read; it does not
+/// close it, because the specification does not order the event before the
+/// map. A submission is validated on the device timeline before the map
+/// requested after it can complete, but the two reach the page by different
+/// paths: the map's success steps are one global task on the WebGPU task
+/// source, while dispatching an uncaptured error issues a task that only then
+/// queues a second one to fire the event ("dispatch error"). The map's task
+/// can therefore run first, and an animation-frame callback in between
+/// collects the frame on the timestamps an earlier lap left in its slot. The
+/// specification also lets a user agent throttle or not fire the event at
+/// all, and an error it never fires is never counted. What the watch does
+/// guarantee is narrower: a rejected frame whose error is counted before the
+/// callback that would collect it is never read. Browsers deliver the error
+/// and the map completion together in practice, which is what the watch
+/// relies on; it is not a proof.
+///
+/// An error scope per frame would say which frame, and collecting a frame
+/// only after its scope's promise settled would close the window, at the
+/// cost of two calls into the browser and a promise to await every frame, and
+/// would take the frame's errors away from the count the report gives.
+pub struct ErrorWatch {
+    seen: u64,
+}
+
+impl ErrorWatch {
+    /// A watch that counts from the errors reported so far.
+    pub fn from_now() -> Self {
+        Self { seen: gpu_errors() }
+    }
+
+    /// [`SliceTimer::collect_ready`], after marking everything `timer` was
+    /// handed as submitted and has not returned when the device has reported
+    /// an error since the last call. The page collects only through this, so
+    /// no collection skips the check.
+    pub fn collect_ready<T>(&mut self, timer: &mut SliceTimer<T>) -> Vec<FrameTiming<T>> {
+        let errors = gpu_errors();
+        if errors != self.seen {
+            self.seen = errors;
+            timer.invalidate_submitted();
+        }
+        timer.collect_ready()
+    }
 }
 
 /// Why the device was lost, or `None` while it has not been.
