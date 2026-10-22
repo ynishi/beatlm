@@ -221,6 +221,48 @@ impl Kernels {
         set: usize,
         timestamp_writes: Option<wgpu::ComputePassTimestampWrites<'_>>,
     ) -> Result<(), CodegenError> {
+        // Both indices are checked before the pass opens, so a bad one records
+        // nothing, not an empty pass carrying the timestamp writes.
+        let (k, group) = self.lookup(kernel, set)?;
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some(&k.label),
+            timestamp_writes,
+        });
+        Self::dispatch(&mut pass, k, group);
+        Ok(())
+    }
+
+    /// Records kernel `kernel`'s dispatch, with the bind group of binding set
+    /// `set`, into `pass`, a compute pass the caller opened and may already
+    /// have recorded other kernels into.
+    ///
+    /// [`encode`](Self::encode) is one pass per kernel, the granularity the
+    /// timer measures and the scheduler plans in; this is the dispatch alone,
+    /// so a host can put several kernels in one pass, as the bench's
+    /// `pass-cost` workload does to measure what a pass costs beside its
+    /// dispatch. Dispatches in one pass run in recording order, each seeing
+    /// the writes of those before it, as across passes.
+    ///
+    /// # Errors
+    ///
+    /// A kernel or set index past those the kernels were built with.
+    pub fn record(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        kernel: usize,
+        set: usize,
+    ) -> Result<(), CodegenError> {
+        let (k, group) = self.lookup(kernel, set)?;
+        Self::dispatch(pass, k, group);
+        Ok(())
+    }
+
+    /// Kernel `kernel` and its bind group for binding set `set`.
+    fn lookup(
+        &self,
+        kernel: usize,
+        set: usize,
+    ) -> Result<(&Kernel, &wgpu::BindGroup), CodegenError> {
         let k = self
             .kernels
             .get(kernel)
@@ -230,14 +272,14 @@ impl Kernels {
             .get(set)
             .and_then(|&g| k.bind_groups.get(g))
             .ok_or(CodegenError::NoSuchSet(set))?;
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some(&k.label),
-            timestamp_writes,
-        });
+        Ok((k, group))
+    }
+
+    /// Records `k`'s dispatch with `group` into `pass`.
+    fn dispatch(pass: &mut wgpu::ComputePass<'_>, k: &Kernel, group: &wgpu::BindGroup) {
         pass.set_pipeline(&k.pipeline);
         pass.set_bind_group(0, group, &[]);
         let [x, y, z] = k.workgroups;
         pass.dispatch_workgroups(x, y, z);
-        Ok(())
     }
 }

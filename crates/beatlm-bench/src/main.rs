@@ -473,6 +473,131 @@
 //! budget held of it, 10 to 12 ms here, rounded up; `k` one less than that is
 //! the edge, and one more frame is the slack the default keeps.
 //!
+//! # The `pass-cost` workload
+//!
+//! `--workload pass-cost` measures what a compute pass costs apart from the
+//! work it dispatches, with and without its timestamp writes, because a slice
+//! is one pass (`beatlm::gpu::SliceTimer`) and the depth model is about 155
+//! of them per job. It schedules nothing and promises nothing: each frame
+//! encodes `P` dispatches in one of four variants (`--variants`; A
+//! `per-pass`, what the engine does, B `ends`, C `one-pass`, D `every:<k>`)
+//! for each `P` of `--passes`, and reads their span on the GPU and their
+//! encode and submit time on the CPU. `pass_cost.rs` owns the design: what
+//! each variant isolates, the order of the frames, what is derived and from
+//! what, and why `--render` is off by default. The browser host runs the same
+//! file (`beatlm-web`, "What a pass costs").
+//!
+//! **Natively, trivial kernels.** Apple M1 Pro, Metal, wgpu 30.0.1, release
+//! build, 2026-10-22, `--frames 250` (timed frames per cell), `--render off`,
+//! one dispatch of one workgroup, one run per table, no run discarded, no
+//! frame dropped or left untimed. Spans and `between_us` are medians, in
+//! microseconds; the derived columns are the report's, microseconds per pass.
+//! `--passes 1,8,32,128 --variants per-pass,ends,one-pass`:
+//!
+//! | `P` | span A / B / C | A `per_pass_us` | C `per_dispatch_us` | A `over_one_pass_us` | A `over_ends_us` | A `between_us` |
+//! |---|---|---|---|---|---|---|
+//! | 1 | 16.4 / 16.3 / 16.3 | | | | | 0.0 |
+//! | 8 | 282.7 / 285.7 / 62.1 | 38.05 | 6.54 | 31.52 | -0.43 | 177.7 |
+//! | 32 | 1134.2 / 1079.8 / 197.8 | 36.06 | 5.85 | 30.21 | 1.75 | 757.2 |
+//! | 128 | 4704.8 / 4723.5 / 728.2 | 36.92 | 5.61 | 31.31 | -0.15 | 3242.6 |
+//!
+//! `--passes 1,32,128 --variants per-pass,every:8,every:32,one-pass`, at
+//! `P` = 128: `per_pass_us` 34.49 (A), 37.34 (`every:8`) and 37.13
+//! (`every:32`), `over_one_pass_us` 28.95, 31.80 and 31.58. An earlier run of
+//! the first table's cells, whose driver did not yet wait for each frame
+//! (the frames all fit the period and none was skipped, so they ran the same
+//! work), had 34.69, 5.52, 29.17 and 0.73 at 128.
+//!
+//! On the CPU, at `P` = 128, encoding took 5 097 us at the median as 128
+//! passes (A) and 295 us as one pass of 128 dispatches (C), `encode_per_pass_us`
+//! 38.60 against `encode_per_dispatch_us` 1.70; `queue.submit` took 735 and
+//! 82 us.
+//!
+//! **Natively, the depth model's kernels.** The same machine and day,
+//! `--kernels depth` at 112 pixels, fused, unsplit, the model's first `P`
+//! kernels on one slot, `--frames 120 --passes 1,8,32,128 --variants
+//! per-pass,ends,one-pass`, two runs; at `P` = 128 a frame took 34 to 50 ms
+//! and gave up the periods it overran (437 and 565 dropped), and none was
+//! skipped:
+//!
+//! | run, `P` | span A / B / C | A `over_one_pass_us` | B `over_one_pass_us` | A `between_us` |
+//! |---|---|---|---|---|
+//! | 1, 8 | 1202.6 / 1182.6 / 1003.7 | 28.41 | 25.56 | 151.2 |
+//! | 1, 32 | 9894.5 / 8627.3 / 6849.8 | 98.22 | 57.34 | 950.0 |
+//! | 1, 128 | 42846.5 / 40895.1 / 33671.0 | 72.25 | 56.88 | 4364.8 |
+//! | 2, 8 | 1717.6 / 1713.8 / 1352.5 | 52.16 | 51.61 | 163.5 |
+//! | 2, 32 | 11171.2 / 10817.0 / 9657.0 | 48.85 | 37.42 | 1012.9 |
+//! | 2, 128 | 49538.3 / 47781.9 / 43306.9 | 49.07 | 35.24 | 4597.5 |
+//!
+//! Encoding the 128 kernels took 5 559 us as passes and 1 302 us as one pass
+//! (run 2).
+//!
+//! What the numbers say, and what they do not:
+//!
+//! - **On Metal a pass costs about 30 us more than a dispatch inside one
+//!   pass** with trivial kernels (`over_one_pass_us` 29 to 32 at every `P`
+//!   from 8 in both tables), and one more dispatch inside the pass about
+//!   5.6 us. The figure is the same at 8, 32 and 128 passes, so it is a cost
+//!   per pass, not one that grows with the frame.
+//! - **The timestamp writes are not the cost.** A over B, which differ only
+//!   in the timestamps of every pass but the ends, was -0.43 to 1.75 us per
+//!   pass, and timing every 8th or 32nd pass (D) measured what timing every
+//!   pass did.
+//! - **Most of a pass's cost is between passes**, where no pass's timestamps
+//!   see it: at 128 trivial passes 3 243 of the 4 705 us span, about 25 us
+//!   per gap. A sum of per-pass durations leaves it out.
+//! - **With real kernels the cost per pass was larger and noisier**: 128 of
+//!   the depth model's kernels took 6.2 and 9.2 ms more as passes than in one
+//!   pass (49 and 72 us per extra pass, 14% and 27% of the one-pass span).
+//!   The same cell's span differed by up to 41% between the two runs, and a
+//!   frame this long runs a GPU that idled before it, so only the comparison
+//!   within a run is evidence; why real kernels pay more per pass than
+//!   trivial ones was not established.
+//! - **On the CPU a pass costs tens of microseconds to encode** natively
+//!   (36 to 39 us at 128, against under 2 us per dispatch inside one pass;
+//!   41 us with the depth model's kernels).
+//! - At these per-pass figures a job of 155 passes would carry 4.5 to 11 ms
+//!   of GPU time and about 6 ms of encoding for its pass boundaries alone;
+//!   that is arithmetic on the figures above, not a measurement of a job.
+//!
+//! **Beside Chrome.** The same workload in Chrome 154 (WebGPU) on the same
+//! machine and day, with a 120 Hz display; `beatlm-web`'s crate
+//! documentation ("What Chrome measured") has its tables, URLs and limits.
+//! Trivial kernels at `P` = 128, us per pass, one run each:
+//!
+//! | Figure | Native (Metal) | Chrome |
+//! |---|---|---|
+//! | a pass boundary over a dispatch in one pass, no per-pass timestamps (B `over_one_pass_us`) | 31.46 | 0.52 |
+//! | a timestamp pair on every pass over the ends only (A `over_ends_us`) | -0.15 | 22.71 |
+//! | timestamps on every 8th pass, over one pass (D `over_one_pass_us`) | 31.80 | 4.64 |
+//! | one more dispatch inside one pass (C `per_dispatch_us`) | 5.61 | 5.16 |
+//!
+//! With the depth model's first 128 kernels at 112 pixels, timestamps on
+//! every pass added about 2.4 ms (18.58 us per pass) to a 24 to 27 ms span
+//! in Chrome, and one pass for all was not faster than separate passes
+//! without them (25.4 against 24.2 ms, inside the noise). Natively, in the
+//! two runs above, separate passes without per-pass timestamps cost 7.2 and
+//! 4.5 ms more than one pass there, and the timestamps another 2.0 and 1.8 ms
+//! (`over_ends_us` 15.37 and 13.83).
+//!
+//! - **The costs sit in opposite places.** With trivial kernels, natively a
+//!   separate pass costs about 30 us and its timestamps nothing; in Chrome a
+//!   separate pass costs about nothing and a pair of timestamps about 23 us
+//!   (19 with the depth model's kernels). With real kernels natively the
+//!   timestamps cost something too, though less than the passes. The
+//!   workload does not say why either cost is where it is.
+//! - **For #49, fewer passes is not the main lever in the browser.** There
+//!   the per-pass cost is the timestamps, at most about a tenth of a job's
+//!   GPU time on these figures, so pass overhead does not explain why a
+//!   job's GPU time in Chrome barely shrinks with the model's side; that is
+//!   a reading of one run per configuration. The cheaper lever there, if
+//!   wanted, is fewer timestamp pairs (per frame, or every `k` slices), which
+//!   costs the per-slice measurements the cost model plans with. Natively,
+//!   merging kernels into fewer passes is what would save time.
+//! - **Neither host was the slower one by these runs**: Chrome's 128 depth
+//!   kernels in one pass took 25.4 ms, the native runs 33.7 and 43.3 ms; one
+//!   run each, in different sessions, which ranks nothing.
+//!
 //! # Running it
 //!
 //! ```text
@@ -485,7 +610,15 @@
 //! cargo run --release -p beatlm-bench -- --workload net --frames 1 --dump-wgsl target/wgsl
 //! cargo run --release -p beatlm-bench -- --workload depth --frames 600 --runs 2
 //! cargo run --release -p beatlm-bench -- --workload depth --size 182 --latency 2 --frames 600 --runs 2
+//! cargo run --release -p beatlm-bench -- --workload pass-cost --frames 250 --variants per-pass,ends,one-pass
+//! cargo run --release -p beatlm-bench -- --workload pass-cost --frames 250 --passes 1,32,128 --variants per-pass,every:8,every:32,one-pass
+//! cargo run --release -p beatlm-bench -- --workload pass-cost --kernels depth --frames 120 --variants per-pass,ends,one-pass
 //! ```
+//!
+//! A `pass-cost` run encodes `--frames` timed frames of each cell, plus one
+//! untimed round, at most one frame per 60 Hz period: about 50 seconds for
+//! the first two lines above, and about 45 for the third, whose frames of 128
+//! kernels overrun the period.
 //!
 //! The `depth` workload reads the weights `just setup-depth-anything` fetches;
 //! from a worktree, set `BEATLM_MODELS_DIR` to the main checkout's `models/`.
@@ -546,6 +679,9 @@
 //! | `memory_plan_*` | `net` and `depth` only: tensors, input/output slots, arenas and their bytes, the plan's total, the most bytes live at one kernel, and the bytes with no sharing |
 //! | `wgpu_counters_populated` | `net` and `depth` only: whether the backend sets wgpu's buffer counter; when false the loop's buffer creation is unmeasured and the report says so |
 //! | `loop_*` | `net` and `depth` only: a counter's reading before the first frame and after the last, and the change; for buffers also the least and most seen at a frame boundary |
+//! | `pass_cost_config` | `pass-cost` only, after `run`, `adapter`, `backend`, `config` (`workload=pass-cost`, `frames`, `render_iters`, and `size` and `fusion` with `--kernels depth`), `frames`, `frames_dropped` and the `timings_*` lines, which are the only other lines its report has: the timed frames per cell, the cells, their order, and the settings |
+//! | `pass_cost[variant,P]` | `pass-cost` only: the cell's timed frames and span, and the per-pass figures derived from it; `pass_cost.rs` defines each |
+//! | `pass_cost_cpu[variant,P]` | `pass-cost` only: the cell's encode and submit times and their per-pass figures |
 //!
 //! The process exits non-zero when `latency_violations` is not zero in any run.
 //! A missed deadline is reported but does not fail the run: it is the documented
@@ -681,6 +817,8 @@ mod harness;
 mod load;
 mod net;
 mod pace;
+mod pass_bench;
+mod pass_cost;
 #[cfg(test)]
 mod reference;
 mod report;
@@ -724,8 +862,33 @@ fn real_main() -> Result<ExitCode> {
     }
 
     let gpu = device::Gpu::open()?;
+    let env = report::Environment {
+        adapter: gpu.info.name.clone(),
+        backend: gpu.info.backend.to_string(),
+    };
+    if args.workload == args::WorkloadKind::PassCost {
+        eprintln!(
+            "running pass-cost x {} runs, {} frames per cell, {}, on {} ({})",
+            args.runs,
+            args.frames,
+            args.pass_cost.describe(),
+            gpu.info.name,
+            gpu.info.backend
+        );
+        for number in 1..=args.runs {
+            let outcome = pass_bench::run(&gpu, &args)?;
+            if number > 1 {
+                println!();
+            }
+            print!(
+                "{}",
+                report::render_pass_cost(&env, &args, number, &outcome)
+            );
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
     let workload = match args.workload {
-        args::WorkloadKind::Synthetic => String::from("synthetic"),
+        args::WorkloadKind::Synthetic | args::WorkloadKind::PassCost => String::from("synthetic"),
         args::WorkloadKind::Net | args::WorkloadKind::Depth => {
             let split = args
                 .max_dispatch_us
@@ -754,10 +917,6 @@ fn real_main() -> Result<ExitCode> {
         gpu.info.name,
         gpu.info.backend
     );
-    let env = report::Environment {
-        adapter: gpu.info.name.clone(),
-        backend: gpu.info.backend.to_string(),
-    };
     let mut violations = 0;
     for number in 1..=args.runs {
         // Each run builds its own scheduler, cost model and timer on the same

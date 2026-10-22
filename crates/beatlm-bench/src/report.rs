@@ -6,6 +6,7 @@ use std::fmt::Write as _;
 use crate::args::{Args, WorkloadKind, fusion_name};
 use crate::engine::{NetReport, Outcome};
 use crate::pace::FRAME_PERIOD;
+use crate::pass_bench::PassOutcome;
 use crate::stats::{frame_ratio_value, frame_scale_value, histogram, summarize};
 
 /// Where the run happened.
@@ -22,6 +23,54 @@ pub fn render(env: &Environment, args: &Args, run: u32, outcome: &Outcome) -> St
     // Writing to a String cannot fail.
     let _ = write_report(&mut out, env, args, run, outcome);
     out
+}
+
+/// Renders run number `run` (counting from 1) of `args.runs` of the
+/// `pass-cost` workload: the lines every report starts with, then the
+/// workload's own (`pass_cost.rs` defines them).
+pub fn render_pass_cost(env: &Environment, args: &Args, run: u32, outcome: &PassOutcome) -> String {
+    let mut out = String::new();
+    // Writing to a String cannot fail.
+    let _ = write_pass_cost(&mut out, env, args, run, outcome);
+    out
+}
+
+fn write_pass_cost(
+    out: &mut String,
+    env: &Environment,
+    args: &Args,
+    run: u32,
+    outcome: &PassOutcome,
+) -> std::fmt::Result {
+    writeln!(out, "run: {run}/{}", args.runs)?;
+    writeln!(out, "adapter: {}", env.adapter)?;
+    writeln!(out, "backend: {}", env.backend)?;
+    write!(
+        out,
+        "config: workload={} runs={} frames={} render_iters={}",
+        args.workload.name(),
+        args.runs,
+        args.frames,
+        args.render_iters
+    )?;
+    if matches!(
+        args.pass_cost.dispatches,
+        crate::pass_cost::Dispatches::Depth { .. }
+    ) {
+        write!(
+            out,
+            " size={} fusion={}",
+            args.size,
+            fusion_name(args.fusion)
+        )?;
+    }
+    writeln!(out)?;
+    writeln!(out, "frames: {}", outcome.frames)?;
+    writeln!(out, "frames_dropped: {}", outcome.dropped)?;
+    writeln!(out, "timings_collected: {}", outcome.timer.frames_collected)?;
+    writeln!(out, "timings_skipped: {}", outcome.timer.frames_skipped)?;
+    writeln!(out, "timings_failed: {}", outcome.timer.frames_failed)?;
+    outcome.measurements.write_report(out, &args.pass_cost)
 }
 
 fn write_report(

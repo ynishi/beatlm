@@ -304,13 +304,40 @@ impl Net {
         slice: SliceId,
         timestamp_writes: Option<wgpu::ComputePassTimestampWrites<'_>>,
     ) -> Result<()> {
+        let (kernel, set) = self.indices(slot, slice)?;
+        self.kernels
+            .encode(encoder, kernel, set, timestamp_writes)
+            .with_context(|| format!("slice {} of the network", slice.get()))
+    }
+
+    /// The kernel and binding set indices of `slice` on `slot`.
+    fn indices(&self, slot: u32, slice: SliceId) -> Result<(usize, usize)> {
         if slot >= self.slots {
             bail!("slot {slot} of a network with {} slots", self.slots);
         }
         let kernel = usize::try_from(slice.get()).unwrap_or(usize::MAX);
         let set = usize::try_from(slot).unwrap_or(usize::MAX);
+        Ok((kernel, set))
+    }
+
+    /// Records the dispatch of the kernel `slice` names into `pass`, a compute
+    /// pass the caller opened, on `slot` as [`encode`](Self::encode) does.
+    /// The loop never does this: a slice is one pass. The `pass-cost`
+    /// workload (`pass_cost.rs`) does, to put several kernels in one pass.
+    ///
+    /// # Errors
+    ///
+    /// A slot the network does not have, or a slice that is not one of its
+    /// kernels.
+    pub fn record(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        slot: u32,
+        slice: SliceId,
+    ) -> Result<()> {
+        let (kernel, set) = self.indices(slot, slice)?;
         self.kernels
-            .encode(encoder, kernel, set, timestamp_writes)
+            .record(pass, kernel, set)
             .with_context(|| format!("slice {} of the network", slice.get()))
     }
 }
