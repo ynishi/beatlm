@@ -99,7 +99,7 @@
 //! (`render_fs` in `beatlm-host`'s `shaders.wgsl`; the depth model's display,
 //! `web/display.wgsl`, carries the same loop before it draws the image and the
 //! depth), `render_iters` times per pixel; the budget's prior for the render
-//! at the default of 50 is the bench's [`crate::render_cost::RENDER_PRIOR`].
+//! at the default of 50 is the bench's [`presets::RENDER_PRIOR`].
 //! It exists to test H2 of #53: that the render pass in the same frame
 //! contends with the depth slices on the GPU, so slices measure slower in the
 //! loop than in calibration (`tail_loop_over_calibration`). Run at a minimal
@@ -123,7 +123,7 @@
 //! delivery is not comparable with a default run's on that account alone; read
 //! the `gpu_render_alone_us` and `gpu_render_with_slices_us` lines beside it.
 //! The forecast follows the render only as it is measured: until the first
-//! measurement it is [`crate::render_cost::RENDER_PRIOR`], the default's, at
+//! measurement it is [`presets::RENDER_PRIOR`], the default's, at
 //! any value, and without `timestamp_query` the render is never measured, so
 //! the budget stays at the default's and the value changes the render's cost
 //! but not the slices' share of the frame.
@@ -143,14 +143,14 @@
 //!
 //! | Value | The core's estimator |
 //! |---|---|
-//! | `quantile` | `WindowedQuantile`, quantile 0.9, window [`DEFAULT_WINDOW`] (32): the core's default |
-//! | `quantile:<q>` |`WindowedQuantile`, window [`DEFAULT_WINDOW`] (32), quantile `q`, a number in `(0, 1]` |
+//! | `quantile` | [`presets::quantile`]: `WindowedQuantile`, quantile [`presets::QUANTILE`] (0.9), window [`presets::WINDOW`] (32): the core's default |
+//! | `quantile:<q>` |`WindowedQuantile`, window [`presets::WINDOW`] (32), quantile `q`, a number in `(0, 1]` |
 //! | `quantile:<q>:<window>` | the same with a window of `window` measurements, `1..=`[`MAX_WINDOW`] |
-//! | `mean-sigmas` | `MeanPlusSigmas`, `alpha` [`COST_ALPHA`] (0.2), `sigmas` [`COST_SIGMAS`] (2) |
+//! | `mean-sigmas` | [`presets::mean_sigmas`]: `MeanPlusSigmas`, `alpha` [`presets::ALPHA`] (0.2), `sigmas` [`presets::SIGMAS`] (2) |
 //! | `mean-sigmas:<alpha>:<sigmas>` | the same with `alpha` in `(0, 1]` and `sigmas` not negative |
-//! | `capped` | `CappedDeviation`, `alpha` 0.2, `sigmas` 2, `cap` [`COST_CAP`] (0.5) |
+//! | `capped` | [`presets::capped`]: `CappedDeviation`, `alpha` [`presets::ALPHA`] (0.2), `sigmas` [`presets::SIGMAS`] (2), `cap` [`presets::CAP`] (0.5) |
 //! | `capped:<alpha>:<sigmas>:<cap>` | the same with `cap` not negative |
-//! | `frame-scaled` | `FrameScaled`, `window` [`DEFAULT_WINDOW`] (32), `frame_window` [`DEFAULT_FRAME_WINDOW`] (64), `frame_quantile` [`DEFAULT_FRAME_QUANTILE`] (0.9) |
+//! | `frame-scaled` | [`presets::frame_scaled`]: `FrameScaled`, `window` [`presets::WINDOW`] (32), `frame_window` [`presets::FRAME_WINDOW`] (64), `frame_quantile` [`presets::FRAME_QUANTILE`] (0.9) |
 //! | `frame-scaled:<q>` | the same with `frame_quantile` `q`, a number in `(0, 1]` |
 //! | `frame-scaled:<q>:<frame_window>` | the same with a frame window of `frame_window` frames, `1..=`[`MAX_WINDOW`] |
 //! | `frame-scaled:<q>:<frame_window>:<window>` | the same with a slice window of `window` measurements, `1..=`[`MAX_WINDOW`] |
@@ -292,6 +292,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use beatlm_core::cost::{CostModel, Estimator, MAX_WINDOW};
 use beatlm_core::time::Micros;
 use beatlm_host::pass_cost::{self, DEFAULT_DEPTH_SIDE, Dispatches};
+use beatlm_host::presets::{self, FRAME_WINDOW, WINDOW};
 use beatlm_host::workload::{DEFAULT_RENDER_ITERS, RenderOrder};
 
 use crate::depth::{MAX_SIDE, NATIVE_DEFAULT_LATENCY, NATIVE_DEFAULT_SIDE, PATCH};
@@ -317,37 +318,10 @@ pub const DEFAULT_LATENCY: u32 = 2;
 /// for it, which the page does not change.
 pub const SLICES: u32 = 4;
 
-/// The margin kept free in each frame's budget, in microseconds: the bench's
-/// default, which the page does not change.
-pub const MARGIN_US: u64 = 2_000;
-
 /// The longest promised latency `latency_ms` accepts, in milliseconds: a
 /// minute, far past any job here, so a typing slip is refused rather than
 /// planned.
 const MAX_LATENCY_MS: f64 = 60_000.0;
-
-/// The window `estimator=quantile` and `quantile:<q>` read: the core's
-/// default, and the bench's `COST_WINDOW`.
-pub const DEFAULT_WINDOW: usize = 32;
-
-/// The weight of a new measurement of `estimator=mean-sigmas` and `capped`:
-/// the value the core's estimators were compared with, and the bench's.
-pub const COST_ALPHA: f64 = 0.2;
-
-/// The standard deviations `estimator=mean-sigmas` and `capped` add to the
-/// mean.
-pub const COST_SIGMAS: f64 = 2.0;
-
-/// The most `estimator=capped` pads the mean by, as a multiple of it.
-pub const COST_CAP: f64 = 0.5;
-
-/// The frames `estimator=frame-scaled` reads its frame scale from: the
-/// bench's `COST_FRAME_WINDOW`.
-pub const DEFAULT_FRAME_WINDOW: usize = 64;
-
-/// The quantile of the frame ratios `estimator=frame-scaled` reads: the
-/// bench's, the default estimator's quantile.
-pub const DEFAULT_FRAME_QUANTILE: f64 = 0.9;
 
 /// The parameters the query string accepts, as the error for an unknown one
 /// lists them.
@@ -739,11 +713,11 @@ pub fn estimator(value: &str) -> Result<Estimator> {
     let args: Vec<&str> = parts.collect();
     let float = |text: &str| number::<f64>("estimator", text);
     let chosen = match (kind, args.as_slice()) {
-        ("quantile", []) => bare_quantile(),
-        ("mean-sigmas", []) => bare_mean_sigmas(),
-        ("capped", []) => bare_capped(),
+        ("quantile", []) => presets::quantile(),
+        ("mean-sigmas", []) => presets::mean_sigmas(),
+        ("capped", []) => presets::capped(),
         ("quantile", [q]) => Estimator::WindowedQuantile {
-            window: DEFAULT_WINDOW,
+            window: WINDOW,
             quantile: float(q)?,
         },
         ("quantile", [q, window]) => Estimator::WindowedQuantile {
@@ -759,16 +733,16 @@ pub fn estimator(value: &str) -> Result<Estimator> {
             sigmas: float(sigmas)?,
             cap: float(cap)?,
         },
-        ("frame-scaled", []) => bare_frame_scaled(),
+        ("frame-scaled", []) => presets::frame_scaled(),
         ("frame-scaled", [q]) => Estimator::FrameScaled {
             frame_quantile: float(q)?,
-            frame_window: DEFAULT_FRAME_WINDOW,
-            window: DEFAULT_WINDOW,
+            frame_window: FRAME_WINDOW,
+            window: WINDOW,
         },
         ("frame-scaled", [q, frame_window]) => Estimator::FrameScaled {
             frame_quantile: float(q)?,
             frame_window: number("estimator", frame_window)?,
-            window: DEFAULT_WINDOW,
+            window: WINDOW,
         },
         ("frame-scaled", [q, frame_window, window]) => Estimator::FrameScaled {
             frame_quantile: float(q)?,
@@ -804,56 +778,22 @@ pub fn estimator(value: &str) -> Result<Estimator> {
     Ok(chosen)
 }
 
-/// The estimator the bare `quantile` names: the core's default, which is the
-/// bench's `--estimator quantile` (quantile 0.9, window [`DEFAULT_WINDOW`]).
-const fn bare_quantile() -> Estimator {
-    Estimator::WindowedQuantile {
-        window: DEFAULT_WINDOW,
-        quantile: 0.9,
-    }
-}
-
-/// The estimator the bare `mean-sigmas` names, the bench's.
-const fn bare_mean_sigmas() -> Estimator {
-    Estimator::MeanPlusSigmas {
-        alpha: COST_ALPHA,
-        sigmas: COST_SIGMAS,
-    }
-}
-
-/// The estimator the bare `capped` names, the bench's.
-const fn bare_capped() -> Estimator {
-    Estimator::CappedDeviation {
-        alpha: COST_ALPHA,
-        sigmas: COST_SIGMAS,
-        cap: COST_CAP,
-    }
-}
-
-/// The estimator the bare `frame-scaled` names, the bench's.
-const fn bare_frame_scaled() -> Estimator {
-    Estimator::FrameScaled {
-        window: DEFAULT_WINDOW,
-        frame_window: DEFAULT_FRAME_WINDOW,
-        frame_quantile: DEFAULT_FRAME_QUANTILE,
-    }
-}
-
 /// `estimator` in a form [`estimator`] reads back: the bench's bare name when
-/// the estimator is exactly what that name means, else the name with every
-/// parameter written. What the report's `config:` line prints.
+/// the estimator is exactly what that name means (its preset in
+/// [`presets`]), else the name with every parameter written. What the
+/// report's `config:` line prints.
 #[must_use]
 pub fn estimator_name(estimator: Estimator) -> String {
-    if estimator == bare_quantile() {
+    if estimator == presets::quantile() {
         return "quantile".to_owned();
     }
-    if estimator == bare_mean_sigmas() {
+    if estimator == presets::mean_sigmas() {
         return "mean-sigmas".to_owned();
     }
-    if estimator == bare_capped() {
+    if estimator == presets::capped() {
         return "capped".to_owned();
     }
-    if estimator == bare_frame_scaled() {
+    if estimator == presets::frame_scaled() {
         return "frame-scaled".to_owned();
     }
     match estimator {

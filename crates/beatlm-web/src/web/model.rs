@@ -19,14 +19,14 @@ use beatlm::load::depth_anything_v2::{Config, inventory};
 use beatlm_core::cost::{CostModel, Estimator, SliceId};
 use beatlm_core::kernel::Program;
 use beatlm_core::time::{FrameIndex, Micros};
+use beatlm_host::presets::{CALIBRATION_FRAMES, SLICE_PRIOR};
 use beatlm_host::slots::{Net, Numbers};
 use beatlm_host::workload::Workload;
 
 use super::device::{self, Gpu};
 use super::fetch;
-use super::frame::SLICE_PRIOR;
 use super::wait::{self, callback, next_frame};
-use crate::depth::{self, CALIBRATION_FRAMES, MAX_DISPATCH_US, WholeRuns};
+use crate::depth::{self, MAX_DISPATCH_US, WholeRuns};
 use crate::pace::ms_to_us;
 use crate::report::Check;
 

@@ -34,14 +34,7 @@ use std::collections::VecDeque;
 
 use beatlm_core::budget::Budget;
 use beatlm_core::time::Micros;
-
-/// What the render pass is assumed to cost until it has been measured: the
-/// bench's.
-pub const RENDER_PRIOR: Micros = Micros::new(2_000);
-
-/// How many recent render measurements the forecast takes its median over:
-/// the bench's, the window of the cost model's default estimate.
-pub const RENDER_WINDOW: usize = 32;
+use beatlm_host::presets::{RENDER_PRIOR, RENDER_WINDOW};
 
 /// The render's measurements, as the budget reads them.
 #[derive(Debug, Clone)]

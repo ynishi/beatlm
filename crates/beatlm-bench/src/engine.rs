@@ -24,6 +24,7 @@ use beatlm_core::schedule::{FramePlan, JobId, Scheduler};
 use beatlm_core::sync::{MissPolicy, SyncPolicy};
 use beatlm_core::time::{FrameIndex, FrameInfo, Micros, TimePoint};
 use beatlm_host::pass_overlap;
+use beatlm_host::presets::{self, RENDER_PRIOR, RENDER_WINDOW, SLICE_PRIOR, STARTUP_FRAMES};
 use beatlm_host::slots;
 use beatlm_host::stats::frame_ratio;
 use beatlm_host::workload::{
@@ -39,38 +40,9 @@ use crate::device::Gpu;
 use crate::net::{self, Net, Numbers};
 use crate::pace::{FRAME_PERIOD, Tick, micros_between};
 
-/// What a slice is assumed to cost until it has been measured.
-const SLICE_PRIOR: Micros = Micros::new(2_000);
-/// What the render pass is assumed to cost until it has been measured.
-const RENDER_PRIOR: Micros = Micros::new(2_000);
-/// How many recent render measurements the budget forecast takes its median
-/// over: the cost model's window, so the forecast and the estimates it is
-/// compared with look back as far.
-const RENDER_WINDOW: usize = COST_WINDOW;
-/// Weight of a new measurement in a slice's exponentially weighted mean.
-const COST_ALPHA: f64 = 0.2;
-/// Standard deviations added to a slice's mean when budgeting it.
-const COST_SIGMAS: f64 = 2.0;
-/// Measurements per slice the windowed quantile reads, about half a second of
-/// frames at 60 Hz.
-pub const COST_WINDOW: usize = 32;
-/// The quantile of the window the windowed estimate is.
-const COST_QUANTILE: f64 = 0.9;
-/// The most the capped estimate pads the mean, as a multiple of the mean.
-const COST_CAP: f64 = 0.5;
-/// The frames whose ratio the frame-scaled estimate reads its scale from;
-/// `beatlm_core::cost` ("Planning a frame against its total") says why 64.
-pub const COST_FRAME_WINDOW: usize = 64;
-/// The quantile of the frame ratios the frame scale is: the windowed
-/// estimate's quantile, for the reason the same section gives.
-const COST_FRAME_QUANTILE: f64 = COST_QUANTILE;
 /// How many times the final drain waits for the device before giving up on the
 /// timings still in flight.
 const DRAIN_ATTEMPTS: usize = 8;
-/// The first frames of the loop, counted from its first frame, whose jobs'
-/// misses are reported apart as `startup_missed`: twice the quantile
-/// estimator's window.
-pub const STARTUP_FRAMES: u64 = 2 * COST_WINDOW as u64;
 
 /// How many timed slices the loop's timer must hold for jobs of `slices`
 /// slices when `jobs` of them can have slices left at once
@@ -95,28 +67,14 @@ pub fn jobs_with_slices(submit: Submit, latency: u32) -> Option<u32> {
     }
 }
 
-/// The cost model's statistic for the `--estimator` choice, with this
-/// harness's parameters.
+/// The cost model's statistic for the `--estimator` choice: the preset of
+/// that name ([`presets`]).
 const fn estimator(kind: EstimatorKind) -> Estimator {
     match kind {
-        EstimatorKind::MeanSigmas => Estimator::MeanPlusSigmas {
-            alpha: COST_ALPHA,
-            sigmas: COST_SIGMAS,
-        },
-        EstimatorKind::Quantile => Estimator::WindowedQuantile {
-            window: COST_WINDOW,
-            quantile: COST_QUANTILE,
-        },
-        EstimatorKind::Capped => Estimator::CappedDeviation {
-            alpha: COST_ALPHA,
-            sigmas: COST_SIGMAS,
-            cap: COST_CAP,
-        },
-        EstimatorKind::FrameScaled => Estimator::FrameScaled {
-            window: COST_WINDOW,
-            frame_window: COST_FRAME_WINDOW,
-            frame_quantile: COST_FRAME_QUANTILE,
-        },
+        EstimatorKind::MeanSigmas => presets::mean_sigmas(),
+        EstimatorKind::Quantile => presets::quantile(),
+        EstimatorKind::Capped => presets::capped(),
+        EstimatorKind::FrameScaled => presets::frame_scaled(),
     }
 }
 
@@ -1003,10 +961,8 @@ mod tests {
 
     #[test]
     fn every_estimator_the_options_name_is_valid() {
-        for kind in EstimatorKind::ALL {
-            assert!(CostModel::new(SLICE_PRIOR, estimator(kind)).is_ok());
-        }
-        // Only the frame-scaled one has a frame scale.
+        // Each is valid (the unwrap), and only the frame-scaled one has a
+        // frame scale.
         for kind in EstimatorKind::ALL {
             let cost = CostModel::new(SLICE_PRIOR, estimator(kind)).unwrap();
             let warming = matches!(cost.frame_scale(), FrameScale::WarmingUp { .. });

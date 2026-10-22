@@ -181,17 +181,12 @@ use std::fmt::Write as _;
 use beatlm::gpu::{FrameTiming, PassSpan};
 use beatlm_core::cost::SliceId;
 
-use crate::stats::{Ratios, nearest_rank, share, step_ns, summarize};
+use crate::stats::{MIN_SAMPLES, Ratios, nearest_rank, share, step_ns, summarize};
 
 /// The least intersection, in nanoseconds, that can count as an overlap
 /// whatever the timestamps' step: one microsecond. The module documentation,
 /// "When an intersection counts", says why.
 pub const MIN_TOLERANCE_NS: u64 = 1_000;
-
-/// Slices measured fewer times than this in the frames with a render are left
-/// out of `slice_vs_render_overlap`: a median of fewer says little about the
-/// slice. The page's `tail_*` lines leave slices out by the same count.
-pub const MIN_SAMPLES: usize = 8;
 
 /// One timed compute pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

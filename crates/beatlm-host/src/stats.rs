@@ -9,6 +9,11 @@ use std::collections::BTreeMap;
 use beatlm_core::cost::FrameScale;
 use beatlm_core::time::Micros;
 
+/// Slices measured fewer times than this, in the frames a per-slice statistic
+/// reads, are left out of that statistic: a median of fewer says little about
+/// the slice.
+pub const MIN_SAMPLES: usize = 8;
+
 /// The median, the 99th percentile and the maximum of a set of samples.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Summary {

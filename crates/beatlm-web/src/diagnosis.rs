@@ -546,7 +546,7 @@ mod tests {
     }
 
     fn render_budget(period: Micros, margin: Micros) -> beatlm_core::budget::Budget {
-        beatlm_core::budget::Budget::for_frame(period, crate::render_cost::RENDER_PRIOR, margin)
+        beatlm_core::budget::Budget::for_frame(period, beatlm_host::presets::RENDER_PRIOR, margin)
     }
 
     /// A property of the core's rules, not the page's finding: a slice whose
