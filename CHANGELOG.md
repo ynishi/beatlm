@@ -101,6 +101,8 @@ and this project adheres to
   `beatlm-web ?model=pass-cost`): what a compute pass and its timestamps
   cost, natively and in the browser; `Kernels::record` and `Net::record`
   record a kernel into an open pass.
+- `beatlm-web` `render_iters`: the render pass's per-pixel loop count for
+  synthetic, depth and on-beat runs (default 50, as the bench).
 
 ### Changed
 
