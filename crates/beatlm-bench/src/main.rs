@@ -338,7 +338,7 @@
 //! scheduler owns the rule). Submitting every frame's input then queues most
 //! jobs behind work that leaves them too few frames, and the scheduler
 //! abandons each of those once the next input queues behind it and reports it
-//! missed (it owns that rule too). The engine's test
+//! missed (it owns that rule too). The test of [`beatlm_host::frame`]
 //! `a_job_longer_than_a_frame_misses_most_inputs_when_every_frame_submits_and_none_when_free`
 //! shows it on the scheduler alone, with a job of five frames' estimates under
 //! latency 5: every frame's input delivers 26 results in 120 frames and misses
@@ -355,7 +355,8 @@
 //! now delivers about as many results, for two reasons: each input it runs is
 //! delivered, so `missed` counts broken promises and not inputs that could
 //! never have been kept; and at most one job has slices left at a time, so the
-//! loop's timer holds one job's slices (`engine::jobs_with_slices`), and the
+//! loop's timer holds one job's slices
+//! ([`beatlm_host::frame::jobs_with_slices`]), and the
 //! unsplit model's 155 kernels times `k + 1` jobs, which the timer could not
 //! hold for `k` past 12, never has to be timed. `submitted` in the report
 //! counts the inputs run; `delivered` per second is the rate depth results

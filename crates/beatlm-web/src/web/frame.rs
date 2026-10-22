@@ -12,16 +12,16 @@
 //! one clock and need no frame time.
 //!
 //! The frame's work is the bench's synchronous `tick` (`beatlm-bench`'s
-//! `engine.rs`): the same budget and forecast, the same scheduler and cost
-//! model, one timed compute pass per slice handed out and one timed render
-//! pass; the crate documentation says what differs and why. The job is the
-//! synthetic one or the depth model ([`Load`]). The depth model's slices are
-//! its kernels' parts on the slot of their job, a frame submits its input only
-//! when the job before it has had all its slices (the bench's `--submit free`,
-//! its default for the depth workload), and the render pass is the display,
-//! showing the result the frame delivers or, under the miss policy, the last
-//! one delivered. A result is copied into the display in the frame that
-//! delivers it, after the frame's slices and before its render pass, never
+//! `engine.rs`): the same budget and forecast, admission and timer capacity
+//! ([`beatlm_host::frame`]), the same scheduler and cost model, one timed
+//! compute pass per slice handed out and one timed render pass; the crate
+//! documentation says what differs and why. The job is the synthetic one or
+//! the depth model ([`Load`]). The depth model's slices are its kernels' parts
+//! on the slot of their job, a frame submits its input only when the job
+//! before it has had all its slices ([`DEPTH_SUBMIT`]), and the render pass is
+//! the display, showing the result the frame delivers or, under the miss
+//! policy, the last one delivered. A result is copied into the display in the
+//! frame that delivers it, after the frame's slices and before its render pass, never
 //! earlier ([`super::display`] says why).
 //!
 //! An on-beat run ([`OnBeatRun`]) adds one step at the start of each frame,
@@ -41,9 +41,12 @@ use anyhow::{Context, Result, anyhow, bail};
 use beatlm::gpu::{FrameTiming, MAX_SLICES, PassSpan, SliceTimer};
 use beatlm_core::budget::Budget;
 use beatlm_core::cost::{CostModel, Estimator, FrameScale, SliceId};
-use beatlm_core::schedule::{Due, FramePlan, JobId, Scheduler, SliceRun};
+use beatlm_core::schedule::{Due, FramePlan, Scheduler, SliceRun};
 use beatlm_core::sync::{MissPolicy, SyncPolicy};
 use beatlm_core::time::{BeatGrid, FrameIndex, FrameInfo, Micros, TimePoint};
+use beatlm_host::frame::{
+    Admission, InFlight, RenderCost, Submit, Tag, jobs_with_slices, timer_capacity,
+};
 use beatlm_host::presets::{MARGIN_US, RENDER_PRIOR, SLICE_PRIOR, STARTUP_FRAMES};
 use beatlm_host::slots::Net;
 use beatlm_host::stats::frame_ratio;
@@ -56,12 +59,11 @@ use super::device::{self, Gpu};
 use super::display::Display;
 use super::page;
 use crate::config::{Config, OnBeat, SLICES};
-use crate::depth::{delivered_now, frames_for, still_busy};
+use crate::depth::{delivered_now, frames_for};
 use crate::diagnosis::tail::{Pass as TailPass, TimedFrame};
 use crate::diagnosis::{self, Reason, Unstarted};
 use crate::onbeat::{self, Beats};
 use crate::pace::{FrameStart, NOMINAL_PERIOD, Pace, Pacer, ms_to_us};
-use crate::render_cost::RenderCost;
 use crate::report::{DepthReport, Environment, Outcome, render};
 
 /// How long after the last frame the host waits for timings still in flight
@@ -69,15 +71,6 @@ use crate::report::{DepthReport, Environment, Outcome, render};
 /// display's rate. The bench blocks on the device instead, which a page
 /// cannot.
 const DRAIN_US: u64 = 1_000_000;
-
-/// The label a timed slice carries from the scheduler to the cost model: its
-/// job, the slice, and what a frame's ratio takes the slice at when the frame
-/// was planned ([`CostModel::frame_estimate`], `None` for a slice left out of
-/// it), the bench's label and for its reason: the frame's measured slice time
-/// is compared with what the same slices were planned at
-/// ([`CostModel::record_frame`]), however many frames later the timing comes
-/// back.
-type Tag = (JobId, SliceId, Option<Micros>);
 
 /// Whether the loop asks for another callback.
 enum Turn {
@@ -91,6 +84,32 @@ pub enum Load {
     Synthetic,
     /// The depth model, realised and calibrated.
     Depth(Box<DepthLoad>),
+}
+
+/// When a frame of the depth model submits its input: only once the job
+/// before it has had all its slices, the bench's default for its `depth`
+/// workload.
+pub const DEPTH_SUBMIT: Submit = Submit::Free;
+
+impl Load {
+    /// When a frame submits its input: every frame for the synthetic job, as
+    /// the bench's default, and [`DEPTH_SUBMIT`] for the depth model.
+    const fn submit(&self) -> Submit {
+        match self {
+            Self::Synthetic => Submit::Every,
+            Self::Depth(_) => DEPTH_SUBMIT,
+        }
+    }
+}
+
+/// How many jobs a run's promise lets be pending at once: `latency + 1` at a
+/// fixed latency, and on beat the [`onbeat::SLOTS`] the host keeps.
+pub const fn in_flight(on_beat: bool, latency: u32) -> InFlight {
+    if on_beat {
+        InFlight::Bounded(onbeat::SLOTS)
+    } else {
+        InFlight::Latency(latency)
+    }
 }
 
 /// The depth model as the loop runs it.
@@ -146,10 +165,9 @@ pub struct Host {
     gpu: Gpu,
     workload: Workload,
     load: Load,
-    /// The depth model's job submitted last, with its slices not yet handed
-    /// out, while it has some and has not left the scheduler: a frame submits
-    /// no input while there is one.
-    busy: Option<(JobId, usize)>,
+    /// Whether the load's rule takes a frame's input; on beat, an input is
+    /// also owed and its slot free.
+    admission: Admission,
     /// Whether the display holds a delivered depth, the last one delivered:
     /// false until the first delivery.
     shown: bool,
@@ -192,26 +210,16 @@ impl Host {
     /// cannot be built, or a page without `performance`.
     pub fn new(gpu: Gpu, workload: Workload, mut run: Run) -> Result<Self> {
         let estimator = run.estimator;
-        let on_beat = run.on_beat.is_some();
-        let (slices, jobs, cost) = match &mut run.load {
-            // Every frame submits a job, and a job lives `latency` frames past
-            // its submission, so `latency + 1` jobs can have slices left in a
-            // frame. On beat, no more than `SLOTS` are pending.
+        let submit = run.load.submit();
+        let jobs = jobs_with_slices(submit, in_flight(run.on_beat.is_some(), run.latency));
+        let (slices, cost) = match &mut run.load {
             Load::Synthetic => (
                 SLICES,
-                if on_beat {
-                    Some(onbeat::SLOTS)
-                } else {
-                    run.latency.checked_add(1)
-                },
                 CostModel::new(SLICE_PRIOR, estimator).context("cannot build the cost model")?,
             ),
-            // A frame submits only once the job before has had its slices, so
-            // one job at a time has slices left. The model is calibration's,
-            // built with the run's estimator.
+            // The model is calibration's, built with the run's estimator.
             Load::Depth(depth) => (
                 depth.net.kernel_count(),
-                Some(1),
                 std::mem::replace(
                     &mut depth.cost,
                     CostModel::new(SLICE_PRIOR, estimator)
@@ -221,11 +229,12 @@ impl Host {
         };
         let timer = if gpu.timestamp_query {
             let capacity = jobs
-                .and_then(|jobs| jobs.checked_mul(slices))
-                .filter(|&capacity| capacity <= MAX_SLICES)
+                .and_then(|jobs| timer_capacity(slices, jobs))
                 .with_context(|| {
+                    let jobs =
+                        jobs.map_or_else(|| String::from("too many"), |jobs| jobs.to_string());
                     format!(
-                        "{slices} slices for each of the jobs with slices left at latency {} \
+                        "{slices} slices for each of {jobs} jobs with slices left (latency {}) \
                          are more than the GPU timer can time ({MAX_SLICES})",
                         run.latency
                     )
@@ -267,7 +276,7 @@ impl Host {
             gpu,
             workload,
             load: run.load,
-            busy: None,
+            admission: Admission::new(submit),
             shown: false,
             asked: run.asked,
             period: run.period,
@@ -357,20 +366,13 @@ impl Host {
         };
 
         let planning = self.performance.now();
-        // This frame's budget follows the last render measured and the
-        // display's period; the frames to come are forecast from the median of
-        // the recent renders, as the bench does and for its reason
-        // (`Scheduler::set_expected_budget`), at the same period.
+        // This frame's budget and the forecast of the frames to come, at the
+        // display's measured period; `RenderCost` says why the two differ.
         let budget = self.render.budget(start.period, self.margin);
         let forecast = self.render.expected(start.period, self.margin);
         self.scheduler.set_expected_budget(forecast);
         self.outcome.expected_budget_us.push(forecast.get().get());
-        let takes_input = owed
-            && match self.load {
-                Load::Synthetic => true,
-                Load::Depth(_) => self.busy.is_none(),
-            };
-        let new_job = if takes_input {
+        let new_job = if owed && self.admission.takes_input() {
             let job = self
                 .scheduler
                 .submit(frame, self.slices.clone(), &self.cost)
@@ -487,13 +489,8 @@ impl Host {
         if new_job.is_some() {
             self.outcome.submitted += 1;
         }
-        if let Load::Depth(_) = self.load {
-            self.busy = still_busy(
-                self.busy,
-                new_job.map(|job| (job, self.slices.len())),
-                &plan,
-            );
-        }
+        self.admission
+            .planned(new_job.map(|job| (job, self.slices.len())), &plan);
         // After the frame's CPU times are taken, so the diagnosis is not
         // charged to `cpu_plan_us`, the bench's line; before the slices are
         // counted, which it reads.

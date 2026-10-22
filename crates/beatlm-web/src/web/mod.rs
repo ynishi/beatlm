@@ -16,6 +16,7 @@ mod wait;
 use anyhow::{Context, Result};
 use beatlm_core::sync::SyncPolicy;
 use beatlm_core::time::Micros;
+use beatlm_host::frame::jobs_with_slices;
 use beatlm_host::slots::Net;
 use beatlm_host::workload::{DEFAULT_SLICE_ITERS, Workload};
 use wasm_bindgen::prelude::wasm_bindgen;
@@ -231,7 +232,14 @@ async fn setup(mut config: Config) -> Result<()> {
             let gpu = device::open(page::canvas()?, Need::Plan(plan)).await?;
             let workload = Workload::new(&gpu.device, DEFAULT_SLICE_ITERS, config.render_iters);
             warm_up(&gpu, &workload).await?;
-            let load = depth_load(&gpu, &workload, loaded, slots, url, &config).await?;
+            // The jobs whose slices the loop's timer holds at once, which
+            // calibration checks each program against before running it.
+            let jobs = jobs_with_slices(
+                frame::DEPTH_SUBMIT,
+                frame::in_flight(config.on_beat.is_some(), latency),
+            )
+            .context("the latency is too large to count the jobs in flight")?;
+            let load = depth_load(&gpu, &workload, loaded, slots, jobs, url, &config).await?;
             (gpu, workload, load)
         }
     };
@@ -306,14 +314,15 @@ async fn warm_up(gpu: &device::Gpu, workload: &Workload) -> Result<()> {
     Ok(())
 }
 
-/// The depth model, from its weights to the loop: calibrated and split,
-/// realised with `slots` slots, warmed up, checked against the reference, and
-/// with its display.
+/// The depth model, from its weights to the loop: calibrated and split for a
+/// loop with `jobs` jobs with slices left at once, realised with `slots`
+/// slots, warmed up, checked against the reference, and with its display.
 async fn depth_load(
     gpu: &device::Gpu,
     workload: &Workload,
     mut loaded: model::Loaded,
     slots: u32,
+    jobs: u32,
     weights_url: String,
     config: &Config,
 ) -> Result<Load> {
@@ -329,6 +338,7 @@ async fn depth_load(
         &loaded.program,
         &loaded.numbers,
         config.estimator,
+        jobs,
     )
     .await?;
     let net = device::accepted(&gpu.device, "the depth model's network", || {

@@ -315,7 +315,8 @@ pub struct Outcome {
     /// The render pass's measured GPU time in each timed frame that ran a
     /// slice, in microseconds. Above `render_alone_us`, the measurement counts
     /// time the pass spent on or behind the slices, and the budget, which
-    /// takes the render measured, shrinks by it ([`crate::render_cost`]).
+    /// takes the render measured, shrinks by it
+    /// ([`RenderCost`](beatlm_host::frame::RenderCost)).
     pub render_with_slices_us: Vec<u64>,
     /// The longest compute pass measured in each timed frame that ran one, in
     /// microseconds.

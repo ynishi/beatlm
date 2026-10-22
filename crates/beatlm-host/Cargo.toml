@@ -1,6 +1,6 @@
 [package]
 name          = "beatlm-host"
-description   = "What beatlm's two hosts both compile: the synthetic load, the depth model's slots, the pass-cost measurement and the report's shared lines and statistics, reading no clock"
+description   = "What beatlm's two hosts both compile: the synthetic load, the depth model's slots, the pieces of a frame's step, the pass-cost measurement and the report's shared lines and statistics, reading no clock"
 publish       = false
 version.workspace      = true
 edition.workspace      = true

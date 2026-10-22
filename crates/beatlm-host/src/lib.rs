@@ -22,6 +22,9 @@
 //!   compute kernel per slice and one render pass, and the render order;
 //! - [`slots`]: a lowered program realised with one input and one output slot
 //!   per job in flight ([`slots::Net`]), which the depth model runs through;
+//! - [`frame`]: the pieces of a frame's step that read no clock: the label a
+//!   timed slice carries, the render's budget and forecast, the admission of
+//!   an input, and the timer's capacity;
 //! - [`pass_cost`]: the `pass-cost` workload's encoding, cells and lines;
 //! - [`pass_overlap`]: the `pass_overlap_*` lines, read from a frame's
 //!   timestamps;
@@ -57,10 +60,10 @@
 //! on `wasm32-unknown-unknown`, and turns on wgpu's `counters` feature, which
 //! a dependency on it would turn on in the browser build too.
 //!
-//! The rest of the frame's bookkeeping that both hosts do (the budget and
-//! forecast, the admission of an input, the delivery and miss counts) is
-//! written in each host; `beatlm-web`'s crate
-//! documentation ("What is shared with the bench") says why.
+//! The rest of the frame's bookkeeping that both hosts do (the delivery and
+//! miss counts, what each measurement feeds) is written in each host;
+//! `beatlm-web`'s crate documentation ("What is shared with the bench") says
+//! why.
 //!
 //! The crate is not published (`publish = false`): its API is the two hosts'
 //! and changes with them.
@@ -68,6 +71,7 @@
 // Also set as a workspace lint; see the same attribute in `beatlm-core`.
 #![warn(missing_docs)]
 
+pub mod frame;
 pub mod pass_cost;
 pub mod pass_overlap;
 pub mod presets;

@@ -293,26 +293,6 @@ impl WholeRuns {
     }
 }
 
-/// The depth model's job that holds back the next input after `plan`, the bench's
-/// `Admission::planned` for `--submit free`: the job submitted last, `job`
-/// with its slice count when this frame submitted one or `busy` when it did
-/// not, less the slices `plan` handed out, until none are left or it has left
-/// the scheduler, delivered or missed. `None` when no job holds back the
-/// next input.
-#[must_use]
-pub fn still_busy(
-    busy: Option<(JobId, usize)>,
-    job: Option<(JobId, usize)>,
-    plan: &FramePlan,
-) -> Option<(JobId, usize)> {
-    let (id, left) = job.or(busy)?;
-    let handed_out = plan.runs.iter().filter(|run| run.job == id).count();
-    let left = left.saturating_sub(handed_out);
-    let gone =
-        plan.delivered.iter().any(|d| d.job == id) || plan.missed.iter().any(|m| m.job == id);
-    (left > 0 && !gone).then_some((id, left))
-}
-
 /// The job whose depth the display copies in the frame of `plan`: the last
 /// one `plan` delivers, `None` when it delivers none. The frame loop records
 /// the copy after the frame's slices and before its render pass, so a result
@@ -657,10 +637,11 @@ mod tests {
     use beatlm_core::schedule::Scheduler;
     use beatlm_core::sync::{MissPolicy, SyncPolicy};
     use beatlm_core::time::{FrameIndex, FrameInfo, TimePoint};
+    use beatlm_host::frame::{Admission, Submit};
 
     /// A fixed-latency depth run of `frames` frames at `latency` frames, as
     /// the page runs it: `latency + 1` slots, jobs of two 1 ms slices, an input
-    /// only once the job before has had its slices (`still_busy`), and a frame
+    /// only once the job before has had its slices (`Submit::Free`), and a frame
     /// budget of 10 ms, or none in the frames `starved` names. Returns the
     /// memory and the job on screen after each frame.
     fn fixed_run(
@@ -675,7 +656,7 @@ mod tests {
         let cost = CostModel::new(Micros::new(1_000), Estimator::default()).unwrap();
         let slices = vec![SliceId::new(0), SliceId::new(1)];
         let mut screen = Screen::new(policy.max_in_flight().unwrap());
-        let mut busy = None;
+        let mut admission = Admission::new(Submit::Free);
         let mut shown = Vec::new();
         for index in 0..frames {
             let frame = FrameInfo {
@@ -683,8 +664,8 @@ mod tests {
                 start: TimePoint::new(index * PERIOD),
                 period: Micros::new(PERIOD),
             };
-            let job = busy
-                .is_none()
+            let job = admission
+                .takes_input()
                 .then(|| scheduler.submit(frame, slices.clone(), &cost).unwrap());
             let budget = if starved(index) {
                 Budget::new(Micros::ZERO)
@@ -693,7 +674,7 @@ mod tests {
             };
             let plan = scheduler.plan_frame(frame, budget, &cost);
             screen.frame(&plan, slices.len());
-            busy = still_busy(busy, job.map(|job| (job, slices.len())), &plan);
+            admission.planned(job.map(|job| (job, slices.len())), &plan);
             shown.push(screen.shown());
         }
         (screen, shown)
