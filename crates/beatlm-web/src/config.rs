@@ -33,6 +33,11 @@
 //! - `estimator`: the statistic the cost model estimates a slice with, the
 //!   core's [`Estimator`], in the forms the next section lists. Default: the
 //!   core's ([`Estimator::default`]).
+//! - `render_iters`: loop iterations per pixel of the render pass, a whole
+//!   number from 0 up (the bench's `--render-iters`, whose spelling and range
+//!   it has; default [`DEFAULT_RENDER_ITERS`], 50). Both jobs, fixed latency
+//!   and on beat; refused with `model=pass-cost` (below). The next section
+//!   says why it exists.
 //! - `sync`: the delivery promise, `latency` (the default: fixed latency, the
 //!   promise every parameter above is about) or `onbeat` (results on the
 //!   first frame at or after a beat of a click track the page plays,
@@ -53,8 +58,13 @@
 //!     ([`crate::onbeat::run_frames`]), 1 to [`MAX_BEATS`].
 //!
 //! `model=pass-cost` schedules nothing, so `latency`, `latency_ms`,
-//! `arena_bytes`, `estimator` and `sync` are refused with it; `frames` is the
-//! timed frames of each cell. These apply, each only with it, and spell their
+//! `arena_bytes`, `estimator` and `sync` are refused with it, and so is
+//! `render_iters`: that measurement's render pass is `render=on|off` at the
+//! default [`DEFAULT_RENDER_ITERS`], the figure its published cells were
+//! measured at, whereas the bench's `pass-cost` does take `--render-iters`. A
+//! page that took it there would put a second spelling of the render beside
+//! `render`, so it is refused rather than half-applied. `frames` is the timed
+//! frames of each cell. These apply, each only with it, and spell their
 //! values as the bench's flags of the same names do:
 //!
 //! - `passes`: the dispatches per frame, a comma-separated list (default
@@ -68,6 +78,44 @@
 //!   `kernels=depth`.
 //! - `render`: `on` to end each frame with the synthetic render pass, as the
 //!   loop's frames do; `off` (the default).
+//!
+//! # The render_iters parameter
+//!
+//! The render pass of a loop run repeats the synthetic per-pixel loop
+//! (`render_fs` in the bench's `shaders.wgsl`; the depth model's display,
+//! `web/display.wgsl`, carries the same loop before it draws the image and the
+//! depth), `render_iters` times per pixel; the budget's prior for the render
+//! at the default of 50 is the bench's [`crate::render_cost::RENDER_PRIOR`].
+//! It exists to test H2 of #53: that the render pass in the same frame
+//! contends with the depth slices on the GPU, so slices measure slower in the
+//! loop than in calibration (`tail_loop_over_calibration`). Run at a minimal
+//! render (`render_iters=1`, or 0) and compare: if the in-loop over
+//! calibration ratio falls and delivery rises, the render pass contends; if the
+//! ratio stays, it does not.
+//!
+//! **0 is accepted.** The shader's loop is `for i in 0..render_iters` over a
+//! uniform, so zero trips is well defined; the loop's result still feeds the
+//! colour (`a` keeps its starting value, a function of the pixel position), so
+//! nothing else in the fragment shader changes: the display still draws the
+//! source and the depth once per pixel, and the synthetic render still fills
+//! the target. No other minimum applies; the range is the bench's, any `u32`.
+//!
+//! **What it changes.** It is the render pass's cost, and the render pass's
+//! cost sets the frame budget the slices share: each frame's budget is the
+//! display's period less the render the forecast expects and the margin
+//! ([`crate::render_cost`]). A cheaper render leaves more of the frame to
+//! slices, so a run at `render_iters=1` is not the native default's budget (the
+//! default's is the one it was measured under) but a larger one, and its
+//! delivery is not comparable with a default run's on that account alone; read
+//! the `gpu_render_alone_us` and `gpu_render_with_slices_us` lines beside it.
+//! The forecast follows the render only as it is measured: until the first
+//! measurement it is [`crate::render_cost::RENDER_PRIOR`], the default's, at
+//! any value, and without `timestamp_query` the render is never measured, so
+//! the budget stays at the default's and the value changes the render's cost
+//! but not the slices' share of the frame.
+//! The value applies to the whole run: calibration's frames end with the same
+//! synthetic render pass, so the same value reaches them, and the `config:`
+//! line prints the value used (`render_iters=`).
 //!
 //! # The estimator parameter
 //!
@@ -236,6 +284,7 @@ use crate::onbeat::{
     Tempo, TempoChange,
 };
 use crate::pass_cost::{self, DEFAULT_DEPTH_SIDE, Dispatches};
+use crate::workload::DEFAULT_RENDER_ITERS;
 
 /// Frames a run lasts when `frames` is not given: the bench's default.
 pub const DEFAULT_FRAMES: u64 = 600;
@@ -283,8 +332,8 @@ pub const DEFAULT_FRAME_QUANTILE: f64 = 0.9;
 /// The parameters the query string accepts, as the error for an unknown one
 /// lists them.
 const PARAMETERS: &str = "frames, model, side, latency, latency_ms, arena_bytes, estimator, \
-                          sync, bpm, bpm_change, margin_ms, beats, passes, variants, kernels, \
-                          groups, render";
+                          sync, bpm, bpm_change, margin_ms, beats, render_iters, passes, variants, \
+                          kernels, groups, render";
 
 /// The parameters only `model=pass-cost` reads.
 const PASS_COST_PARAMETERS: [&str; 5] = ["passes", "variants", "kernels", "groups", "render"];
@@ -343,6 +392,10 @@ pub struct Config {
     /// `estimator`: the statistic the loop's cost model estimates a slice
     /// with.
     pub estimator: Estimator,
+    /// `render_iters`: loop iterations per pixel of the render pass of a loop
+    /// run, calibration's included; [`DEFAULT_RENDER_ITERS`] when not given.
+    /// Zero is allowed (the module documentation says why).
+    pub render_iters: u32,
     /// `sync=onbeat` and its parameters; `None` for the fixed-latency promise,
     /// whose `latency` is then the one kept.
     pub on_beat: Option<OnBeat>,
@@ -367,6 +420,7 @@ impl Default for Config {
             latency: Latency::Frames(DEFAULT_LATENCY),
             arena_bytes: None,
             estimator: Estimator::default(),
+            render_iters: DEFAULT_RENDER_ITERS,
             on_beat: None,
         }
     }
@@ -383,7 +437,8 @@ impl Default for Config {
 /// is not a positive multiple of 14 up to 518, `side` without `model=depth`,
 /// `arena_bytes` with it, both `latency` and `latency_ms`, or an `estimator`
 /// that is not one of the forms [`estimator`] reads or has a parameter out of
-/// range; a `sync` that is not `latency` or `onbeat`, `bpm`, `bpm_change`,
+/// range; a `render_iters` that is not a whole number or is given with
+/// `model=pass-cost`; a `sync` that is not `latency` or `onbeat`, `bpm`, `bpm_change`,
 /// `margin_ms` or `beats` without `sync=onbeat` or out of range, and
 /// `latency`, `latency_ms`, or `frames` beside `beats`, with it.
 pub fn parse(query: &str) -> Result<Config> {
@@ -398,6 +453,7 @@ pub fn parse(query: &str) -> Result<Config> {
     let mut latency_ms = None;
     let mut arena_bytes = None;
     let mut chosen = None;
+    let mut render_iters = DEFAULT_RENDER_ITERS;
     let mut on_beat = false;
     let mut bpm = None;
     let mut change = None;
@@ -455,6 +511,7 @@ pub fn parse(query: &str) -> Result<Config> {
             "latency_ms" => latency_ms = Some(milliseconds(value)?),
             "arena_bytes" => arena_bytes = Some(number(name, value)?),
             "estimator" => chosen = Some(estimator(value)?),
+            "render_iters" => render_iters = number(name, value)?,
             "sync" => {
                 on_beat = match value {
                     "latency" => false,
@@ -478,6 +535,12 @@ pub fn parse(query: &str) -> Result<Config> {
         if let Some(name) = LOOP_PARAMETERS.iter().find(|name| seen.contains(name)) {
             bail!(
                 "query parameter {name} has no effect with model=pass-cost, which schedules nothing"
+            );
+        }
+        if seen.contains(&"render_iters") {
+            bail!(
+                "query parameter render_iters has no effect with model=pass-cost, whose render \
+                 pass is render=on or render=off at the default of {DEFAULT_RENDER_ITERS} iterations"
             );
         }
         if let Some(name) = ON_BEAT_PARAMETERS.iter().find(|name| seen.contains(name)) {
@@ -567,6 +630,7 @@ pub fn parse(query: &str) -> Result<Config> {
         latency,
         arena_bytes,
         estimator: chosen.unwrap_or_default(),
+        render_iters,
         on_beat,
     })
 }
@@ -871,6 +935,7 @@ mod tests {
                 latency: Latency::Frames(5),
                 arena_bytes: Some(134_217_600),
                 estimator: Estimator::default(),
+                render_iters: DEFAULT_RENDER_ITERS,
                 on_beat: None,
             }
         );
@@ -899,6 +964,7 @@ mod tests {
                 latency: Latency::Time(Micros::new(83_300)),
                 arena_bytes: None,
                 estimator: Estimator::default(),
+                render_iters: DEFAULT_RENDER_ITERS,
                 on_beat: None,
             }
         );
@@ -1196,6 +1262,71 @@ mod tests {
             assert_eq!(estimator_name(chosen), name, "{value}");
             assert_eq!(estimator(name).unwrap(), chosen, "{name}");
         }
+    }
+
+    #[test]
+    fn render_iters_defaults_to_the_benchs_and_reads_any_whole_number() {
+        assert_eq!(Config::default().render_iters, 50);
+        assert_eq!(parse("").unwrap().render_iters, DEFAULT_RENDER_ITERS);
+        assert_eq!(
+            parse("?model=depth&side=112&latency_ms=200")
+                .unwrap()
+                .render_iters,
+            50
+        );
+        for (query, iters) in [
+            ("?render_iters=1", 1),
+            ("?render_iters=0", 0),
+            ("?render_iters=50", 50),
+            ("?render_iters=4294967295", u32::MAX),
+            ("?model=depth&side=266&latency_ms=200&render_iters=1", 1),
+            ("?model=depth&side=112&render_iters=0&frames=900", 0),
+            ("?render_iters=7&sync=onbeat&bpm=120", 7),
+            ("?model=depth&sync=onbeat&render_iters=0&beats=8", 0),
+        ] {
+            assert_eq!(parse(query).unwrap().render_iters, iters, "{query}");
+        }
+        // Nothing else moves with it.
+        let with = parse("?model=depth&side=112&render_iters=1").unwrap();
+        assert_eq!(
+            with,
+            Config {
+                model: Model::Depth { side: 112 },
+                latency: Latency::Time(NATIVE_DEFAULT_LATENCY),
+                render_iters: 1,
+                ..Config::default()
+            }
+        );
+    }
+
+    #[test]
+    fn render_iters_out_of_range_or_with_the_pass_cost_measurement_is_refused() {
+        for bad in [
+            "?render_iters",
+            "?render_iters=",
+            "?render_iters=-1",
+            "?render_iters=1.5",
+            "?render_iters=fifty",
+            "?render_iters=4294967296",
+            "?render_iters=1&render_iters=2",
+            "?model=pass-cost&render_iters=1",
+            "?model=pass-cost&render_iters=50",
+            "?model=pass-cost&render=on&render_iters=0",
+            "?model=pass-cost&kernels=depth&render_iters=1",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+        let error = parse("?model=pass-cost&render_iters=1")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("render_iters") && error.contains("render=on"),
+            "{error}"
+        );
+        // The pass-cost measurement's own render switch is unaffected.
+        assert!(parse("?model=pass-cost&render=on").is_ok());
+        let unknown = parse("?frame=600").unwrap_err().to_string();
+        assert!(unknown.contains("render_iters"), "{unknown}");
     }
 
     #[test]

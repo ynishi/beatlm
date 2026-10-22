@@ -461,9 +461,10 @@ fn write_report(
     write!(
         out,
         "config: frames={} latency={latency} slices={slices} slice_iters={DEFAULT_SLICE_ITERS} \
-         render_iters={DEFAULT_RENDER_ITERS} margin_us={MARGIN_US} estimator={} \
+         render_iters={} margin_us={MARGIN_US} estimator={} \
          submit={submit}",
         config.frames,
+        config.render_iters,
         estimator_name(config.estimator),
     )?;
     if let Some(bytes) = config.arena_bytes {
@@ -1178,6 +1179,39 @@ mod tests {
             )
         );
         assert_eq!(text.lines().last(), Some("status: done"));
+    }
+
+    #[test]
+    fn the_config_line_prints_the_render_iters_used() {
+        let config_of = |query: &str| {
+            let config = crate::config::parse(query).unwrap();
+            let text = render(&Environment::default(), &config, &Outcome::default());
+            line(&text, "config").unwrap().to_owned()
+        };
+        // The default is unchanged.
+        assert!(config_of("").contains(" render_iters=50 margin_us=2000 "));
+        for (query, printed) in [
+            ("?render_iters=1", "render_iters=1"),
+            ("?render_iters=0", "render_iters=0"),
+            ("?render_iters=200&latency=3", "render_iters=200"),
+            ("?model=depth&side=112&render_iters=1", "render_iters=1"),
+            ("?sync=onbeat&render_iters=0", "render_iters=0"),
+        ] {
+            let line = config_of(query);
+            let words: Vec<&str> = line.split(' ').collect();
+            assert_eq!(
+                words
+                    .iter()
+                    .filter(|word| word.starts_with("render_iters="))
+                    .count(),
+                1,
+                "{line}"
+            );
+            assert!(words.contains(&printed), "{query}: {line}");
+        }
+        // The pass-cost measurement's render is at the default and says so.
+        let pass_cost = crate::config::parse("?model=pass-cost&render=on").unwrap();
+        assert_eq!(pass_cost.render_iters, DEFAULT_RENDER_ITERS);
     }
 
     #[test]

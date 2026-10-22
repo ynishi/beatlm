@@ -51,7 +51,13 @@
 //! 120 Hz ("Which estimator, measured in a browser"). `sync` chooses the
 //! promise: `latency`, the fixed latency everything above is about and the
 //! default, or `onbeat`, with `bpm`, `bpm_change`, `margin_ms` and `beats`
-//! ("On-beat delivery" below). `model=pass-cost` is no job at all but the
+//! ("On-beat delivery" below). `render_iters` sets the render pass's loop
+//! iterations per pixel (the bench's `--render-iters`: any whole number, 0
+//! included; default 50), for either job and either promise: it is how a run
+//! tests whether the render pass contends with the depth slices (H2 of #53),
+//! and since the render's cost sets the frame budget the slices share, a run
+//! at another value has another budget ([`config`] has the reasons and what is
+//! refused). `model=pass-cost` is no job at all but the
 //! bench's measurement of what a compute pass costs, with parameters of its
 //! own ("What a pass costs" below). Anything else in the query is refused.
 //!
