@@ -30,6 +30,24 @@
 //! - `estimator`: the statistic the cost model estimates a slice with, the
 //!   core's [`Estimator`], in the forms the next section lists. Default: the
 //!   core's ([`Estimator::default`]).
+//! - `sync`: the delivery promise, `latency` (the default: fixed latency, the
+//!   promise every parameter above is about) or `onbeat` (results on the
+//!   first frame at or after a beat of a click track the page plays,
+//!   [`crate::onbeat`]). With `onbeat`, `latency` and `latency_ms` are
+//!   refused, since the promise has no latency in frames, and these apply,
+//!   each only with it:
+//!   - `bpm`: the tempo, a decimal from [`MIN_BPM`] to [`MAX_BPM`] (default
+//!     [`DEFAULT_BPM`]).
+//!   - `bpm_change`: `<bpm>@<seconds>`, a tempo in the same range from the
+//!     first beat at or after `seconds` after the first beat, a decimal above
+//!     zero up to an hour; the scheduler is told at the instant `seconds`
+//!     names (the [`crate::onbeat`] documentation, "A tempo change").
+//!   - `margin_ms`: the margin the core places a job's beat with, a decimal
+//!     from 0 to 1000 milliseconds (default 100, [`crate::onbeat`] says why).
+//!   - `beats`: run for this many beats rather than for `frames` (not with
+//!     it): inputs at the first `beats` beats, the run lasting to the beat
+//!     the last is placed on and a little after
+//!     ([`crate::onbeat::run_frames`]), 1 to [`MAX_BEATS`].
 //!
 //! # The estimator parameter
 //!
@@ -193,6 +211,10 @@ use beatlm_core::cost::{CostModel, Estimator, MAX_WINDOW};
 use beatlm_core::time::Micros;
 
 use crate::depth::{MAX_SIDE, NATIVE_DEFAULT_LATENCY, NATIVE_DEFAULT_SIDE, PATCH};
+use crate::onbeat::{
+    DEFAULT_BPM, DEFAULT_MARGIN, MAX_BEATS, MAX_BPM, MAX_CHANGE_AFTER_S, MAX_MARGIN, MIN_BPM,
+    Tempo, TempoChange,
+};
 
 /// Frames a run lasts when `frames` is not given: the bench's default.
 pub const DEFAULT_FRAMES: u64 = 600;
@@ -239,7 +261,11 @@ pub const DEFAULT_FRAME_QUANTILE: f64 = 0.9;
 
 /// The parameters the query string accepts, as the error for an unknown one
 /// lists them.
-const PARAMETERS: &str = "frames, model, side, latency, latency_ms, arena_bytes, estimator";
+const PARAMETERS: &str = "frames, model, side, latency, latency_ms, arena_bytes, estimator, \
+                          sync, bpm, bpm_change, margin_ms, beats";
+
+/// The parameters only `sync=onbeat` reads.
+const ON_BEAT_PARAMETERS: [&str; 4] = ["bpm", "bpm_change", "margin_ms", "beats"];
 
 /// The forms `estimator` accepts, as the error for another value lists them.
 const ESTIMATOR_FORMS: &str = "quantile, quantile:<q>, quantile:<q>:<window>, mean-sigmas, \
@@ -286,6 +312,20 @@ pub struct Config {
     /// `estimator`: the statistic the loop's cost model estimates a slice
     /// with.
     pub estimator: Estimator,
+    /// `sync=onbeat` and its parameters; `None` for the fixed-latency promise,
+    /// whose `latency` is then the one kept.
+    pub on_beat: Option<OnBeat>,
+}
+
+/// The on-beat promise, `sync=onbeat`, as the query gave it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OnBeat {
+    /// `bpm` and `bpm_change`.
+    pub tempo: Tempo,
+    /// `margin_ms`.
+    pub margin: Micros,
+    /// `beats`: the run's length in beats, in place of `frames`.
+    pub beats: Option<u64>,
 }
 
 impl Default for Config {
@@ -296,6 +336,7 @@ impl Default for Config {
             latency: Latency::Frames(DEFAULT_LATENCY),
             arena_bytes: None,
             estimator: Estimator::default(),
+            on_beat: None,
         }
     }
 }
@@ -311,7 +352,9 @@ impl Default for Config {
 /// is not a positive multiple of 14 up to 518, `side` without `model=depth`,
 /// `arena_bytes` with it, both `latency` and `latency_ms`, or an `estimator`
 /// that is not one of the forms [`estimator`] reads or has a parameter out of
-/// range.
+/// range; a `sync` that is not `latency` or `onbeat`, `bpm`, `bpm_change`,
+/// `margin_ms` or `beats` without `sync=onbeat` or out of range, and
+/// `latency`, `latency_ms`, or `frames` beside `beats`, with it.
 pub fn parse(query: &str) -> Result<Config> {
     let mut frames = DEFAULT_FRAMES;
     let mut depth = false;
@@ -320,6 +363,11 @@ pub fn parse(query: &str) -> Result<Config> {
     let mut latency_ms = None;
     let mut arena_bytes = None;
     let mut chosen = None;
+    let mut on_beat = false;
+    let mut bpm = None;
+    let mut change = None;
+    let mut margin = None;
+    let mut beats = None;
     let mut seen: Vec<&str> = Vec::new();
     let query = query.strip_prefix('?').unwrap_or(query);
     for pair in query.split('&').filter(|pair| !pair.is_empty()) {
@@ -344,9 +392,47 @@ pub fn parse(query: &str) -> Result<Config> {
             "latency_ms" => latency_ms = Some(milliseconds(value)?),
             "arena_bytes" => arena_bytes = Some(number(name, value)?),
             "estimator" => chosen = Some(estimator(value)?),
+            "sync" => {
+                on_beat = match value {
+                    "latency" => false,
+                    "onbeat" => true,
+                    _ => bail!("query parameter sync: {value:?} is not latency or onbeat"),
+                };
+            }
+            "bpm" => bpm = Some(tempo(name, value)?),
+            "bpm_change" => change = Some(tempo_change(value)?),
+            "margin_ms" => margin = Some(margin_ms(value)?),
+            "beats" => beats = Some(number::<u64>(name, value)?),
             _ => bail!("unknown query parameter {name:?}; the page accepts {PARAMETERS}"),
         }
     }
+    let on_beat = if on_beat {
+        if latency.is_some() || latency_ms.is_some() {
+            bail!(
+                "sync=onbeat delivers on beats and has no latency in frames; \
+                 give bpm (and bpm_change) instead of latency or latency_ms"
+            );
+        }
+        if beats.is_some() && seen.contains(&"frames") {
+            bail!("give the run's length in frames or in beats, not both");
+        }
+        if beats.is_some_and(|beats| !(1..=MAX_BEATS).contains(&beats)) {
+            bail!("beats must be from 1 to {MAX_BEATS}");
+        }
+        Some(OnBeat {
+            tempo: Tempo {
+                bpm: bpm.unwrap_or(DEFAULT_BPM),
+                change,
+            },
+            margin: margin.unwrap_or(DEFAULT_MARGIN),
+            beats,
+        })
+    } else {
+        if let Some(name) = ON_BEAT_PARAMETERS.iter().find(|name| seen.contains(name)) {
+            bail!("query parameter {name} belongs to on-beat delivery; it needs sync=onbeat");
+        }
+        None
+    };
     if frames == 0 {
         bail!("frames must be at least 1");
     }
@@ -385,7 +471,50 @@ pub fn parse(query: &str) -> Result<Config> {
         latency,
         arena_bytes,
         estimator: chosen.unwrap_or_default(),
+        on_beat,
     })
+}
+
+/// Parses a tempo, the value of `bpm` or the tempo of `bpm_change`: a decimal
+/// number of beats per minute from [`MIN_BPM`] to [`MAX_BPM`].
+fn tempo(name: &str, value: &str) -> Result<f64> {
+    let bpm: f64 = number(name, value)?;
+    // The range check is false for NaN.
+    if !(MIN_BPM..=MAX_BPM).contains(&bpm) {
+        bail!("query parameter {name}: {value:?} is not a tempo from {MIN_BPM} to {MAX_BPM} BPM");
+    }
+    Ok(bpm)
+}
+
+/// Parses `bpm_change`, `<bpm>@<seconds>`.
+fn tempo_change(value: &str) -> Result<TempoChange> {
+    let (bpm, after) = value
+        .split_once('@')
+        .with_context(|| format!("query parameter bpm_change: {value:?} is not <bpm>@<seconds>"))?;
+    let bpm = tempo("bpm_change", bpm)?;
+    let after_s: f64 = number("bpm_change", after)?;
+    if !(after_s > 0.0 && after_s <= MAX_CHANGE_AFTER_S) {
+        bail!(
+            "query parameter bpm_change: the change must come after the first beat, \
+             at most {MAX_CHANGE_AFTER_S} seconds, not {after:?}"
+        );
+    }
+    Ok(TempoChange { bpm, after_s })
+}
+
+/// Parses `margin_ms`, a decimal number of milliseconds up to [`MAX_MARGIN`],
+/// into whole microseconds.
+fn margin_ms(value: &str) -> Result<Micros> {
+    let ms: f64 = number("margin_ms", value)?;
+    #[allow(clippy::cast_precision_loss)]
+    let max_ms = MAX_MARGIN.get() as f64 / 1_000.0;
+    if !(0.0..=max_ms).contains(&ms) {
+        bail!("query parameter margin_ms: {value:?} is not between 0 and {max_ms}");
+    }
+    // At most a second in microseconds.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let us = (ms * 1_000.0).round() as u64;
+    Ok(Micros::new(us))
 }
 
 /// Parses the value of `estimator`: a name and its parameters after colons
@@ -580,6 +709,7 @@ mod tests {
                 latency: Latency::Frames(5),
                 arena_bytes: Some(134_217_600),
                 estimator: Estimator::default(),
+                on_beat: None,
             }
         );
         assert_eq!(parse("latency=0").unwrap().latency, Latency::Frames(0));
@@ -607,8 +737,107 @@ mod tests {
                 latency: Latency::Time(Micros::new(83_300)),
                 arena_bytes: None,
                 estimator: Estimator::default(),
+                on_beat: None,
             }
         );
+    }
+
+    #[test]
+    fn on_beat_delivery_reads_its_tempo_change_margin_and_beats() {
+        let config = parse("?model=depth&side=112&sync=onbeat").unwrap();
+        assert_eq!(config.model, Model::Depth { side: 112 });
+        assert_eq!(
+            config.on_beat,
+            Some(OnBeat {
+                tempo: Tempo {
+                    bpm: 100.0,
+                    change: None
+                },
+                margin: Micros::new(100_000),
+                beats: None,
+            })
+        );
+        let config = parse(
+            "?model=depth&side=112&sync=onbeat&bpm=90&bpm_change=120@60.5&margin_ms=50.5&beats=300",
+        )
+        .unwrap();
+        assert_eq!(
+            config.on_beat,
+            Some(OnBeat {
+                tempo: Tempo {
+                    bpm: 90.0,
+                    change: Some(TempoChange {
+                        bpm: 120.0,
+                        after_s: 60.5
+                    })
+                },
+                margin: Micros::new(50_500),
+                beats: Some(300),
+            })
+        );
+        // The fixed-latency promise is the default and can be named.
+        assert_eq!(parse("?sync=latency").unwrap(), Config::default());
+        assert_eq!(
+            parse("?sync=onbeat&bpm=30&margin_ms=0&frames=900")
+                .unwrap()
+                .on_beat
+                .map(|o| (o.tempo.bpm, o.margin, o.beats)),
+            Some((30.0, Micros::ZERO, None))
+        );
+        assert_eq!(
+            parse("?sync=onbeat&bpm=120")
+                .unwrap()
+                .on_beat
+                .unwrap()
+                .tempo
+                .bpm,
+            120.0
+        );
+    }
+
+    #[test]
+    fn on_beat_parameters_out_of_place_or_range_are_refused() {
+        for query in [
+            "?sync=OnBeat",
+            "?sync=",
+            "?bpm=100",
+            "?bpm_change=120@60",
+            "?margin_ms=50",
+            "?beats=300",
+            "?sync=latency&bpm=100",
+            "?sync=onbeat&latency=10",
+            "?sync=onbeat&latency_ms=400",
+            "?sync=onbeat&beats=300&frames=600",
+            "?sync=onbeat&beats=0",
+            "?sync=onbeat&beats=100001",
+            "?sync=onbeat&beats=-1",
+            "?sync=onbeat&bpm=29.9",
+            "?sync=onbeat&bpm=120.1",
+            "?sync=onbeat&bpm=NaN",
+            "?sync=onbeat&bpm=inf",
+            "?sync=onbeat&bpm=fast",
+            "?sync=onbeat&bpm_change=120",
+            "?sync=onbeat&bpm_change=120@",
+            "?sync=onbeat&bpm_change=@60",
+            "?sync=onbeat&bpm_change=121@60",
+            "?sync=onbeat&bpm_change=120@0",
+            "?sync=onbeat&bpm_change=120@-5",
+            "?sync=onbeat&bpm_change=120@3601",
+            "?sync=onbeat&bpm_change=120@NaN",
+            "?sync=onbeat&bpm_change=120@60@70",
+            "?sync=onbeat&margin_ms=-1",
+            "?sync=onbeat&margin_ms=1000.1",
+            "?sync=onbeat&margin_ms=NaN",
+            "?sync=onbeat&sync=latency",
+        ] {
+            assert!(parse(query).is_err(), "{query}");
+        }
+        let said = parse("?bpm=100").unwrap_err().to_string();
+        assert!(said.contains("needs sync=onbeat"), "{said}");
+        let said = parse("?sync=onbeat&bpm=200").unwrap_err().to_string();
+        assert!(said.contains("from 30 to 120 BPM"), "{said}");
+        let said = parse("?sync=onbeat&latency=5").unwrap_err().to_string();
+        assert!(said.contains("no latency in frames"), "{said}");
     }
 
     #[test]

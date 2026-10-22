@@ -1,23 +1,45 @@
 //! The depth model's render pass: the source and the delivered depth.
 //!
-//! **It reads no buffer a compute pass writes**, as the bench's render pass
-//! does not, so its measured time, which the frame's budget takes as the
-//! render's cost, cannot include waiting for the frame's slices
-//! ([`crate::render_cost`] says what such a wait would do). The source is a
-//! buffer of its own, the input every slot holds, uploaded once; each slot's
-//! depth is copied into a buffer of its own when its job's last slice is
-//! encoded ([`Display::keep`]), an untimed copy of `side * side` numbers, and
-//! the pass draws from that copy. The report's `gpu_render_alone_us` and
-//! `gpu_render_with_slices_us` show the render's measurement with and without
-//! slices in its frame.
+//! **The screen is part of the delivery promise.** A result may appear only
+//! from the frame that delivers it, so the display holds one depth, the one
+//! delivered last, in a buffer of its own, and copies a job's depth into it in
+//! the frame the scheduler delivers the job ([`Display::deliver`]): after that
+//! frame's slices, since a job is complete once its last slice has been handed
+//! out in that frame or an earlier one, and before its render pass. Until the
+//! first delivery the pass draws the source and no depth. A copy made when a
+//! job's last slice was encoded, into a buffer per output slot, put jobs on
+//! screen early: once the jobs after a delivered one missed, the screen still
+//! showed that slot's buffer, and the next job on the same slot overwrote it
+//! when its last slice ran, frames (on beat, a beat or more) before its own
+//! delivery, with nothing in the report counting it early. The slot copied
+//! from is still reserved when its job is delivered: a slot is handed to
+//! another job only after the plan that delivers or misses its job
+//! ([`crate::depth::delivered_now`] says why under each policy).
 //!
-//! Every slot gets a bind group of its own when the display is built, and one
-//! more draws before the first delivery, so choosing what to show in a frame
-//! creates nothing and uploads nothing, as the rest of the frame loop. The
-//! depth is mapped to grey between the smallest and the largest depth the
-//! check's run computed, fixed for the run. The shader (`display.wgsl`)
-//! carries the synthetic render pass's per-pixel loop, so the pass costs what
-//! the bench's render pass does beside the depth model.
+//! The copy is `side * side` numbers recorded between passes, so no timestamp
+//! covers it: neither the render's measured time nor `gpu_frame_us` counts
+//! it, as neither counted the per-slot copy before it. It does make the
+//! render pass of a delivery frame read a buffer written in its own frame,
+//! from an arena that frame's slices may write, so in that frame the render
+//! can be ordered behind the slices. The render was measured not to carry the
+//! slices when it read no such buffer (p50 1 245 µs, and 1 573 µs in a later
+//! run, with slices in its frame against 1 901 µs without; Chrome 154,
+//! WebGPU, Apple M1 Pro, 120 Hz, Depth Anything V2 Small at 266 pixels,
+//! [`crate::render_cost`]), and a delivery frame comes at most once per job,
+//! so a wait there would shrink the budget of the frame after it and not the
+//! median of recent renders the frames to come are forecast with. The
+//! report's `gpu_render_alone_us` and `gpu_render_with_slices_us` show the
+//! render's measurement without and with slices in its frame, and would show
+//! it if that changed.
+//!
+//! Both bind groups, one drawing the depth and one drawn before the first
+//! delivery, are made when the display is built, so choosing what to show in
+//! a frame creates nothing and uploads nothing, as the rest of the frame
+//! loop. The source is a buffer of its own, the input every slot holds,
+//! uploaded once. The depth is mapped to grey between the smallest and the
+//! largest depth the check's run computed, fixed for the run. The shader
+//! (`display.wgsl`) carries the synthetic render pass's per-pixel loop, so
+//! the pass costs what the bench's render pass does beside the depth model.
 
 use anyhow::{Context, Result};
 use beatlm::load::depth_anything_v2::reference::{MEAN, STD};
@@ -26,16 +48,18 @@ use wgpu::util::DeviceExt;
 use crate::slots::{Net, Numbers};
 use crate::workload::TARGET_FORMAT;
 
-/// The render pass that shows a slot's input and output.
+/// The render pass that shows the source and the depth delivered last.
 pub struct Display {
     pipeline: wgpu::RenderPipeline,
-    /// Per slot: where its output is in the arenas, and the display's copy.
-    copies: Vec<Kept>,
+    /// Per slot, where its output is in the arenas.
+    outputs: Vec<Output>,
+    /// The depth delivered last, which the pass draws.
+    depth: wgpu::Buffer,
     /// The bytes of one depth.
     depth_bytes: u64,
-    /// One per slot, drawing that slot's input and output.
-    slots: Vec<wgpu::BindGroup>,
-    /// Drawn before the first delivery: the input, and no depth.
+    /// Draws the source and `depth`.
+    shown: wgpu::BindGroup,
+    /// Drawn before the first delivery: the source, and no depth.
     blank: wgpu::BindGroup,
 }
 
@@ -88,7 +112,7 @@ impl Display {
                 usage: wgpu::BufferUsages::UNIFORM,
             })
         };
-        let shown = params(1);
+        let shown_params = params(1);
         let blank_params = params(0);
         let pixels = u64::from(side) * u64::from(side);
         let depth_bytes = pixels * 4;
@@ -106,7 +130,7 @@ impl Display {
             contents: &input,
             usage: wgpu::BufferUsages::STORAGE,
         });
-        let copies = (0..net.slots())
+        let outputs = (0..net.slots())
             .map(|slot| {
                 let id = numbers.output_of(slot);
                 let placement = net
@@ -114,67 +138,64 @@ impl Display {
                     .placement(id)
                     .filter(|p| p.size >= depth_bytes)
                     .with_context(|| format!("the depth of slot {slot} has no placement"))?;
-                let source = net
+                let arena = net
                     .arenas()
                     .buffer(placement.arena)
                     .with_context(|| format!("the depth of slot {slot} names no arena"))?
                     .clone();
-                let depth = device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("beatlm-web display depth"),
-                    size: depth_bytes,
-                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-                Ok(Kept {
-                    source,
+                Ok(Output {
+                    arena,
                     offset: placement.offset,
-                    depth,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        anyhow::ensure!(!outputs.is_empty(), "the network has no slots");
+        let depth = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("beatlm-web display depth"),
+            size: depth_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let layout = pipeline.get_bind_group_layout(0);
-        let slots = copies
-            .iter()
-            .map(|copy| bind_group(device, &layout, &shown, &image, &copy.depth))
-            .collect();
-        let first = copies.first().context("the network has no slots")?;
-        let blank = bind_group(device, &layout, &blank_params, &image, &first.depth);
+        let shown = bind_group(device, &layout, &shown_params, &image, &depth);
+        let blank = bind_group(device, &layout, &blank_params, &image, &depth);
         Ok(Self {
             pipeline,
-            copies,
+            outputs,
+            depth,
             depth_bytes,
-            slots,
+            shown,
             blank,
         })
     }
 
-    /// Copies the depth of `slot` into the display's own buffer: encoded after
-    /// the last slice of the slot's job, so the render pass reads a buffer no
-    /// slice writes. A slot the network does not have is ignored.
-    pub fn keep(&self, encoder: &mut wgpu::CommandEncoder, slot: u32) {
-        if let Some(copy) = usize::try_from(slot).ok().and_then(|i| self.copies.get(i)) {
+    /// Copies the depth of `slot` into the buffer the pass draws: recorded in
+    /// the frame that delivers the slot's job, after the frame's slices and
+    /// before its render pass, so the depth is on screen from that frame and
+    /// not before (the module documentation says why). A slot the network
+    /// does not have is ignored.
+    pub fn deliver(&self, encoder: &mut wgpu::CommandEncoder, slot: u32) {
+        if let Some(output) = usize::try_from(slot).ok().and_then(|i| self.outputs.get(i)) {
             encoder.copy_buffer_to_buffer(
-                &copy.source,
-                copy.offset,
-                &copy.depth,
+                &output.arena,
+                output.offset,
+                &self.depth,
                 0,
                 self.depth_bytes,
             );
         }
     }
 
-    /// Records the pass into `target`, showing the depth of `slot`, or none
-    /// before the first delivery.
+    /// Records the pass into `target`, showing the depth delivered last when
+    /// `delivered`, and the source alone before the first delivery.
     pub fn encode(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
-        slot: Option<u32>,
+        delivered: bool,
         timestamp_writes: Option<wgpu::RenderPassTimestampWrites<'_>>,
     ) {
-        let group = slot
-            .and_then(|slot| self.slots.get(usize::try_from(slot).ok()?))
-            .unwrap_or(&self.blank);
+        let group = if delivered { &self.shown } else { &self.blank };
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("beatlm-web display"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -197,14 +218,12 @@ impl Display {
     }
 }
 
-/// Where a slot's depth is computed, and the display's copy of it.
-struct Kept {
+/// Where a slot's depth is computed.
+struct Output {
     /// The arena holding the slot's output.
-    source: wgpu::Buffer,
+    arena: wgpu::Buffer,
     /// The output's offset in it.
     offset: u64,
-    /// The display's copy.
-    depth: wgpu::Buffer,
 }
 
 /// The bindings of one picture: the uniform `params`, the source `image` and

@@ -220,6 +220,114 @@ pub fn still_busy(
     (left > 0 && !gone).then_some((id, left))
 }
 
+/// The job whose depth the display copies in the frame of `plan`: the last
+/// one `plan` delivers, `None` when it delivers none. The frame loop records
+/// the copy after the frame's slices and before its render pass, so a result
+/// is on screen from the frame that delivers it and never before
+/// (`web/display.rs` says why the screen is held to that).
+///
+/// The job's output slot still holds it then. A slot's output is live for the
+/// whole program and shares bytes with nothing else (`slots.rs`, "Jobs, slots
+/// and the shared plan"), so only a later job on the same slot could
+/// overwrite it, and none has had a slice by the copy:
+///
+/// - Under `FixedLatency { frames: k }` there are `k + 1` slots and at most
+///   one submission a frame, so the job `k + 1` after job `j` is submitted at
+///   least `k + 1` frames after `j`'s, past the frame `k` after it, the only
+///   one that can deliver `j`.
+/// - On beat, a job is not submitted while the job [`crate::onbeat::SLOTS`]
+///   before it is pending, and a job stays pending until the plan that
+///   delivers or misses it has been recorded, after that frame's submission
+///   ([`crate::onbeat::Beats::slot_free`]).
+#[must_use]
+pub fn delivered_now(plan: &FramePlan) -> Option<JobId> {
+    plan.delivered.last().map(|delivery| delivery.job)
+}
+
+/// The page's GPU memory as the frame loop writes it, for the tests of what
+/// the display shows: which job each output slot was last written by, and
+/// which job the display's buffer holds. It also follows the rule the copy at
+/// delivery replaced, a copy into a buffer per slot after a job's last slice
+/// with the slot of the job delivered last drawn, and counts the frames that
+/// rule drew a job not yet delivered.
+#[cfg(test)]
+pub(crate) struct Screen {
+    /// Per output slot, the job whose slice wrote it last.
+    written: Vec<Option<u64>>,
+    /// The job the display's buffer holds, copied at its delivery.
+    shown: Option<u64>,
+    /// The replaced rule's buffers: per slot, the job copied after its last
+    /// slice.
+    kept: Vec<Option<u64>>,
+    /// The slot the replaced rule drew: the delivered last's.
+    kept_slot: Option<usize>,
+    /// Every job delivered so far.
+    delivered: std::collections::BTreeSet<u64>,
+    /// Frames in which the replaced rule drew a job not yet delivered.
+    pub(crate) early_under_kept: u64,
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+impl Screen {
+    /// Memory for `slots` output slots, nothing written and nothing shown.
+    pub(crate) fn new(slots: u32) -> Self {
+        let slots = usize::try_from(slots).unwrap();
+        Self {
+            written: vec![None; slots],
+            shown: None,
+            kept: vec![None; slots],
+            kept_slot: None,
+            delivered: std::collections::BTreeSet::new(),
+            early_under_kept: 0,
+        }
+    }
+
+    /// Runs the frame of `plan`, for jobs of `slices` slices, in the order
+    /// the frame loop encodes it: the slices write their jobs' slots, the
+    /// delivered job's depth is copied, and the render pass draws.
+    ///
+    /// # Panics
+    ///
+    /// When the copy finds its job's slot written by another job, or the
+    /// screen draws a job not delivered.
+    pub(crate) fn frame(&mut self, plan: &FramePlan, slices: usize) {
+        let slots = self.written.len() as u64;
+        let slot = |job: u64| usize::try_from(job % slots).unwrap();
+        for run in &plan.runs {
+            let job = run.job.get();
+            self.written[slot(job)] = Some(job);
+            if run.position + 1 == slices {
+                self.kept[slot(job)] = Some(job);
+            }
+        }
+        if let Some(job) = delivered_now(plan).map(JobId::get) {
+            assert_eq!(
+                self.written[slot(job)],
+                Some(job),
+                "job {job}'s slot was written by another job before its delivery"
+            );
+            self.shown = Some(job);
+        }
+        for delivery in &plan.delivered {
+            self.delivered.insert(delivery.job.get());
+            self.kept_slot = Some(slot(delivery.job.get()));
+        }
+        if let Some(job) = self.shown {
+            assert!(self.delivered.contains(&job), "job {job} drawn undelivered");
+        }
+        let kept = self.kept_slot.and_then(|slot| self.kept[slot]);
+        if kept.is_some_and(|job| !self.delivered.contains(&job)) {
+            self.early_under_kept += 1;
+        }
+    }
+
+    /// The job on screen after the last frame run.
+    pub(crate) fn shown(&self) -> Option<u64> {
+        self.shown
+    }
+}
+
 /// Whether the frames a job is promised can hold its slices at all: the
 /// report's `capacity_frames_needed` line.
 ///
@@ -451,6 +559,81 @@ pub fn native_default(facts: &Facts) -> String {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use beatlm_core::budget::Budget;
+    use beatlm_core::cost::{CostModel, Estimator};
+    use beatlm_core::schedule::Scheduler;
+    use beatlm_core::sync::{MissPolicy, SyncPolicy};
+    use beatlm_core::time::{FrameIndex, FrameInfo, TimePoint};
+
+    /// A fixed-latency depth run of `frames` frames at `latency` frames, as
+    /// the page runs it: `latency + 1` slots, jobs of two 1 ms slices, an input
+    /// only once the job before has had its slices (`still_busy`), and a frame
+    /// budget of 10 ms, or none in the frames `starved` names. Returns the
+    /// memory and the job on screen after each frame.
+    fn fixed_run(
+        latency: u32,
+        frames: u64,
+        starved: impl Fn(u64) -> bool,
+    ) -> (Screen, Vec<Option<u64>>) {
+        const PERIOD: u64 = 8_333;
+        let full = Budget::new(Micros::new(10_000));
+        let policy = SyncPolicy::FixedLatency { frames: latency };
+        let mut scheduler = Scheduler::new(policy, MissPolicy::HoldPrevious, full);
+        let cost = CostModel::new(Micros::new(1_000), Estimator::default()).unwrap();
+        let slices = vec![SliceId::new(0), SliceId::new(1)];
+        let mut screen = Screen::new(policy.max_in_flight().unwrap());
+        let mut busy = None;
+        let mut shown = Vec::new();
+        for index in 0..frames {
+            let frame = FrameInfo {
+                index: FrameIndex::new(index),
+                start: TimePoint::new(index * PERIOD),
+                period: Micros::new(PERIOD),
+            };
+            let job = busy
+                .is_none()
+                .then(|| scheduler.submit(frame, slices.clone(), &cost).unwrap());
+            let budget = if starved(index) {
+                Budget::new(Micros::ZERO)
+            } else {
+                full
+            };
+            let plan = scheduler.plan_frame(frame, budget, &cost);
+            screen.frame(&plan, slices.len());
+            busy = still_busy(busy, job.map(|job| (job, slices.len())), &plan);
+            shown.push(screen.shown());
+        }
+        (screen, shown)
+    }
+
+    #[test]
+    fn a_result_is_on_screen_from_its_delivery_frame_and_not_before() {
+        // Latency 2, three slots. Job 0, submitted at frame 0, finishes there
+        // and is delivered at frame 2. Jobs 1 and 2 get no budget and miss, at
+        // frames 3 and 6; job 3, on job 0's slot, is submitted at frame 7,
+        // finishes there, and is delivered at frame 9.
+        let (screen, shown) = fixed_run(2, 12, |frame| (1..=6).contains(&frame));
+        assert_eq!(shown[1], None);
+        assert_eq!(shown[2..9], [Some(0); 7]);
+        assert_eq!(shown[9], Some(3));
+        // The copy after the last slice, into job 0's slot's buffer, drew job
+        // 3 at frames 7 and 8, before its delivery.
+        assert_eq!(screen.early_under_kept, 2);
+    }
+
+    #[test]
+    fn a_slot_is_never_reused_before_its_job_is_delivered() {
+        // Runs of misses of every length between deliveries, at latencies
+        // with one slot and with several: `Screen::frame` checks every copy
+        // against its slot, and that only a delivered job is drawn.
+        for latency in [0, 1, 2, 5] {
+            let (screen, shown) = fixed_run(latency, 400, |frame| frame % 23 < frame % 11);
+            assert!(shown.last().unwrap().is_some(), "latency {latency}");
+            if latency > 0 {
+                assert!(screen.early_under_kept > 0, "latency {latency}");
+            }
+        }
+    }
 
     #[test]
     fn the_native_default_is_83_ms_at_266_pixels() {

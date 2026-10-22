@@ -8,7 +8,9 @@
   crate documentation of beatlm-web (`cargo doc -p beatlm-web`) says what each
   does. With `model=depth` the module fetches the weights and the references
   from `models/`, which `just serve-web` maps to the models directory; nothing
-  of the model is in the build output.
+  of the model is in the build output. With `sync=onbeat` the module shows the
+  start button and waits for it: a browser starts audio only after a user
+  gesture, and the run plays a click on every beat.
 -->
 <html lang="en">
 <head>
@@ -19,10 +21,12 @@
     /* The canvas draws 1280x720 pixels whatever size it is shown at. */
     canvas { display: block; width: 640px; max-width: 100%; aspect-ratio: 16 / 9; background: #000; }
     pre { font: 12px/1.4 ui-monospace, monospace; white-space: pre-wrap; }
+    button { margin: 8px 0; padding: 6px 18px; font: inherit; }
   </style>
 </head>
 <body>
   <canvas id="beatlm-canvas" width="1280" height="720"></canvas>
+  <button id="beatlm-start" type="button" hidden>start</button>
   <pre id="beatlm-report">status: loading</pre>
   <script type="module">
     import init from "./beatlm_web.js";

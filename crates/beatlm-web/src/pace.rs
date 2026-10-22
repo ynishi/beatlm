@@ -284,6 +284,15 @@ impl Pacer {
         sorted.get(sorted.len() / 2).copied().map(Micros::new)
     }
 
+    /// The run's first callback timestamp, in microseconds on the clock the
+    /// timestamps are read from: the epoch of every [`FrameStart::start_us`],
+    /// which a host maps another clock onto the frames' with; `None` before
+    /// the first callback.
+    #[must_use]
+    pub const fn epoch_us(&self) -> Option<u64> {
+        self.first_us
+    }
+
     /// Frame periods of the run given up because a callback came more than 1.5
     /// periods after the one before; with the frames started, the number the
     /// run was asked for once it is done.
