@@ -146,6 +146,11 @@ and this project adheres to
   to `SliceTimer::submitted` straight after the `queue.submit` carrying the
   encoder; that call requests the map. `SliceTimer::start_readback` is gone
   (breaking).
+- The code both hosts compile (the synthetic workload and its shaders, the
+  slot-backed `Net`, the `pass-cost` and `pass_overlap_*` lines, the report's
+  statistics) moved into a new unpublished crate, `beatlm-host`, which the
+  bench and the page depend on instead of compiling the bench's files by
+  `#[path]`. No behaviour or report line changed.
 
 ### Fixed
 
