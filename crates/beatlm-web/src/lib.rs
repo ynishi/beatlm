@@ -118,8 +118,9 @@
 //!    the device is asked for what the plan needs and not for what one model
 //!    happens to fit.
 //! 4. **Calibration**, as the bench's `calibrate.rs`: the unsplit model is run
-//!    whole for [`depth::CALIBRATION_FRAMES`] timed frames behind the synthetic
-//!    render pass, each kernel's median over the second half decides how it is
+//!    whole for [`CALIBRATION_FRAMES`](beatlm_host::presets::CALIBRATION_FRAMES)
+//!    timed frames behind the synthetic render pass, each kernel's median over
+//!    the second half decides how it is
 //!    split for [`depth::MAX_DISPATCH_US`] (the core's
 //!    `Program::parts_within`), and the split program is run the same way into
 //!    the cost model the loop starts from, built with the page's `estimator`;

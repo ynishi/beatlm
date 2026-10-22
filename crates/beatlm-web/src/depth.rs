@@ -17,6 +17,7 @@ use beatlm_core::kernel::{Fusion, Program};
 use beatlm_core::memory::{MemoryPlan, TensorId};
 use beatlm_core::schedule::{FramePlan, JobId};
 use beatlm_core::time::Micros;
+use beatlm_host::presets::CALIBRATION_FRAMES;
 use beatlm_host::slots::{self, Numbers};
 use beatlm_host::stats::median;
 use beatlm_host::workload::{DEFAULT_STAGE_STORAGE_BUFFERS, RenderOrder, written_fits};
@@ -56,14 +57,6 @@ pub const NATIVE_DEFAULT_LATENCY: Micros =
 /// splits kernels to: the bench's default `--max-dispatch-us`, which the
 /// native default was measured with.
 pub const MAX_DISPATCH_US: u64 = 1_000;
-
-/// Timed frames of whole jobs in each calibration pass, after one untimed
-/// frame: the bench's (`calibrate.rs`), twice the window of the core's
-/// default estimator, so the half the decision reads is as long as the window
-/// the loop's estimate reads. An `estimator` with a longer window starts the
-/// loop with the counted half, which is [`CALIBRATION_FRAMES`] / 2
-/// measurements of each part, and fills the rest from the loop.
-pub const CALIBRATION_FRAMES: u64 = 64;
 
 /// The share of deadlines that must arrive with their result for the native
 /// default to hold: the lower of its two native runs, 0.9916, rounded down to

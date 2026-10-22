@@ -44,6 +44,7 @@ use beatlm_core::cost::{CostModel, Estimator, FrameScale, SliceId};
 use beatlm_core::schedule::{Due, FramePlan, JobId, Scheduler, SliceRun};
 use beatlm_core::sync::{MissPolicy, SyncPolicy};
 use beatlm_core::time::{BeatGrid, FrameIndex, FrameInfo, Micros, TimePoint};
+use beatlm_host::presets::{MARGIN_US, RENDER_PRIOR, SLICE_PRIOR, STARTUP_FRAMES};
 use beatlm_host::slots::Net;
 use beatlm_host::stats::frame_ratio;
 use beatlm_host::workload::Workload;
@@ -54,17 +55,15 @@ use super::audio::Audio;
 use super::device::{self, Gpu};
 use super::display::Display;
 use super::page;
-use crate::config::{Config, MARGIN_US, OnBeat, SLICES};
+use crate::config::{Config, OnBeat, SLICES};
 use crate::depth::{delivered_now, frames_for, still_busy};
 use crate::diagnosis::tail::{Pass as TailPass, TimedFrame};
 use crate::diagnosis::{self, Reason, Unstarted};
 use crate::onbeat::{self, Beats};
 use crate::pace::{FrameStart, NOMINAL_PERIOD, Pace, Pacer, ms_to_us};
-use crate::render_cost::{RENDER_PRIOR, RenderCost};
-use crate::report::{DepthReport, Environment, Outcome, STARTUP_FRAMES, render};
+use crate::render_cost::RenderCost;
+use crate::report::{DepthReport, Environment, Outcome, render};
 
-/// What a slice is assumed to cost until it has been measured: the bench's.
-pub(super) const SLICE_PRIOR: Micros = Micros::new(2_000);
 /// How long after the last frame the host waits for timings still in flight
 /// before it reports without them, in microseconds: a second, whatever the
 /// display's rate. The bench blocks on the device instead, which a page

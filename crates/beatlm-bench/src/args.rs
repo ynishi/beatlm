@@ -103,8 +103,8 @@ impl Submit {
     }
 }
 
-/// Which statistic the cost model reads a slice's measurements with; the
-/// parameters of each are constants in `engine.rs`. The default is the one the
+/// Which statistic the cost model reads a slice's measurements with; each is
+/// the preset of its name in `beatlm_host::presets`. The default is the one the
 /// measurements in `beatlm_core::cost` chose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EstimatorKind {
@@ -267,7 +267,7 @@ impl Default for Args {
             slice_iters: DEFAULT_SLICE_ITERS,
             render_iters: DEFAULT_RENDER_ITERS,
             render_order: RenderOrder::Free,
-            margin_us: 2_000,
+            margin_us: beatlm_host::presets::MARGIN_US,
             workload: WorkloadKind::Synthetic,
             submit: Submit::Every,
             size: DEFAULT_DEPTH_SIZE,

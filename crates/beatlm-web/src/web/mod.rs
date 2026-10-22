@@ -321,7 +321,7 @@ async fn depth_load(
         "status: calibrating {} kernels at {} pixels over {} frames, twice",
         loaded.program.kernels().len(),
         loaded.side,
-        depth::CALIBRATION_FRAMES + 1
+        beatlm_host::presets::CALIBRATION_FRAMES + 1
     ));
     let calibration = model::calibrate(
         gpu,

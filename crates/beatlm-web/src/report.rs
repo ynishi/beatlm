@@ -111,12 +111,13 @@ use beatlm::load::depth_anything_v2::reference::{
 use beatlm_core::cost::SliceId;
 use beatlm_core::time::Micros;
 use beatlm_host::pass_overlap;
+use beatlm_host::presets::MARGIN_US;
 use beatlm_host::stats::{
     frame_ratio_value, frame_scale_value, histogram, nearest_rank, share, summarize,
 };
 use beatlm_host::workload::{DEFAULT_RENDER_ITERS, DEFAULT_SLICE_ITERS};
 
-use crate::config::{Config, MARGIN_US, Model, SLICES, estimator_name};
+use crate::config::{Config, Model, SLICES, estimator_name};
 use crate::depth::{
     self, Capacity, Facts, MAX_DISPATCH_US, NATIVE_DEFAULT_LATENCY, NATIVE_DEFAULT_SIDE,
 };
@@ -328,7 +329,7 @@ pub struct Outcome {
     /// Deadlines that arrived without a complete result.
     pub missed: u64,
     /// The part of `missed` that belongs to jobs submitted in the first
-    /// [`STARTUP_FRAMES`] frames.
+    /// [`STARTUP_FRAMES`](beatlm_host::presets::STARTUP_FRAMES) frames.
     pub startup_missed: u64,
     /// Deliveries whose latency was not the promised one.
     pub violations: u64,
@@ -353,11 +354,6 @@ pub struct Outcome {
     /// latency.
     pub on_beat: Option<onbeat::Summary>,
 }
-
-/// The first frames whose jobs' misses are reported apart as
-/// `startup_missed`, as the bench counts them: twice the window the cost
-/// model's default estimate reads.
-pub const STARTUP_FRAMES: u64 = 64;
 
 /// Renders the summary of a finished run.
 #[must_use]

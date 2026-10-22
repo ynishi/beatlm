@@ -251,8 +251,9 @@
 //! 2026-10-21). Calibration now times the split program too and starts the
 //! loop's cost model from those measurements (`calibrate.rs` owns the two
 //! passes), and `startup_missed` reports the misses among the loop's first
-//! `2 * COST_WINDOW` frames apart, so a cascade shows. The bound sweep that
-//! chose 1000 us was made before that change and is replaced by the one below.
+//! [`STARTUP_FRAMES`](beatlm_host::presets::STARTUP_FRAMES) frames apart, so
+//! a cascade shows. The bound sweep that chose 1000 us was made before that
+//! change and is replaced by the one below.
 //!
 //! **The bound sweep, with the parts measured.** Configuration of every run:
 //! `--workload net --frames 300 --runs 2`, `sync` mode, latency 2, the
@@ -649,8 +650,9 @@
 //! Options are listed by `--help`. It needs an adapter with
 //! `Features::TIMESTAMP_QUERY` and is not part of `just check`; an adapter is
 //! not guaranteed where `check` runs. A run takes about `frames / 60` seconds;
-//! with splitting on, calibration first runs two passes of `2 * COST_WINDOW`
-//! paced frames, each plus one untimed frame. A calibration frame waits for a
+//! with splitting on, calibration first runs two passes of
+//! [`CALIBRATION_FRAMES`](beatlm_host::presets::CALIBRATION_FRAMES) paced
+//! frames, each plus one untimed frame. A calibration frame waits for a
 //! whole job, so for the depth model a pass takes about 65 times its GPU time
 //! per run: about 13 seconds at 518 pixels from the 202 ms per run measured
 //! on an Apple M1 Pro, Metal ("What a size costs" above).
@@ -674,7 +676,7 @@
 //! | `submitted` | inputs run as jobs: one per frame with `--submit every`, fewer with `--submit free` |
 //! | `delivered`, `missed` | results delivered on their frame, and deadlines that arrived without a complete result |
 //! | `delivery_rate` | `delivered` over `delivered` plus `missed`: the share of deadlines that arrived with their result; `none` when no deadline arrived |
-//! | `startup_missed` | the part of `missed` that belongs to jobs submitted in the loop's first `2 * COST_WINDOW` frames, so a cascade of misses while estimates are new shows apart from misses in steady state |
+//! | `startup_missed` | the part of `missed` that belongs to jobs submitted in the loop's first [`STARTUP_FRAMES`](beatlm_host::presets::STARTUP_FRAMES) frames, so a cascade of misses while estimates are new shows apart from misses in steady state |
 //! | `pending_at_end` | jobs submitted whose deadline was after the last frame |
 //! | `latency_violations` | deliveries whose latency was not `--latency`; the L1 promise broke when this is not zero |
 //! | `timings_collected`, `timings_skipped`, `timings_failed` | frames whose GPU timing was read, was not taken because the readback ring was full, and was lost to a failed map |
@@ -733,16 +735,16 @@
 //!
 //! `--estimator` picks the statistic the cost model reads a slice's
 //! measurements with: `mean-sigmas`, `quantile`, `capped` or `frame-scaled`
-//! (the parameters are constants in `engine.rs`). The default is the one the
-//! measurements recorded in `beatlm_core::cost` chose, with the table of every
-//! run. `frame-scaled` plans a slice at its median times a slowdown measured
-//! over whole frames, and is opt-in; `beatlm_core::cost` ("Planning a frame
-//! against its total") says why and with which parameters. For it the engine
-//! hands each frame's measured slice time back with the estimates those
-//! slices were planned at, which the timer carries in each pass's label, and
-//! calibration records its measurements as calibration's
-//! (`CostModel::record_calibration`), which every other estimator folds as
-//! the loop's.
+//! (each is the preset of its name in [`beatlm_host::presets`]). The default
+//! is the one the measurements recorded in `beatlm_core::cost` chose, with the
+//! table of every run. `frame-scaled` plans a slice at its median times a
+//! slowdown measured over whole frames, and is opt-in; `beatlm_core::cost`
+//! ("Planning a frame against its total") says why and with which parameters.
+//! For it the engine hands each frame's measured slice time back with the
+//! estimates those slices were planned at, which the timer carries in each
+//! pass's label, and calibration records its measurements as calibration's
+//! (`CostModel::record_calibration`), which every other estimator folds as the
+//! loop's.
 //!
 //! # The competing load
 //!

@@ -25,8 +25,11 @@
 //! - [`pass_cost`]: the `pass-cost` workload's encoding, cells and lines;
 //! - [`pass_overlap`]: the `pass_overlap_*` lines, read from a frame's
 //!   timestamps;
+//! - [`presets`]: the cost model's estimators and priors, the margin, and the
+//!   windows and frame counts derived from the default estimator's window;
 //! - [`stats`]: the percentiles, the median and the ratio lines both reports
-//!   and calibration quote.
+//!   and calibration quote, and the fewest measurements a slice's median is
+//!   read from.
 //!
 //! # What goes here
 //!
@@ -65,6 +68,7 @@
 
 pub mod pass_cost;
 pub mod pass_overlap;
+pub mod presets;
 pub mod slots;
 pub mod stats;
 pub mod workload;

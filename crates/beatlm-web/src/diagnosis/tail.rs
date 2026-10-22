@@ -17,16 +17,13 @@ use std::collections::BTreeMap;
 use beatlm_core::cost::SliceId;
 use beatlm_host::stats::nearest_rank as percentile;
 // Shared with the bench (`beatlm_host::stats`), where the `pass_overlap_*`
-// lines read the same step and ratios.
-pub use beatlm_host::stats::{Ratios, step_ns};
+// lines read the same step and ratios and leave slices out by the same count;
+// here the frames a per-slice statistic reads are the loop's.
+pub use beatlm_host::stats::{MIN_SAMPLES, Ratios, step_ns};
 
 /// A measurement is an outlier when it is more than this many times its
 /// slice's median in the loop.
 pub const OUTLIER_FACTOR: u64 = 2;
-
-/// Slices measured fewer times than this in the loop are left out of every
-/// per-slice statistic: a median of fewer says little about the slice.
-pub const MIN_SAMPLES: usize = 8;
 
 /// How many frames before a measurement's own its GPU busy fraction is read
 /// over: four, 33 ms at 120 Hz, long enough to span a few frames with and
