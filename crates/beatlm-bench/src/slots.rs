@@ -110,15 +110,14 @@ pub(crate) fn tensors(program: &Program, numbers: &Numbers, slots: u32) -> Resul
 /// tensors and every slot's stand-ins, planned against the baseline profile.
 ///
 /// A host that must create its device with the limits the plan needs
-/// (`beatlm::gpu::required_limits`) asks for it before the device exists;
-/// [`Net::new`] makes the same plan from the same tensors.
+/// (`beatlm::gpu::required_limits`) asks for it before the device exists,
+/// and both hosts ask whether its arenas fit the render order before the
+/// work that comes before [`Net::new`] (the page's download, the bench's
+/// calibration); [`Net::new`] makes the same plan from the same tensors.
 ///
 /// # Errors
 ///
 /// No slots or more than [`MAX_SLOTS`], or tensors that cannot be planned.
-// Only the browser host asks for the plan apart; the bench realises it
-// through `Net::new`.
-#[allow(dead_code)]
 pub fn memory_plan(program: &Program, numbers: &Numbers, slots: u32) -> Result<MemoryPlan> {
     planned(program, numbers, slots).map(|(plan, _)| plan)
 }
@@ -266,25 +265,29 @@ impl Net {
         &self.arenas
     }
 
-    /// The buffer every kernel of the network writes: the plan's one arena,
+    /// Every buffer a kernel of the network can write: all the plan's arenas,
     /// which a render pass reads to be ordered after a frame's slices
-    /// (`workload.rs`, "Ordering the render pass after the slices").
+    /// (`workload.rs`, "Ordering the render pass after the slices", says why
+    /// all of them).
     ///
     /// # Errors
     ///
-    /// A plan of more than one arena, whose kernels need not all write one
-    /// buffer, so a read of one would not order the render after every slice.
-    pub fn written(&self) -> Result<&wgpu::Buffer> {
-        let count = self.plan.arenas().len();
-        if count != 1 {
-            bail!(
-                "the render is ordered after the slices through the plan's one arena, and this \
-                 plan has {count}"
-            );
-        }
-        self.arenas
-            .buffer(ArenaId::new(0))
-            .context("the plan's arena has no buffer")
+    /// An arena with no buffer, or one smaller than the word the render
+    /// reads of it; neither comes from a plan [`Net::new`] realised.
+    pub fn written(&self) -> Result<Vec<&wgpu::Buffer>> {
+        self.plan
+            .arenas()
+            .iter()
+            .zip(0_u32..)
+            .map(|(&size, index)| {
+                if size < 4 {
+                    bail!("arena {index} has {size} bytes, less than the word the render reads");
+                }
+                self.arenas
+                    .buffer(ArenaId::new(index))
+                    .with_context(|| format!("arena {index} of the plan has no buffer"))
+            })
+            .collect()
     }
 
     /// The lowered network the kernels were generated from.

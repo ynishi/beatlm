@@ -57,7 +57,10 @@
 //! tests whether the render pass contends with the depth slices (H2 of #53),
 //! and since the render's cost sets the frame budget the slices share, a run
 //! at another value has another budget ([`config`] has the reasons and what is
-//! refused). `model=pass-cost` is no job at all but the
+//! refused). `render_order` is `after` unless `render_order=free` is given:
+//! the render pass waits for the frame's slices, where the bench's default
+//! lets it run beside them ("What differs from the native bench, and why"
+//! below). `model=pass-cost` is no job at all but the
 //! bench's measurement of what a compute pass costs, with parameters of its
 //! own ("What a pass costs" below). Anything else in the query is refused.
 //!
@@ -148,8 +151,11 @@
 //! computed. The display's shader carries the synthetic render pass's
 //! per-pixel loop, so the render pass costs what the bench's does beside the
 //! depth model and a frame's budget is the one the native default was measured
-//! under. Like the bench's render pass, it reads no buffer a slice writes: the
-//! depth it draws is the display's own copy. The screen is part of the
+//! under. The depth it draws is the display's own copy; under
+//! `render_order=free` it reads no buffer a slice writes, as the bench's
+//! render pass does not, and under the default `after` it reads the first
+//! word of every arena of the plan, so that it runs after the slices
+//! (`web/display.rs`). The screen is part of the
 //! delivery promise, so a job's depth is copied there in the frame that
 //! delivers it, after that frame's slices and before its render pass, and
 //! nothing appears before its frame; a copy at the job's last slice, as
@@ -464,6 +470,22 @@
 //!   the last frame are collected over one second of further callbacks
 //!   rather than waited for; any not back by then are left out, and
 //!   `timings_collected` says how many came back.
+//! - **The render order.** The page's render pass waits for the frame's
+//!   slices unless `render_order=free` is given; the bench's runs beside
+//!   them unless `--render-order after` is. In Chrome the render ran beside
+//!   the slices and the two slowed each other (H7 of #53, #61), and waiting
+//!   took that away: Chrome 154, WebGPU, Apple M1 Pro, 120 Hz, 2026-10-22,
+//!   Depth Anything V2 Small at 266 px, `latency_ms=83`, `render_iters=50`,
+//!   back to back, `free` delivered 18 of 139 results with 59 frames over the
+//!   period, `after` 115 of 157 with 10 over and no frame whose render
+//!   overlapped a slice. Natively the same order changed neither the
+//!   delivery nor the slices' means and cost a little GPU time per frame (the
+//!   bench's crate documentation, "What it measures", has the run), so
+//!   the bench keeps `free`. The bench's `workload.rs` ("Ordering the render
+//!   pass after the slices") says how the order is kept, for a plan of any
+//!   number of arenas up to what one shader stage binds; a plan of more is
+//!   refused before the weights are fetched, with `render_order=free` named
+//!   as the way out. `free` stays for comparing the two.
 //! - **The render target** is the canvas's texture, acquired every frame,
 //!   where the bench draws into an offscreen texture; it has the same format
 //!   and size, so the pass is the same work. `encode_us` includes acquiring
@@ -569,14 +591,20 @@ mod tests {
 
     /// The display's shader is compiled only by the browser that runs the
     /// page, so it is validated here, by naga with every check on and no
-    /// optional feature, as the generated kernels are.
+    /// optional feature, as the generated kernels are; with
+    /// `display_vs_after` over every count of arenas a device with the
+    /// default limits can bind.
     #[test]
     fn the_display_shader_validates_without_optional_features() {
-        beatlm::codegen::validate(
-            "display",
-            include_str!("web/display.wgsl"),
-            DeviceFeatures::default(),
-        )
-        .unwrap();
+        let source = include_str!("web/display.wgsl");
+        beatlm::codegen::validate("display", source, DeviceFeatures::default()).unwrap();
+        for arenas in 1..=crate::workload::DEFAULT_STAGE_STORAGE_BUFFERS as usize {
+            let wgsl = format!(
+                "{source}{}",
+                crate::workload::after_vertex(arenas, "display_vs_after")
+            );
+            beatlm::codegen::validate("display, render after", &wgsl, DeviceFeatures::default())
+                .unwrap_or_else(|e| panic!("{arenas} arenas: {e}"));
+        }
     }
 }

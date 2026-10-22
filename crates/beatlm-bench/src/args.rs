@@ -222,7 +222,9 @@ pub struct Args {
     /// Loop iterations per pixel of the render pass.
     pub render_iters: u32,
     /// Whether the loop's render pass waits for the frame's slices
-    /// (`workload.rs` says how).
+    /// (`workload.rs` says how); [`RenderOrder::Free`] unless asked, where
+    /// the browser host's default is `after` (the crate documentation, "What
+    /// it measures", says why).
     pub render_order: RenderOrder,
     /// The margin subtracted from each frame's budget, in microseconds.
     pub margin_us: u64,

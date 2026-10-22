@@ -57,7 +57,7 @@ pub async fn run(config: &Config, settings: &Settings) -> Result<()> {
         }
         Dispatches::Depth { side } => {
             page::show(&format!("status: fetching {}", crate::depth::weights_url()));
-            let loaded = model::load(side).await?;
+            let loaded = model::load(crate::depth::graph(side)?).await?;
             settings.check_kernels(loaded.program.kernels().len())?;
             let plan = slots::memory_plan(&loaded.program, &loaded.numbers, 1)?;
             let gpu = device::open(page::canvas()?, Need::Plan(plan)).await?;

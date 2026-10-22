@@ -13,7 +13,9 @@
 //! says whether the render's measurement, which the budget takes, counts the
 //! slices. The five lines that say whether a frame's render pass overlapped
 //! its slices on the GPU (`pass_overlap_frames`, `pass_overlap_us`,
-//! `pass_order`, `slice_vs_render_overlap`, `pass_overlap_compute`) follow
+//! `pass_order`, `slice_vs_render_overlap`, `pass_overlap_compute`), and the
+//! one that says whether the next frame's slices began before its render
+//! ended (`pass_overlap_next_frame`), follow
 //! `gpu_frames_over_period` in both hosts' reports, from the bench's own
 //! `pass_overlap.rs` ([`crate::pass_overlap`]). The browser's own lines go on
 //! with the diagnosis of the misses ([`crate::diagnosis`]): how many were
@@ -1178,7 +1180,7 @@ mod tests {
         assert_eq!(
             line(&text, "config"),
             Some(
-                "frames=600 latency=2 slices=4 slice_iters=500 render_iters=50 render_order=free \
+                "frames=600 latency=2 slices=4 slice_iters=500 render_iters=50 render_order=after \
                  margin_us=2000 estimator=quantile submit=every"
             )
         );
@@ -1195,14 +1197,28 @@ mod tests {
         let q = 65_536;
         let span = |begin_ns, end_ns| PassSpan { begin_ns, end_ns };
         let outcome = Outcome {
-            pass_frames: vec![Frame {
-                compute: vec![Pass {
-                    slice: SliceId::new(0),
-                    us: 655,
-                    span: span(3 * q, 13 * q),
-                }],
-                render: Some(span(10 * q, 41 * q)),
-            }],
+            pass_frames: vec![
+                Frame {
+                    index: 0,
+                    compute: vec![Pass {
+                        slice: SliceId::new(0),
+                        us: 655,
+                        span: span(3 * q, 13 * q),
+                    }],
+                    render: Some(span(10 * q, 41 * q)),
+                },
+                // The next frame's slice began two steps before the render
+                // above ended.
+                Frame {
+                    index: 1,
+                    compute: vec![Pass {
+                        slice: SliceId::new(0),
+                        us: 655,
+                        span: span(39 * q, 49 * q),
+                    }],
+                    render: None,
+                },
+            ],
             ..Outcome::default()
         };
         let text = report(&Environment::default(), &outcome);
@@ -1215,25 +1231,35 @@ mod tests {
             .position(|&n| n == "gpu_frames_over_period")
             .unwrap();
         assert_eq!(
-            names[at + 1..at + 6],
+            names[at + 1..at + 7],
             [
                 "pass_overlap_frames",
                 "pass_overlap_us",
                 "pass_order",
                 "slice_vs_render_overlap",
-                "pass_overlap_compute"
+                "pass_overlap_compute",
+                "pass_overlap_next_frame"
             ]
         );
         assert_eq!(
             line(&text, "pass_overlap_frames"),
             Some(
-                "frames=1 with_render_and_slices=1 overlapping=1 share=1.0000 \
+                "frames=2 with_render_and_slices=1 overlapping=1 share=1.0000 \
                  tolerance_ns=65536 max_intersection_ns=196608"
             )
         );
         assert_eq!(
             line(&text, "pass_order"),
             Some("render_before_first_slice=0 render_after_last_slice=0 render_among_slices=1")
+        );
+        // Two steps of 65.536 µs.
+        assert_eq!(
+            line(&text, "pass_overlap_next_frame"),
+            Some(
+                "pairs=1 first_slice_before_render_end=1 share=1.0000 \
+                 first_slice_at_render_end=0 first_slice_after_render_end=0 tolerance_ns=65536 \
+                 before_us_p50=131 before_us_max=131 after_us_p50=none after_us_max=none"
+            )
         );
     }
 
@@ -1244,11 +1270,12 @@ mod tests {
             let text = render(&Environment::default(), &config, &Outcome::default());
             line(&text, "config").unwrap().to_owned()
         };
-        // The default is unchanged.
-        assert!(config_of("").contains(" render_iters=50 render_order=free margin_us=2000 "));
-        assert!(config_of("?render_order=after").contains(" render_order=after margin_us="));
+        // The order used is printed, the default `after` included.
+        assert!(config_of("").contains(" render_iters=50 render_order=after margin_us=2000 "));
+        assert!(config_of("?model=depth").contains(" render_order=after "));
+        assert!(config_of("?render_order=free").contains(" render_order=free margin_us="));
         assert!(
-            config_of("?model=depth&side=266&render_order=after").contains(" render_order=after ")
+            config_of("?model=depth&side=266&render_order=free").contains(" render_order=free ")
         );
         for (query, printed) in [
             ("?render_iters=1", "render_iters=1"),
@@ -1383,7 +1410,7 @@ mod tests {
             line(&text, "config"),
             Some(
                 "frames=600 latency=none slices=4 slice_iters=500 render_iters=50 \
-                 render_order=free margin_us=2000 estimator=quantile submit=beat sync=onbeat bpm=100 beat_margin_us=100000 \
+                 render_order=after margin_us=2000 estimator=quantile submit=beat sync=onbeat bpm=100 beat_margin_us=100000 \
                  bpm_change=120@60 beats=300"
             )
         );
@@ -1555,7 +1582,7 @@ mod tests {
             line(&text, "config"),
             Some(
                 "frames=600 latency=10 slices=155 slice_iters=500 render_iters=50 \
-                 render_order=free margin_us=2000 estimator=quantile submit=free workload=depth size=266 fusion=on \
+                 render_order=after margin_us=2000 estimator=quantile submit=free workload=depth size=266 fusion=on \
                  split=on max_dispatch_us=1000"
             )
         );

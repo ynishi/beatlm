@@ -32,8 +32,12 @@ use crate::device::Gpu;
 use crate::net::{self, Net, Numbers};
 use crate::pace::{FRAME_PERIOD, Tick, micros_between};
 use crate::pass_overlap;
+use crate::slots;
 use crate::stats::frame_ratio;
-use crate::workload::{RENDER_HEIGHT, RENDER_WIDTH, RenderOrder, TARGET_FORMAT, Workload};
+use crate::workload::{
+    DEFAULT_STAGE_STORAGE_BUFFERS, RENDER_HEIGHT, RENDER_WIDTH, RenderOrder, TARGET_FORMAT,
+    Workload, written_fits,
+};
 
 /// What a slice is assumed to cost until it has been measured.
 const SLICE_PRIOR: Micros = Micros::new(2_000);
@@ -378,6 +382,24 @@ impl<'g> Engine<'g> {
                         whole.kernels().len()
                     );
                 }
+                // `after` reads every arena; refused before calibration
+                // spends its seconds when the unsplit plan has more than a
+                // stage binds. The split plan is checked again below.
+                // One input and output slot per job that can be in flight: a
+                // job's output must survive until its delivery frame.
+                let slots = policy
+                    .max_in_flight()
+                    .context("the policy does not bound the jobs in flight")?;
+                if args.render_order == RenderOrder::After {
+                    let arenas = slots::memory_plan(&whole, &numbers, slots)?.arenas().len();
+                    written_fits(arenas, DEFAULT_STAGE_STORAGE_BUFFERS).with_context(|| {
+                        format!(
+                            "--render-order after cannot be honoured for the plan of {slots} \
+                             slots, which has {arenas} arenas; run with --render-order free, or \
+                             a shorter --latency or smaller --size, whose plan has fewer"
+                        )
+                    })?;
+                }
                 let names = whole.kernels().iter().map(|k| k.name());
                 let program = match args.max_dispatch_us {
                     None => {
@@ -417,11 +439,6 @@ impl<'g> Engine<'g> {
                         calibration.program
                     }
                 };
-                // One input and output slot per job that can be in flight: a
-                // job's output must survive until its delivery frame.
-                let slots = policy
-                    .max_in_flight()
-                    .context("the policy does not bound the jobs in flight")?;
                 Some(
                     Net::new(&gpu.device, &gpu.queue, &numbers, slots, program)
                         .context("cannot build the planned program")?,
@@ -429,14 +446,23 @@ impl<'g> Engine<'g> {
             }
         };
         // After calibration, whose render passes stay the free ones, so the
-        // loop starts from the same measurements under either order. Only
-        // `after` reads the plan's one arena, so only it refuses a plan of
-        // several.
-        let written = match args.render_order {
-            RenderOrder::Free => None,
-            RenderOrder::After => net.as_ref().map(Net::written).transpose()?,
+        // loop starts from the same measurements under either order. `after`
+        // reads every arena of the plan, so it refuses a plan of more than a
+        // stage binds; the synthetic slices write the load's own sink.
+        let written = match (args.render_order, &net) {
+            (RenderOrder::After, Some(net)) => net.written()?,
+            _ => Vec::new(),
         };
-        workload.order_render(&gpu.device, args.render_order, written);
+        workload
+            .order_render(&gpu.device, args.render_order, &written)
+            .with_context(|| {
+                format!(
+                    "--render-order after cannot be honoured for this plan of {} arenas; run \
+                     with --render-order free, or a shorter --latency or smaller --size, whose \
+                     plan has fewer",
+                    written.len()
+                )
+            })?;
         // A job's slices are the program's kernels, each part of a split one
         // included.
         let slices = net.as_ref().map_or(args.slices, Net::kernel_count);

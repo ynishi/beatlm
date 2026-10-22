@@ -23,7 +23,7 @@ use crate::depth;
 use crate::onbeat;
 use crate::pace::{Pace, Pacer, WINDOW, ms_to_us};
 use crate::report::{DepthReport, Environment};
-use crate::slots::{self, Net};
+use crate::slots::Net;
 use crate::workload::{DEFAULT_SLICE_ITERS, Workload};
 use device::Need;
 use frame::{DepthLoad, Load, OnBeatRun, Run};
@@ -206,14 +206,11 @@ async fn setup(mut config: Config) -> Result<()> {
             let gpu = device::open(page::canvas()?, need).await?;
             let mut workload = Workload::new(&gpu.device, DEFAULT_SLICE_ITERS, config.render_iters);
             // The synthetic slices write the load's own sink.
-            workload.order_render(&gpu.device, config.render_order, None);
+            workload.order_render(&gpu.device, config.render_order, &[])?;
             warm_up(&gpu, &workload).await?;
             (gpu, workload, Load::Synthetic)
         }
         Model::Depth { side } => {
-            let url = depth::weights_url();
-            page::show(&format!("status: fetching {url}"));
-            let loaded = model::load(side).await?;
             // One slot per job that can be in flight; the device is asked for
             // what the loop's plan of the unsplit model needs. On beat the
             // host bounds the jobs pending ([`onbeat::SLOTS`]).
@@ -223,7 +220,14 @@ async fn setup(mut config: Config) -> Result<()> {
                     .max_in_flight()
                     .context("the policy does not bound the jobs in flight")?,
             };
-            let plan = slots::memory_plan(&loaded.program, &loaded.numbers, slots)?;
+            // The plan needs only the graph, so a render order it cannot
+            // serve is refused before the weights are downloaded.
+            let graph = depth::graph(side)?;
+            let plan = graph.memory_plan(slots)?;
+            depth::check_render_order(config.render_order, &plan, side, slots)?;
+            let url = depth::weights_url();
+            page::show(&format!("status: fetching {url}"));
+            let loaded = model::load(graph).await?;
             let gpu = device::open(page::canvas()?, Need::Plan(plan)).await?;
             let workload = Workload::new(&gpu.device, DEFAULT_SLICE_ITERS, config.render_iters);
             warm_up(&gpu, &workload).await?;

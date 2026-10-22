@@ -38,15 +38,20 @@
 //!   it has; default [`DEFAULT_RENDER_ITERS`], 50). Both jobs, fixed latency
 //!   and on beat; refused with `model=pass-cost` (below). The next section
 //!   says why it exists.
-//! - `render_order`: `free` (the default) or `after`, the bench's
-//!   `--render-order`: whether the loop's render pass reads what the frame's
-//!   slices write, so that it runs after them. It tests H7 of #53 (#61) by
-//!   taking the overlap the `pass_overlap_*` lines measured away; the bench's
-//!   `workload.rs` ("Ordering the render pass after the slices") says how and
-//!   what it guarantees. With the depth model the display is the pass that
-//!   reads them, the plan's one arena. Both jobs; refused with
-//!   `model=pass-cost`, whose render is no loop's. The `config:` line prints
-//!   it (`render_order=`).
+//! - `render_order`: `after` (the default, [`DEFAULT_RENDER_ORDER`]) or
+//!   `free`, the bench's `--render-order`: whether the loop's render pass
+//!   reads what the frame's slices write, so that it runs after them. It
+//!   came from H7 of #53 (#61): in Chrome the render ran beside the slices
+//!   and slowed them, and ordering it after them took that away (the crate
+//!   documentation, "What differs from the native bench, and why", has the
+//!   measurements and why the bench keeps `free`); `free` is the frame as it
+//!   was before, kept to compare against. The bench's `workload.rs`
+//!   ("Ordering the render pass after the slices") says how and what it
+//!   guarantees. With the depth model the display is the pass that reads
+//!   them, every arena of the plan, and a plan of more arenas than the
+//!   render can read is refused before the weights are fetched, naming
+//!   `render_order=free`. Both jobs; refused with `model=pass-cost`, whose
+//!   render is no loop's. The `config:` line prints it (`render_order=`).
 //! - `sync`: the delivery promise, `latency` (the default: fixed latency, the
 //!   promise every parameter above is about) or `onbeat` (results on the
 //!   first frame at or after a beat of a click track the page plays,
@@ -298,6 +303,12 @@ use crate::workload::{DEFAULT_RENDER_ITERS, RenderOrder};
 /// Frames a run lasts when `frames` is not given: the bench's default.
 pub const DEFAULT_FRAMES: u64 = 600;
 
+/// The render order when `render_order` is not given: the render pass waits
+/// for the frame's slices. The bench's default is `free`; the crate
+/// documentation ("What differs from the native bench, and why") has the
+/// measurements that decided each.
+pub const DEFAULT_RENDER_ORDER: RenderOrder = RenderOrder::After;
+
 /// The promised latency in frames of the synthetic workload when neither
 /// `latency` nor `latency_ms` is given: the bench's default for it.
 pub const DEFAULT_LATENCY: u32 = 2;
@@ -413,7 +424,7 @@ pub struct Config {
     /// Zero is allowed (the module documentation says why).
     pub render_iters: u32,
     /// `render_order`: whether the loop's render pass waits for the frame's
-    /// slices; [`RenderOrder::Free`] when not given.
+    /// slices; [`DEFAULT_RENDER_ORDER`] when not given.
     pub render_order: RenderOrder,
     /// `sync=onbeat` and its parameters; `None` for the fixed-latency promise,
     /// whose `latency` is then the one kept.
@@ -440,7 +451,7 @@ impl Default for Config {
             arena_bytes: None,
             estimator: Estimator::default(),
             render_iters: DEFAULT_RENDER_ITERS,
-            render_order: RenderOrder::Free,
+            render_order: DEFAULT_RENDER_ORDER,
             on_beat: None,
         }
     }
@@ -474,7 +485,7 @@ pub fn parse(query: &str) -> Result<Config> {
     let mut arena_bytes = None;
     let mut chosen = None;
     let mut render_iters = DEFAULT_RENDER_ITERS;
-    let mut render_order = RenderOrder::Free;
+    let mut render_order = DEFAULT_RENDER_ORDER;
     let mut on_beat = false;
     let mut bpm = None;
     let mut change = None;
@@ -963,7 +974,7 @@ mod tests {
                 arena_bytes: Some(134_217_600),
                 estimator: Estimator::default(),
                 render_iters: DEFAULT_RENDER_ITERS,
-                render_order: RenderOrder::Free,
+                render_order: RenderOrder::After,
                 on_beat: None,
             }
         );
@@ -993,7 +1004,7 @@ mod tests {
                 arena_bytes: None,
                 estimator: Estimator::default(),
                 render_iters: DEFAULT_RENDER_ITERS,
-                render_order: RenderOrder::Free,
+                render_order: RenderOrder::After,
                 on_beat: None,
             }
         );
@@ -1294,31 +1305,42 @@ mod tests {
     }
 
     #[test]
-    fn render_order_is_free_unless_after_is_asked_for() {
-        assert_eq!(Config::default().render_order, RenderOrder::Free);
-        assert_eq!(parse("").unwrap().render_order, RenderOrder::Free);
+    fn render_order_is_after_unless_free_is_asked_for() {
+        assert_eq!(DEFAULT_RENDER_ORDER, RenderOrder::After);
+        assert_eq!(Config::default().render_order, RenderOrder::After);
+        for query in [
+            "",
+            "?model=depth",
+            "?model=depth&side=518&latency_ms=600",
+            "?sync=onbeat&bpm=120",
+            "?model=depth&sync=onbeat",
+        ] {
+            assert_eq!(
+                parse(query).unwrap().render_order,
+                RenderOrder::After,
+                "{query}"
+            );
+        }
         for (query, order) in [
             ("?render_order=free", RenderOrder::Free),
             ("?render_order=after", RenderOrder::After),
             (
-                "?model=depth&side=266&latency_ms=200&frames=1500&render_iters=50&render_order=after",
-                RenderOrder::After,
+                "?model=depth&side=266&latency_ms=200&frames=1500&render_iters=50&render_order=free",
+                RenderOrder::Free,
             ),
-            (
-                "?sync=onbeat&bpm=120&render_order=after",
-                RenderOrder::After,
-            ),
+            ("?sync=onbeat&bpm=120&render_order=free", RenderOrder::Free),
         ] {
             assert_eq!(parse(query).unwrap().render_order, order, "{query}");
         }
         // Nothing else moves with it.
         assert_eq!(
-            parse("?render_order=after").unwrap(),
+            parse("?render_order=free").unwrap(),
             Config {
-                render_order: RenderOrder::After,
+                render_order: RenderOrder::Free,
                 ..Config::default()
             }
         );
+        assert_eq!(parse("?render_order=after").unwrap(), Config::default());
         for bad in [
             "?render_order=before",
             "?render_order=",

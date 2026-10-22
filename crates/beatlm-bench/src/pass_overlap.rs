@@ -1,6 +1,8 @@
 //! Whether a frame's render pass ran at the same time as its compute passes
 //! on the GPU: the report's `pass_overlap_frames`, `pass_overlap_us`,
-//! `pass_order`, `slice_vs_render_overlap` and `pass_overlap_compute` lines.
+//! `pass_order`, `slice_vs_render_overlap` and `pass_overlap_compute` lines;
+//! and where the next frame's first compute pass began against the render's
+//! end, `pass_overlap_next_frame`.
 //!
 //! The browser host (`beatlm-web`) compiles this file by path, so a page and
 //! the bench write these lines by the same rules and in the same format, and
@@ -28,9 +30,12 @@
 //! pass (the page records an untimed copy of the delivered depth between
 //! them). Every pass carries a begin and an end timestamp
 //! ([`PassSpan`]) from the timer's one query set, resolved by the frame's own
-//! submission on the one queue. Every comparison here is between passes of
-//! one frame, so of one submission; that those timestamps share a clock is
-//! taken, not checked, as for the page's `tail_gap_*` lines (issue #43).
+//! submission on the one queue. Every comparison here but one is between
+//! passes of one frame, so of one submission; that those timestamps share a
+//! clock is taken, not checked, as for the page's `tail_gap_*` lines (issue
+//! #43). `pass_overlap_next_frame` compares two frames, so two submissions,
+//! and takes the same of them: that the queue's timestamps share one clock
+//! across submissions, as the page's `tail_gap_before_first_us` does.
 //!
 //! A queue that runs the passes one after the other, in the order encoded,
 //! gives spans that do not intersect: each begins at or after the end of the
@@ -93,6 +98,52 @@
 //!   with the render: compute passes that overlap one another as often as the
 //!   render overlaps them point at the timestamps, or at how every pass is
 //!   scheduled, rather than at the render.
+//! - `pass_overlap_next_frame`: pairs of consecutive timed frames, the first
+//!   with a timed render and the second with a timed compute pass (`pairs`),
+//!   by where the second's first compute pass (the earliest begin) fell
+//!   against the first's render end ([`Next`]): more than the tolerance
+//!   before it (`first_slice_before_render_end`, `share` of the pairs),
+//!   within it (`first_slice_at_render_end`), or more than it after
+//!   (`first_slice_after_render_end`); the tolerance; and by how much, in
+//!   microseconds, p50 and max, before (`before_us_*`) and after
+//!   (`after_us_*`). See "Across frames".
+//!
+//! # Across frames
+//!
+//! Under the `after` render order (the bench's `--render-order`, the page's
+//! `render_order`) the render reads every buffer the slices write
+//! (`workload.rs`), so the next frame's slices write what this frame's render
+//! read: a write after a read, which WebGPU orders after the read. Whether
+//! that makes the next frame's slices wait for this render is what
+//! `pass_overlap_next_frame` reads, beside the same line under `free`. Its
+//! three counts say different things. A first slice that began before the
+//! render ended did not wait for its end (WebGPU orders the write after the
+//! vertex stage's read, not after the render's end, so this is no broken
+//! rule), or the two submissions' timestamps do not compare. One that began
+//! at the end, within the tolerance, is what a wait looks like when the next
+//! frame's work was already queued. One that began later says nothing about
+//! a wait: the GPU had nothing queued, because the next frame was submitted
+//! after the render ended, which is how a frame whose GPU work is shorter than
+//! its period usually ends.
+//!
+//! Natively that is every pair. Apple M1 Pro, Metal, wgpu 30.0.1, release,
+//! 2026-10-22, Depth Anything V2 Small, `--workload depth --submit free
+//! --frames 300 --render-iters 50`, one run each:
+//!
+//! | run | arenas | pairs | before / at / after the render's end | after, µs p50 / max |
+//! |---|---|---|---|---|
+//! | 266 px, `--latency 5`, `free` | 1 | 299 | 0 / 0 / 299 | 8316 / 17204 |
+//! | 266 px, `--latency 5`, `after` | 1 | 299 | 0 / 0 / 299 | 1426 / 20715 |
+//! | 266 px, `--latency 25`, `after` | 2 | 299 | 0 / 0 / 299 | 1391 / 17021 |
+//! | 518 px, `--latency 10`, `after` | 2 | 299 | 0 / 0 / 299 | 1793 / 4701 |
+//!
+//! No first slice began before or at the previous render's end: the bench
+//! submits a frame at most once per 16.7 ms period and its GPU work took
+//! about 14 ms, so the GPU was idle when each frame came, and the line could
+//! not have shown a wait natively. The gap is shorter under `after` because
+//! the render is then the frame's last pass, where under `free` slices ran on
+//! after it. Whether the next frame waits is for a run that keeps the GPU
+//! busy across frames to show, as a browser at 120 Hz may.
 //!
 //! # What it found natively
 //!
@@ -157,6 +208,8 @@ pub struct Pass {
 /// encoded, and its render pass, which was encoded after them.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Frame {
+    /// The frame's index, which says which frame came before it.
+    pub index: u64,
     /// The compute passes.
     pub compute: Vec<Pass>,
     /// The render pass's timestamps, when the frame timed one.
@@ -169,6 +222,7 @@ impl Frame {
     #[must_use]
     pub fn of<T>(timing: &FrameTiming<T>, slice: impl Fn(&T) -> SliceId) -> Self {
         Self {
+            index: timing.frame.get(),
             compute: timing
                 .compute
                 .iter()
@@ -283,6 +337,75 @@ pub fn order(render: PassSpan, compute: &[PassSpan], tolerance_ns: u64) -> Optio
     })
 }
 
+/// Where a frame's first compute pass began against the previous frame's
+/// render end, with the distance in nanoseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Next {
+    /// More than the tolerance before the render ended, by this much.
+    Before(u64),
+    /// Within the tolerance of the render's end, either side.
+    At,
+    /// More than the tolerance after the render ended, by this much.
+    After(u64),
+}
+
+/// Where a compute pass that began at `first_begin_ns` fell against a render
+/// that ended at `render_end_ns`, with `tolerance_ns` given to the end
+/// (see [`Next`]).
+#[must_use]
+pub fn next(render_end_ns: u64, first_begin_ns: u64, tolerance_ns: u64) -> Next {
+    if first_begin_ns.saturating_add(tolerance_ns) < render_end_ns {
+        Next::Before(render_end_ns - first_begin_ns)
+    } else if first_begin_ns > render_end_ns.saturating_add(tolerance_ns) {
+        Next::After(first_begin_ns - render_end_ns)
+    } else {
+        Next::At
+    }
+}
+
+/// Consecutive frames: the first's render against the second's first compute
+/// pass ("Across frames" in the module documentation).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NextFrame {
+    /// Pairs of consecutive timed frames, the first with a timed render and
+    /// the second with a timed compute pass.
+    pub pairs: u64,
+    /// Per pair whose first compute pass began before the render ended, by
+    /// how much, in microseconds.
+    pub before_us: Vec<u64>,
+    /// Pairs whose first compute pass began within the tolerance of the
+    /// render's end.
+    pub at: u64,
+    /// Per pair whose first compute pass began after the render ended, by
+    /// how much, in microseconds.
+    pub after_us: Vec<u64>,
+}
+
+/// [`NextFrame`] over `frames`, in any order, with `tolerance_ns`.
+fn next_frame(frames: &[Frame], tolerance_ns: u64) -> NextFrame {
+    let by_index: BTreeMap<u64, &Frame> = frames.iter().map(|f| (f.index, f)).collect();
+    let mut out = NextFrame::default();
+    for (&index, frame) in &by_index {
+        let Some(render) = frame.render else {
+            continue;
+        };
+        let first = index
+            .checked_add(1)
+            .and_then(|i| by_index.get(&i))
+            .and_then(|f| f.compute.iter().map(|p| p.span.begin_ns).min());
+        let Some(first) = first else {
+            continue;
+        };
+        out.pairs += 1;
+        match next(render.end_ns, first, tolerance_ns) {
+            Next::Before(ns) => out.before_us.push(round_us(ns)),
+            Next::At => out.at += 1,
+            Next::After(ns) => out.after_us.push(round_us(ns)),
+        }
+    }
+    out
+}
+
 /// Ratios of measurements to their slice's median: their median and 90th
 /// percentile, and their mean.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -358,6 +481,8 @@ pub struct PassOverlap {
     pub not_overlapped: Option<Normalized>,
     /// Consecutive compute passes against each other.
     pub compute: ComputePairs,
+    /// Each render against the next frame's first compute pass.
+    pub next_frame: NextFrame,
 }
 
 /// The statistics of the lines over `frames`, in any order.
@@ -429,6 +554,7 @@ pub fn analyse(frames: &[Frame]) -> PassOverlap {
     }
     out.overlapped = Normalized::of(with);
     out.not_overlapped = Normalized::of(without);
+    out.next_frame = next_frame(frames, tolerance);
     out
 }
 
@@ -504,7 +630,30 @@ pub fn write_lines(out: &mut String, o: &PassOverlap) -> std::fmt::Result {
         c.frames_with_pairs,
         c.frames_overlapping,
         c.max_intersection_ns
-    )
+    )?;
+    let n = &o.next_frame;
+    let before = n.before_us.len() as u64;
+    write!(
+        out,
+        "pass_overlap_next_frame: pairs={} first_slice_before_render_end={before} share={} \
+         first_slice_at_render_end={} first_slice_after_render_end={} tolerance_ns={}",
+        n.pairs,
+        share(before, n.pairs),
+        n.at,
+        n.after_us.len(),
+        o.tolerance_ns
+    )?;
+    write_p50_max(out, "before_us", &n.before_us)?;
+    write_p50_max(out, "after_us", &n.after_us)?;
+    writeln!(out)
+}
+
+/// ` <name>_p50=.. <name>_max=..`, each `none` when there are no samples.
+fn write_p50_max(out: &mut String, name: &str, samples: &[u64]) -> std::fmt::Result {
+    match summarize(samples) {
+        Some(s) => write!(out, " {name}_p50={} {name}_max={}", s.p50, s.max),
+        None => write!(out, " {name}_p50=none {name}_max=none"),
+    }
 }
 
 /// ` <name>_samples=n <name>_ratio_mean=.. <name>_ratio_p50=.. <name>_ratio_p90=..`,
@@ -537,10 +686,11 @@ mod tests {
         PassSpan { begin_ns, end_ns }
     }
 
-    /// A frame of compute passes `(slice, begin, end)` in nanoseconds, and a
+    /// Frame 0, of compute passes `(slice, begin, end)` in nanoseconds, and a
     /// render.
     fn frame(compute: &[(u32, u64, u64)], render: Option<PassSpan>) -> Frame {
         Frame {
+            index: 0,
             compute: compute
                 .iter()
                 .map(|&(slice, begin, end)| Pass {
@@ -635,7 +785,7 @@ mod tests {
                 // 201 steps apart, so that the timestamps' common step is one
                 // of Chrome's and not a multiple of it.
                 let at = i * 201 * Q;
-                if i < 5 {
+                let f = if i < 5 {
                     frame(
                         &[(0, at, at + 10 * Q), (1, at + 10 * Q, at + 20 * Q)],
                         Some(span(at + 20 * Q, at + 50 * Q)),
@@ -645,7 +795,8 @@ mod tests {
                         &[(0, at, at + 10 * Q), (1, at + 10 * Q, at + 30 * Q)],
                         Some(span(at + 15 * Q, at + 45 * Q)),
                     )
-                }
+                };
+                Frame { index: i, ..f }
             })
             .collect()
     }
@@ -695,12 +846,15 @@ mod tests {
         let mut frames = chrome_like();
         let at = 10 * 201 * Q;
         // Overlapping slices, and no render span.
-        frames.push(frame(
-            &[(0, at, at + 10 * Q), (1, at + 5 * Q, at + 20 * Q)],
-            None,
-        ));
+        frames.push(Frame {
+            index: 10,
+            ..frame(&[(0, at, at + 10 * Q), (1, at + 5 * Q, at + 20 * Q)], None)
+        });
         // A render with no slice.
-        frames.push(frame(&[], Some(span(at + 100 * Q, at + 110 * Q))));
+        frames.push(Frame {
+            index: 11,
+            ..frame(&[], Some(span(at + 100 * Q, at + 110 * Q)))
+        });
         let o = analyse(&frames);
         assert_eq!((o.frames, o.with_render_and_slices), (12, 10));
         assert_eq!(o.compute.pairs, 11);
@@ -710,6 +864,75 @@ mod tests {
         // Their measurements are not among the ratios.
         assert_eq!(o.overlapped.unwrap().ratios.samples, 5);
         assert_eq!(o.not_overlapped.unwrap().ratios.samples, 15);
+    }
+
+    #[test]
+    fn the_next_slice_begins_before_at_or_after_the_render_end() {
+        // Before by more than the tolerance; within it either side; after.
+        assert_eq!(next(1_000, 500, 100), Next::Before(500));
+        assert_eq!(next(1_000, 900, 100), Next::At);
+        assert_eq!(next(1_000, 899, 100), Next::Before(101));
+        assert_eq!(next(1_000, 1_100, 100), Next::At);
+        assert_eq!(next(1_000, 1_101, 100), Next::After(101));
+        // Quantized equal timestamps are at the end.
+        assert_eq!(next(5 * Q, 5 * Q, Q), Next::At);
+        // A render that ends at zero, a slice at the clock's end.
+        assert_eq!(next(0, u64::MAX, 0), Next::After(u64::MAX));
+        assert_eq!(next(u64::MAX, 0, 0), Next::Before(u64::MAX));
+    }
+
+    #[test]
+    fn a_render_is_paired_with_the_next_frames_first_slice_only() {
+        let at = |index: u64, compute: &[(u32, u64, u64)], render: Option<PassSpan>| Frame {
+            index,
+            ..frame(compute, render)
+        };
+        let frames = vec![
+            // Given out of order: frame 2 first.
+            at(
+                2,
+                &[(0, 2_500_000, 3_000_000)],
+                Some(span(3_000_000, 4_000_000)),
+            ),
+            // Its render ends at 2 ms; frame 1's first slice, the earliest
+            // begin and not the first encoded, begins 1 ms before.
+            at(0, &[(0, 0, 500_000)], Some(span(500_000, 2_000_000))),
+            at(
+                1,
+                &[(1, 1_200_000, 1_400_000), (0, 1_000_000, 1_200_000)],
+                Some(span(1_400_000, 2_400_000)),
+            ),
+            // Frame 2's render ends at 4 ms and frame 3's slice begins there.
+            at(
+                3,
+                &[(0, 4_000_000, 4_500_000)],
+                Some(span(4_500_000, 5_000_000)),
+            ),
+            // Frame 4 has neither, so frame 3 has no pair and frame 5 none
+            // before it; frame 7's previous frame, 6, was not timed. Its
+            // render's odd end puts the run's step, and so the tolerance, at
+            // the floor.
+            at(4, &[], None),
+            at(5, &[(0, 7_000_000, 7_500_000)], None),
+            at(
+                7,
+                &[(0, 9_000_000, 9_500_000)],
+                Some(span(9_500_000, 9_800_001)),
+            ),
+        ];
+        let o = analyse(&frames);
+        assert_eq!(o.tolerance_ns, MIN_TOLERANCE_NS);
+        let n = o.next_frame;
+        // (0, 1): 1 ms before; (1, 2): 0.1 ms after; (2, 3): at.
+        assert_eq!(
+            n,
+            NextFrame {
+                pairs: 3,
+                before_us: vec![1_000],
+                at: 1,
+                after_us: vec![100],
+            }
+        );
     }
 
     #[test]
@@ -728,7 +951,10 @@ mod tests {
              not_overlapped_ratio_mean=none not_overlapped_ratio_p50=none \
              not_overlapped_ratio_p90=none\n\
              pass_overlap_compute: pairs=0 overlapping=0 share=none frames_with_pairs=0 \
-             frames_overlapping=0 max_intersection_ns=0\n"
+             frames_overlapping=0 max_intersection_ns=0\n\
+             pass_overlap_next_frame: pairs=0 first_slice_before_render_end=0 share=none \
+             first_slice_at_render_end=0 first_slice_after_render_end=0 tolerance_ns=1000 \
+             before_us_p50=none before_us_max=none after_us_p50=none after_us_max=none\n"
         );
         let mut text = String::new();
         write_lines(&mut text, &analyse(&chrome_like())).unwrap();
@@ -745,6 +971,14 @@ mod tests {
              overlapped_ratio_p50=2.00 overlapped_ratio_p90=2.00 not_overlapped_samples=15 \
              not_overlapped_ratio_mean=1.00 not_overlapped_ratio_p50=1.00 \
              not_overlapped_ratio_p90=1.00"
+        );
+        // Each frame begins 201 steps after the one before, long after its
+        // render ended: 151 steps after for the first five, 156 for the rest.
+        assert_eq!(
+            lines[5],
+            "pass_overlap_next_frame: pairs=9 first_slice_before_render_end=0 share=0.0000 \
+             first_slice_at_render_end=0 first_slice_after_render_end=9 tolerance_ns=65536 \
+             before_us_p50=none before_us_max=none after_us_p50=9896 after_us_max=10224"
         );
         for line in lines {
             let (name, value) = line.split_once(": ").unwrap();
@@ -765,6 +999,7 @@ mod tests {
             render_span: Some(span(100_000, 200_000)),
         };
         let f = Frame::of(&timing, |&tag| SliceId::new(tag));
+        assert_eq!(f.index, 3);
         assert_eq!(f.compute.len(), 2);
         assert_eq!(f.compute[1].slice, SliceId::new(9));
         assert_eq!(f.compute[1].us, 60);
