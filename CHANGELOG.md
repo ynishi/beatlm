@@ -97,6 +97,10 @@ and this project adheres to
 - `beatlm-web` `sync=onbeat`: results delivered on beats from a Web Audio
   clock (`bpm`, `bpm_change`, `margin_ms`, `beats`), started by a click, with
   beat landing error and tempo-change lines in the report.
+- `pass-cost` workload (`beatlm-bench --workload pass-cost`,
+  `beatlm-web ?model=pass-cost`): what a compute pass and its timestamps
+  cost, natively and in the browser; `Kernels::record` and `Net::record`
+  record a kernel into an open pass.
 
 ### Changed
 
