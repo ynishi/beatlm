@@ -49,18 +49,12 @@ fn display_vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
     return triangle(vi);
 }
 
-// Read by `display_vs_after` only, for `render_order=after`: the first word of
-// the plan's one arena, which every slice writes, bound read-only, so the
-// pass runs after the frame's slices. `render_vs_after` in beatlm-bench's
-// shaders.wgsl is the same, and its `workload.rs` says what that guarantees.
-@group(1) @binding(0) var<storage, read> written: array<u32>;
-
-// `display_vs`, made a reader of `written`, by a shift no rasteriser shows.
-@vertex
-fn display_vs_after(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
-    let p = triangle(vi);
-    return vec4<f32>(p.x + f32(written[0] >> 8u) * 1e-30, p.y, p.z, p.w);
-}
+// `display_vs_after`, for `render_order=after`, is `display_vs` made a reader
+// of the first word of every arena of the plan, the buffers the slices write,
+// so the pass runs after the frame's slices. It is appended to this text by
+// beatlm-bench's `workload::after_vertex`, which binds one per arena and
+// generates the synthetic render's `render_vs_after` the same way; its
+// `workload.rs` says what that guarantees.
 
 // The pixel of the model's image under canvas position `p` in the square whose
 // left edge is `x0`, or -1 outside it.

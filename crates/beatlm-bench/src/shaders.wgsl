@@ -36,20 +36,11 @@ fn render_vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
     return triangle(vi);
 }
 
-// Read by `render_vs_after` only: the first word of the buffer the frame's
-// slices write (`sink`, or the depth model's arena), bound read-only. That the
-// vertex stage reads what they wrote is what orders the render pass after
-// them (`workload.rs`, "Ordering the render pass after the slices").
-@group(1) @binding(0) var<storage, read> written: array<u32>;
-
-// `render_vs`, made a reader of `written`. The word moves the vertex by at
-// most 2^24 * 1e-30 of clip space, which no rasteriser shows, and from a
-// value the compiler cannot know, so the read is not removed.
-@vertex
-fn render_vs_after(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
-    let p = triangle(vi);
-    return vec4<f32>(p.x + f32(written[0] >> 8u) * 1e-30, p.y, p.z, p.w);
-}
+// `render_vs_after`, `render_vs` made a reader of every buffer the frame's
+// slices write (`sink`, or the depth model's arenas), is appended to this text
+// by `workload::after_vertex`, which binds as many as there are: that the
+// vertex stage reads what they wrote is what orders the render pass after them
+// (`workload.rs`, "Ordering the render pass after the slices").
 
 // The render pass: a serial float chain per pixel.
 @fragment

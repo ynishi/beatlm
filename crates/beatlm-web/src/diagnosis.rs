@@ -167,8 +167,8 @@
 //! `tail_gap_between_passes_us` and a render that measured faster in frames
 //! with slices (the first section) both fit it. Five lines, written for every
 //! run, the synthetic workload's too (with zero frames when the device has no
-//! timestamps), test it, and the bench
-//! writes the same five from the same file, so a page's compare with a native
+//! timestamps), test it, a sixth reads the frame after, and the bench
+//! writes the same six from the same file, so a page's compare with a native
 //! run line by line; [`crate::pass_overlap`] defines them, the tolerance an
 //! intersection must exceed (one timestamp step: 65 536 ns in Chrome), and
 //! what timestamps of one submission can and cannot say, the clock they share
@@ -186,12 +186,19 @@
 //! - `pass_overlap_compute`: consecutive slices that intersect one another,
 //!   which the render does not explain: overlap there as often as with the
 //!   render points at the timestamps rather than at the render.
+//! - `pass_overlap_next_frame`: where each frame's first slice began against
+//!   the previous frame's render end, before, at or after it; under
+//!   `render_order=after` the slices write what that render read, and the
+//!   line reads whether they waited for it. It compares two submissions, the
+//!   assumption `tail_gap_before_first_us` makes too ([`crate::pass_overlap`],
+//!   "Across frames").
 //!
 //! Natively the render overlapped the slices in every frame, and slowed the
 //! ones it overlapped at 50 iterations ([`crate::pass_overlap`], "What it
 //! found natively"), so overlap alone does not set Chrome apart; the lines'
 //! figures in Chrome against those are what decide H7. `render_order=after`
-//! ([`crate::config`]) takes the overlap away, so that the same lines and the
+//! ([`crate::config`]), the page's default, takes the overlap away, and
+//! `render_order=free` keeps it, so that the same lines and the
 //! slices' times can be compared with it and without; the bench's
 //! `workload.rs` says how and what that guarantees.
 //!

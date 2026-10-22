@@ -64,10 +64,24 @@
 //! one after another (`pass_overlap.rs`, "What it found natively", has the
 //! runs), so a sum of a frame's pass durations, such as `gpu_frame_us`, can
 //! count the same time twice. `--render-order after` makes the render pass
-//! read what the slices write, so that it runs after them; `workload.rs`
-//! ("Ordering the render pass after the slices") says how, what that
-//! guarantees, and what it measured. The default, `free`, is the frame as it
-//! was before the option existed.
+//! read what the slices write, every arena of a planned program's plan, so
+//! that it runs after them; `workload.rs` ("Ordering the render pass after
+//! the slices") says how, what that guarantees, what bounds the arenas it
+//! reads, and what it measured. A plan of more arenas than that is refused
+//! before calibration.
+//!
+//! The default here stays `free`, the frame as it was before the option
+//! existed, although the browser host defaults to `after`: natively the order
+//! bought nothing measurable and cost a little. On an Apple M1 Pro, Metal,
+//! wgpu 30.0.1, Depth Anything V2 Small at 266 px, `--latency 5 --submit
+//! free`, it changed neither the delivery (119 of 119 delivered in 600
+//! frames, either order) nor the slices' means, and `gpu_frame_us` p50 rose
+//! from 13.1 to 13.8 ms (2026-10-22, one run each; the table in
+//! `workload.rs`). In Chrome on the same machine the render slowed the
+//! slices and `after` took that away (`beatlm-web`'s crate documentation has
+//! the figures), which is a browser's reason, not one the native runs show.
+//! Making `after` the default here wants a native measurement that shows a
+//! gain.
 //!
 //! # The `net` workload
 //!
@@ -677,11 +691,12 @@
 //! | `gpu_frame_us` | per timed frame, render plus every slice, on the GPU: p50, p99, max |
 //! | `longest_dispatch_us` | per timed frame that ran a slice, the longest single measured compute pass: how long one dispatch held up the queue; p50, p99, max |
 //! | `gpu_frames_over_period` | timed frames whose render plus slices took longer than the frame period, of the timed frames: a real overrun that the estimates were supposed to prevent |
-//! | `pass_overlap_frames` | of the timed frames, those with a timed render and a timed slice, and of those the frames whose render span intersects a slice's by more than the tolerance (`tolerance_ns`: the timestamps' step, at least 1 µs), with the share and the largest intersection seen; H7 of issue #53 (#61) asks whether the render runs beside the slices. `pass_overlap.rs` defines this line and the four after it, and the browser's report has the same five |
+//! | `pass_overlap_frames` | of the timed frames, those with a timed render and a timed slice, and of those the frames whose render span intersects a slice's by more than the tolerance (`tolerance_ns`: the timestamps' step, at least 1 µs), with the share and the largest intersection seen; H7 of issue #53 (#61) asks whether the render runs beside the slices. `pass_overlap.rs` defines this line and the five after it, and the browser's report has the same six |
 //! | `pass_overlap_us` | per overlapping frame, the time the render shared with the slices taken together: p50, p99, max |
 //! | `pass_order` | where each such frame's render began: before the first slice began, after the last ended (the order encoded), or among them |
 //! | `slice_vs_render_overlap` | each slice measured in a frame with a render, over its slice's median, apart by whether it overlapped the render: how many, and the ratios' mean, p50 and p90 |
 //! | `pass_overlap_compute` | consecutive slices of a frame whose spans intersect by more than the tolerance, of all such pairs, and the frames with one: overlap among the slices, apart from overlap with the render |
+//! | `pass_overlap_next_frame` | consecutive timed frames, by whether the second's first slice began more than the tolerance before the first's render ended, within it, or after it, with the share before and by how much (µs, p50 and max) before and after: whether the next frame's slices, which write what an `after` render read, waited for it. Compares two submissions' timestamps, taking their clock to be shared |
 //! | `frame_ratio` | per timed frame that ran slices, their measured GPU time over the sum of their estimates when the frame was planned (`CostModel::frame_estimate`: every slice, except that `frame-scaled` counts only the slices warm in the loop): how many such frames, and min, p50, p90, max; `none` when there were none |
 //! | `frame_scale` | `none` unless `--estimator frame-scaled`; then the frame scale when the run ended (`final`, `warming_up` before the frame window filled), the frames the cost model recorded (`frames_recorded`), and the plans made with a measured scale (`planned_scaled`) with its min, p50, p90 and max over them |
 //! | `background_dispatches` | dispatches the competing load submitted, from the one completed before the first frame to the last one queued when it was stopped; present only with `--background-load` |

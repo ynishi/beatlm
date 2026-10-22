@@ -9,13 +9,19 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
-use beatlm::load::depth_anything_v2::{Config, reference};
+use beatlm::load::depth_anything_v2::{Config, Role, reference};
+use beatlm::model::Builder;
+use beatlm::model::depth_anything_v2::model;
 use beatlm_core::cost::SliceId;
+use beatlm_core::kernel::{Fusion, Program};
+use beatlm_core::memory::{MemoryPlan, TensorId};
 use beatlm_core::schedule::{FramePlan, JobId};
 use beatlm_core::time::Micros;
 
 use crate::pace::NOMINAL_PERIOD;
+use crate::slots::{self, Numbers};
 use crate::stats::median;
+use crate::workload::{DEFAULT_STAGE_STORAGE_BUFFERS, RenderOrder, written_fits};
 
 /// The URL prefix the models directory is served under, relative to the page:
 /// `just serve-web` maps it to the models directory
@@ -67,6 +73,100 @@ pub const DELIVERY_FLOOR: f64 = 0.99;
 /// A period's fraction, as a divisor, by which a latency in time may fall
 /// short of the frames promised for it ([`frames_for`]): a twentieth.
 const PERIOD_SLACK: u64 = 20;
+
+/// The model at one side, built and lowered but without its numbers: what
+/// the page knows before it fetches the weights, which is enough to plan its
+/// memory and so to refuse a run the plan cannot serve before the download.
+pub struct Graph {
+    /// The side in pixels.
+    pub side: u32,
+    /// The builder the graph was made in, which lists the weights to read
+    /// from the file once it is fetched.
+    pub builder: Builder<Role>,
+    /// The model lowered with fusion, not split.
+    pub program: Program,
+    /// The input image, a job's input.
+    pub image: TensorId,
+    /// The depth, a job's output.
+    pub depth: TensorId,
+}
+
+impl Graph {
+    /// The memory plan of the unsplit program with `slots` slots
+    /// ([`slots::memory_plan`]), the one the device is created for.
+    ///
+    /// The plan reads only which tensors are a job's input and output, so it
+    /// is made here from the ids, before any number exists.
+    ///
+    /// # Errors
+    ///
+    /// No slots or too many, or tensors that cannot be planned.
+    pub fn memory_plan(&self, slots: u32) -> Result<MemoryPlan> {
+        let ids = Numbers {
+            input: self.image,
+            output: self.depth,
+            weights: Vec::new(),
+            slot_input: Box::new(|_| Vec::new()),
+        };
+        slots::memory_plan(&self.program, &ids, slots)
+    }
+}
+
+/// Whether `order` can be honoured for `plan`, the memory plan of the model
+/// at `side` pixels with `slots` slots, before the device exists: under
+/// [`RenderOrder::After`] the display reads every arena of the plan in its
+/// vertex stage, and a device created with the limits the plan needs binds
+/// at most [`DEFAULT_STAGE_STORAGE_BUFFERS`] storage buffers there
+/// (`workload.rs`, "Ordering the render pass after the slices"). The page
+/// asks before it fetches the weights, so a run that cannot be honoured
+/// fails before the download.
+///
+/// # Errors
+///
+/// [`RenderOrder::After`] for a plan of more arenas than that, with what to
+/// change.
+pub fn check_render_order(
+    order: RenderOrder,
+    plan: &MemoryPlan,
+    side: u32,
+    slots: u32,
+) -> Result<()> {
+    if order == RenderOrder::Free {
+        return Ok(());
+    }
+    let arenas = plan.arenas().len();
+    written_fits(arenas, DEFAULT_STAGE_STORAGE_BUFFERS).with_context(|| {
+        format!(
+            "render_order=after cannot be honoured at side={side} with {slots} slots, whose memory \
+             plan has {arenas} arenas: add render_order=free, or ask for a shorter latency or a \
+             smaller side, whose plan has fewer"
+        )
+    })
+}
+
+/// The model at `side` pixels, built and lowered with fusion, without its
+/// weights.
+///
+/// # Errors
+///
+/// A side the model cannot be built at, or a graph that does not lower.
+pub fn graph(side: u32) -> Result<Graph> {
+    let pixels = usize::try_from(side).context("the side does not fit this machine")?;
+    let mut builder = Builder::new();
+    let tensors = model(&mut builder, &Config::small(), pixels)
+        .with_context(|| format!("cannot build Depth Anything V2 Small at {side} pixels"))?;
+    let program = builder
+        .graph()
+        .lower(Fusion::On)
+        .context("cannot lower the depth model")?;
+    Ok(Graph {
+        side,
+        builder,
+        program,
+        image: tensors.image,
+        depth: tensors.depth,
+    })
+}
 
 /// The URL of the weights file, relative to the page.
 #[must_use]
@@ -888,5 +988,69 @@ mod tests {
                 "{unknown:?}"
             );
         }
+    }
+
+    /// The plan the page makes before the weights for `side` at `latency_us`
+    /// on a 120 Hz display, with its slots.
+    fn plan_at(side: u32, latency_us: u64) -> (MemoryPlan, u32) {
+        let frames = frames_for(Micros::new(latency_us), Micros::new(8_333));
+        let slots = SyncPolicy::FixedLatency { frames }.max_in_flight().unwrap();
+        (graph(side).unwrap().memory_plan(slots).unwrap(), slots)
+    }
+
+    /// The runs `render_order=after` became the default with, 112 and 266
+    /// px at 83 and 200 ms and 518 px at 600 ms at 120 Hz, keep it whatever
+    /// their arena count, and one needing more arenas than the render can
+    /// read is refused before the weights, naming the way out.
+    #[test]
+    fn the_measured_runs_fit_the_after_order_and_a_longer_one_is_refused() {
+        let mut most = 0;
+        for (side, latency_us) in [
+            (112, 83_335),
+            (266, 83_335),
+            (112, 200_000),
+            (266, 200_000),
+            (518, 600_000),
+        ] {
+            let (plan, slots) = plan_at(side, latency_us);
+            check_render_order(RenderOrder::After, &plan, side, slots)
+                .unwrap_or_else(|e| panic!("{side} px at {latency_us} us: {e:#}"));
+            most = most.max(plan.arenas().len());
+        }
+        // Several arenas among them, which the single-arena binding refused.
+        assert!(most > 1, "{most}");
+        // 266 px at 200 ms on 120 Hz: 25 slots and more than one arena.
+        let (plan, slots) = plan_at(266, 200_000);
+        assert_eq!(slots, 25);
+        assert!(plan.arenas().len() > 1);
+
+        // 518 px at 2 s: 241 slots, more arenas than a stage binds.
+        let (plan, slots) = plan_at(518, 2_000_000);
+        assert!(plan.arenas().len() > DEFAULT_STAGE_STORAGE_BUFFERS as usize);
+        let refused = check_render_order(RenderOrder::After, &plan, 518, slots)
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("render_order=after cannot be honoured at side=518"));
+        assert!(refused.contains(&format!("with {slots} slots")));
+        assert!(refused.contains("render_order=free"), "{refused}");
+        // `free` reads no arena, so it takes any plan.
+        check_render_order(RenderOrder::Free, &plan, 518, slots).unwrap();
+    }
+
+    /// The plan made from the graph alone is the one `Net` realises from the
+    /// numbers: the ids are all it reads.
+    #[test]
+    fn the_plan_before_the_weights_is_the_plan_of_the_ids() {
+        let graph = graph(112).unwrap();
+        let ids = Numbers {
+            input: graph.image,
+            output: graph.depth,
+            weights: vec![(TensorId::new(0), vec![1.0])],
+            slot_input: Box::new(|_| vec![0.5; 3]),
+        };
+        let from_numbers = slots::memory_plan(&graph.program, &ids, 3).unwrap();
+        let before = graph.memory_plan(3).unwrap();
+        assert_eq!(before.arenas(), from_numbers.arenas());
+        assert_eq!(before.total_bytes(), from_numbers.total_bytes());
     }
 }

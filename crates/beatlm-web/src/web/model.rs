@@ -1,6 +1,7 @@
-//! The depth model's setup in the browser: fetch and check the weights, build
-//! the model, calibrate it, realise it, and check its depth against the
-//! reference, all before the first frame of the loop.
+//! The depth model's setup in the browser: fetch and check the weights of the
+//! model built before the fetch ([`crate::depth::graph`], so that its memory
+//! plan can refuse a run first), calibrate it, realise it, and check its
+//! depth against the reference, all before the first frame of the loop.
 //!
 //! Each step is the native one's, from the same code: the reader and the
 //! inventory check of `beatlm::load`, the graph of `beatlm::model`, the core's
@@ -15,10 +16,8 @@ use beatlm::gpu::SliceTimer;
 use beatlm::load::Archive;
 use beatlm::load::depth_anything_v2::reference::{self, DepthError};
 use beatlm::load::depth_anything_v2::{Config, inventory};
-use beatlm::model::Builder;
-use beatlm::model::depth_anything_v2::model;
 use beatlm_core::cost::{CostModel, Estimator, SliceId};
-use beatlm_core::kernel::{Fusion, Program};
+use beatlm_core::kernel::Program;
 use beatlm_core::time::{FrameIndex, Micros};
 
 use super::device::{self, Gpu};
@@ -56,15 +55,16 @@ pub struct Loaded {
 }
 
 /// Fetches the weights, checks them against the inventory derived from the
-/// Small configuration, and builds the model at `side` pixels with every
-/// slot's input the reference input of that side.
+/// Small configuration, and gives `graph`, the model built at its side
+/// before the fetch ([`depth::graph`]), its numbers, with every slot's input
+/// the reference input of that side.
 ///
 /// # Errors
 ///
 /// No weights file on the server (the message names the recipes), a file that
-/// does not parse or does not match the inventory exactly, or a model that
-/// cannot be built at `side`.
-pub async fn load(side: u32) -> Result<Loaded> {
+/// does not parse or does not match the inventory exactly, or a weight that
+/// cannot be read from it.
+pub async fn load(graph: depth::Graph) -> Result<Loaded> {
     let url = depth::weights_url();
     let bytes = fetch::bytes(&url).await?.with_context(|| {
         format!(
@@ -85,14 +85,14 @@ pub async fn load(side: u32) -> Result<Loaded> {
         crate::report::one_line(&report.to_string())
     );
 
+    let depth::Graph {
+        side,
+        builder,
+        program,
+        image: input,
+        depth: output,
+    } = graph;
     let pixels = usize::try_from(side).context("the side does not fit this machine")?;
-    let mut builder = Builder::new();
-    let tensors = model(&mut builder, &config, pixels)
-        .with_context(|| format!("cannot build Depth Anything V2 Small at {side} pixels"))?;
-    let program = builder
-        .graph()
-        .lower(Fusion::On)
-        .context("cannot lower the depth model")?;
     let mut weights = Vec::with_capacity(builder.weights().len());
     for weight in builder.weights() {
         let numbers = weight
@@ -106,8 +106,8 @@ pub async fn load(side: u32) -> Result<Loaded> {
         side,
         program,
         numbers: Numbers {
-            input: tensors.image,
-            output: tensors.depth,
+            input,
+            output,
             weights,
             slot_input: Box::new(move |_| image.clone()),
         },

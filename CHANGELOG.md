@@ -104,9 +104,13 @@ and this project adheres to
 - `beatlm-web` `render_iters`: the render pass's per-pixel loop count for
   synthetic, depth and on-beat runs (default 50, as the bench).
 - `render_order` (`beatlm-bench --render-order`, `beatlm-web render_order`,
-  `free|after`, default `free`): `after` makes the render wait for the frame's
-  slices through a resource dependency; `pass_overlap_*`, `pass_order` and
-  `slice_vs_render_overlap` report how the render and the slices overlap.
+  `free|after`; the bench defaults to `free`, the browser to `after`): `after`
+  makes the render wait for the frame's slices by reading every arena of the
+  plan, refusing a plan of more arenas than one shader stage binds before the
+  bench calibrates or the page fetches the weights; `pass_overlap_*`,
+  `pass_order` and `slice_vs_render_overlap` report how the render and the
+  slices overlap, and `pass_overlap_next_frame` where the next frame's first
+  slice began against the render's end.
 
 ### Changed
 

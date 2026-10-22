@@ -30,7 +30,18 @@
 //! median of recent renders the frames to come are forecast with. The
 //! report's `gpu_render_alone_us` and `gpu_render_with_slices_us` show the
 //! render's measurement without and with slices in its frame, and would show
-//! it if that changed.
+//! it if that changed. That paragraph is about `render_order=free`.
+//!
+//! Under `render_order=after`, the page's default ([`crate::config`]), the
+//! pass waits for the slices in every frame, not only in a delivery frame:
+//! its vertex stage reads the first word of every arena of the plan, the
+//! buffers the slices write, through `display_vs_after`, which the bench's
+//! `workload::after_vertex` appends to `display.wgsl` with one binding per
+//! arena, and one bind group made here. The bench's `workload.rs` ("Ordering
+//! the render pass after the slices") says why every arena, what bounds
+//! their number, and what the order guarantees; the page refuses a plan of
+//! too many before it fetches the weights (`crate::depth::check_render_order`),
+//! and this checks the split model's plan again.
 //!
 //! Both bind groups, one drawing the depth and one drawn before the first
 //! delivery, are made when the display is built, so choosing what to show in
@@ -46,7 +57,7 @@ use beatlm::load::depth_anything_v2::reference::{MEAN, STD};
 use wgpu::util::DeviceExt;
 
 use crate::slots::{Net, Numbers};
-use crate::workload::{RenderOrder, TARGET_FORMAT, written_bind_group};
+use crate::workload::{RenderOrder, TARGET_FORMAT, after_module, written_bind_group, written_fits};
 
 /// The render pass that shows the source and the depth delivered last.
 pub struct Display {
@@ -61,8 +72,9 @@ pub struct Display {
     shown: wgpu::BindGroup,
     /// Drawn before the first delivery: the source, and no depth.
     blank: wgpu::BindGroup,
-    /// Under [`RenderOrder::After`], group 1: the arena the slices write,
-    /// which the vertex shader reads (`workload.rs` says why).
+    /// Under [`RenderOrder::After`], group 1: every arena of the plan, the
+    /// buffers the slices write, which the vertex shader reads
+    /// (`workload.rs` says why all of them).
     written: Option<wgpu::BindGroup>,
 }
 
@@ -76,8 +88,9 @@ impl Display {
     ///
     /// A slot whose output has no placement in the plan or a smaller one than
     /// a depth of `side` pixels, an input of another size, or
-    /// [`RenderOrder::After`] for a plan of more than one arena
-    /// (`Net::written`).
+    /// [`RenderOrder::After`] for a plan of more arenas than the device binds
+    /// to one stage ([`written_fits`]), which the page refuses before the
+    /// weights from the unsplit plan and this checks again for the split one.
     pub fn new(
         device: &wgpu::Device,
         net: &Net,
@@ -87,13 +100,32 @@ impl Display {
         render_iters: u32,
         order: RenderOrder,
     ) -> Result<Self> {
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("beatlm-web display"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("display.wgsl").into()),
-        });
-        let vertex = match order {
-            RenderOrder::Free => "display_vs",
-            RenderOrder::After => "display_vs_after",
+        const SOURCE: &str = include_str!("display.wgsl");
+        let (written, module, vertex) = match order {
+            RenderOrder::Free => (
+                Vec::new(),
+                device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("beatlm-web display"),
+                    source: wgpu::ShaderSource::Wgsl(SOURCE.into()),
+                }),
+                "display_vs",
+            ),
+            RenderOrder::After => {
+                let written = net.written()?;
+                written_fits(
+                    written.len(),
+                    device.limits().max_storage_buffers_per_shader_stage,
+                )
+                .context("render_order=after cannot be honoured for the split model's plan")?;
+                let module = after_module(
+                    device,
+                    "beatlm-web display, render after",
+                    SOURCE,
+                    written.len(),
+                    "display_vs_after",
+                );
+                (written, module, "display_vs_after")
+            }
         };
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("beatlm-web display"),
@@ -172,7 +204,7 @@ impl Display {
         let blank = bind_group(device, &layout, &blank_params, &image, &depth);
         let written = match order {
             RenderOrder::Free => None,
-            RenderOrder::After => Some(written_bind_group(device, &pipeline, net.written()?)),
+            RenderOrder::After => Some(written_bind_group(device, &pipeline, &written)),
         };
         Ok(Self {
             pipeline,
