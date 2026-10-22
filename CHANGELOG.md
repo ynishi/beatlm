@@ -184,6 +184,13 @@ and this project adheres to
 - `SliceTimer`: a frame resolved into an encoder that was then dropped
   instead of submitted is no longer read; its slot held an earlier frame's
   timestamps, which were reported as its own and fed to the cost model.
+- `SliceTimer::invalidate_submitted`: a host that learns the device rejected
+  a submitted command buffer marks what it submitted, and those frames are
+  counted in `timings_failed` instead of reporting an earlier lap's
+  timestamps. `beatlm-web` marks them when `gpu_errors` has grown before it
+  collects; an error the browser reports later, or not at all, still lets
+  the frame be read. Natively a rejected command buffer still panics in
+  wgpu's default handler.
 
 - `beatlm-web`: a depth result reaches the screen only in the frame that
   delivers it; a later job on the same slot could show its depth before then.
