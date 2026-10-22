@@ -46,7 +46,7 @@ use beatlm::load::depth_anything_v2::reference::{MEAN, STD};
 use wgpu::util::DeviceExt;
 
 use crate::slots::{Net, Numbers};
-use crate::workload::TARGET_FORMAT;
+use crate::workload::{RenderOrder, TARGET_FORMAT, written_bind_group};
 
 /// The render pass that shows the source and the depth delivered last.
 pub struct Display {
@@ -61,17 +61,23 @@ pub struct Display {
     shown: wgpu::BindGroup,
     /// Drawn before the first delivery: the source, and no depth.
     blank: wgpu::BindGroup,
+    /// Under [`RenderOrder::After`], group 1: the arena the slices write,
+    /// which the vertex shader reads (`workload.rs` says why).
+    written: Option<wgpu::BindGroup>,
 }
 
 impl Display {
     /// Builds the pass for `net`, realised with `numbers`, whose input side is
     /// `side`, mapping depths from `range.0` to `range.1` to black to white,
-    /// with `render_iters` loop iterations per pixel.
+    /// with `render_iters` loop iterations per pixel, in `order` against the
+    /// frame's slices.
     ///
     /// # Errors
     ///
     /// A slot whose output has no placement in the plan or a smaller one than
-    /// a depth of `side` pixels, or an input of another size.
+    /// a depth of `side` pixels, an input of another size, or
+    /// [`RenderOrder::After`] for a plan of more than one arena
+    /// (`Net::written`).
     pub fn new(
         device: &wgpu::Device,
         net: &Net,
@@ -79,17 +85,22 @@ impl Display {
         side: u32,
         range: (f32, f32),
         render_iters: u32,
+        order: RenderOrder,
     ) -> Result<Self> {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("beatlm-web display"),
             source: wgpu::ShaderSource::Wgsl(include_str!("display.wgsl").into()),
         });
+        let vertex = match order {
+            RenderOrder::Free => "display_vs",
+            RenderOrder::After => "display_vs_after",
+        };
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("beatlm-web display"),
             layout: None,
             vertex: wgpu::VertexState {
                 module: &module,
-                entry_point: Some("display_vs"),
+                entry_point: Some(vertex),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 buffers: &[],
             },
@@ -159,6 +170,10 @@ impl Display {
         let layout = pipeline.get_bind_group_layout(0);
         let shown = bind_group(device, &layout, &shown_params, &image, &depth);
         let blank = bind_group(device, &layout, &blank_params, &image, &depth);
+        let written = match order {
+            RenderOrder::Free => None,
+            RenderOrder::After => Some(written_bind_group(device, &pipeline, net.written()?)),
+        };
         Ok(Self {
             pipeline,
             outputs,
@@ -166,6 +181,7 @@ impl Display {
             depth_bytes,
             shown,
             blank,
+            written,
         })
     }
 
@@ -214,6 +230,9 @@ impl Display {
         });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, group, &[]);
+        if let Some(written) = &self.written {
+            pass.set_bind_group(1, written, &[]);
+        }
         pass.draw(0..3, 0..1);
     }
 }

@@ -31,8 +31,9 @@ use crate::depth;
 use crate::device::Gpu;
 use crate::net::{self, Net, Numbers};
 use crate::pace::{FRAME_PERIOD, Tick, micros_between};
+use crate::pass_overlap;
 use crate::stats::frame_ratio;
-use crate::workload::{RENDER_HEIGHT, RENDER_WIDTH, TARGET_FORMAT, Workload};
+use crate::workload::{RENDER_HEIGHT, RENDER_WIDTH, RenderOrder, TARGET_FORMAT, Workload};
 
 /// What a slice is assumed to cost until it has been measured.
 const SLICE_PRIOR: Micros = Micros::new(2_000);
@@ -203,6 +204,9 @@ pub struct Outcome {
     pub frames_recorded: u64,
     /// What the timer could not measure.
     pub timer: TimerStats,
+    /// Every timed frame's passes with their timestamps, for the
+    /// `pass_overlap_*` lines (`pass_overlap.rs`).
+    pub pass_frames: Vec<pass_overlap::Frame>,
     /// Dispatches the competing load submitted, from the one it completed
     /// before the run's first frame to the last one queued when it was stopped
     /// after the run; `None` when the run had no competing load.
@@ -348,7 +352,7 @@ impl<'g> Engine<'g> {
     /// A calibration, network or timer that cannot be built, or a device that
     /// cannot be polled.
     pub fn new(gpu: &'g Gpu, args: &Args) -> Result<Self> {
-        let workload = Workload::new(&gpu.device, args.slice_iters, args.render_iters);
+        let mut workload = Workload::new(&gpu.device, args.slice_iters, args.render_iters);
         let target = offscreen_target(&gpu.device);
         let policy = SyncPolicy::FixedLatency {
             frames: args.latency,
@@ -424,6 +428,15 @@ impl<'g> Engine<'g> {
                 )
             }
         };
+        // After calibration, whose render passes stay the free ones, so the
+        // loop starts from the same measurements under either order. Only
+        // `after` reads the plan's one arena, so only it refuses a plan of
+        // several.
+        let written = match args.render_order {
+            RenderOrder::Free => None,
+            RenderOrder::After => net.as_ref().map(Net::written).transpose()?,
+        };
+        workload.order_render(&gpu.device, args.render_order, written);
         // A job's slices are the program's kernels, each part of a split one
         // included.
         let slices = net.as_ref().map_or(args.slices, Net::kernel_count);
@@ -671,6 +684,9 @@ impl<'g> Engine<'g> {
     /// estimate when it was planned: what they were planned at against what
     /// they measured.
     fn absorb(&mut self, timing: FrameTiming<Tag>) {
+        self.outcome
+            .pass_frames
+            .push(pass_overlap::Frame::of(&timing, |&(_, slice, _)| slice));
         let mut gpu = Micros::ZERO;
         let (mut predicted, mut in_ratio) = (Micros::ZERO, Micros::ZERO);
         for ((_, slice, planned), duration) in &timing.compute {

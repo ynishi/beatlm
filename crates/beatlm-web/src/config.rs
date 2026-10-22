@@ -38,6 +38,15 @@
 //!   it has; default [`DEFAULT_RENDER_ITERS`], 50). Both jobs, fixed latency
 //!   and on beat; refused with `model=pass-cost` (below). The next section
 //!   says why it exists.
+//! - `render_order`: `free` (the default) or `after`, the bench's
+//!   `--render-order`: whether the loop's render pass reads what the frame's
+//!   slices write, so that it runs after them. It tests H7 of #53 (#61) by
+//!   taking the overlap the `pass_overlap_*` lines measured away; the bench's
+//!   `workload.rs` ("Ordering the render pass after the slices") says how and
+//!   what it guarantees. With the depth model the display is the pass that
+//!   reads them, the plan's one arena. Both jobs; refused with
+//!   `model=pass-cost`, whose render is no loop's. The `config:` line prints
+//!   it (`render_order=`).
 //! - `sync`: the delivery promise, `latency` (the default: fixed latency, the
 //!   promise every parameter above is about) or `onbeat` (results on the
 //!   first frame at or after a beat of a click track the page plays,
@@ -284,7 +293,7 @@ use crate::onbeat::{
     Tempo, TempoChange,
 };
 use crate::pass_cost::{self, DEFAULT_DEPTH_SIDE, Dispatches};
-use crate::workload::DEFAULT_RENDER_ITERS;
+use crate::workload::{DEFAULT_RENDER_ITERS, RenderOrder};
 
 /// Frames a run lasts when `frames` is not given: the bench's default.
 pub const DEFAULT_FRAMES: u64 = 600;
@@ -332,14 +341,21 @@ pub const DEFAULT_FRAME_QUANTILE: f64 = 0.9;
 /// The parameters the query string accepts, as the error for an unknown one
 /// lists them.
 const PARAMETERS: &str = "frames, model, side, latency, latency_ms, arena_bytes, estimator, \
-                          sync, bpm, bpm_change, margin_ms, beats, render_iters, passes, variants, \
-                          kernels, groups, render";
+                          sync, bpm, bpm_change, margin_ms, beats, render_iters, render_order, \
+                          passes, variants, kernels, groups, render";
 
 /// The parameters only `model=pass-cost` reads.
 const PASS_COST_PARAMETERS: [&str; 5] = ["passes", "variants", "kernels", "groups", "render"];
 
 /// The parameters of the loop, which `model=pass-cost` refuses.
-const LOOP_PARAMETERS: [&str; 5] = ["latency", "latency_ms", "arena_bytes", "estimator", "sync"];
+const LOOP_PARAMETERS: [&str; 6] = [
+    "latency",
+    "latency_ms",
+    "arena_bytes",
+    "estimator",
+    "sync",
+    "render_order",
+];
 
 /// The parameters only `sync=onbeat` reads.
 const ON_BEAT_PARAMETERS: [&str; 4] = ["bpm", "bpm_change", "margin_ms", "beats"];
@@ -396,6 +412,9 @@ pub struct Config {
     /// run, calibration's included; [`DEFAULT_RENDER_ITERS`] when not given.
     /// Zero is allowed (the module documentation says why).
     pub render_iters: u32,
+    /// `render_order`: whether the loop's render pass waits for the frame's
+    /// slices; [`RenderOrder::Free`] when not given.
+    pub render_order: RenderOrder,
     /// `sync=onbeat` and its parameters; `None` for the fixed-latency promise,
     /// whose `latency` is then the one kept.
     pub on_beat: Option<OnBeat>,
@@ -421,6 +440,7 @@ impl Default for Config {
             arena_bytes: None,
             estimator: Estimator::default(),
             render_iters: DEFAULT_RENDER_ITERS,
+            render_order: RenderOrder::Free,
             on_beat: None,
         }
     }
@@ -454,6 +474,7 @@ pub fn parse(query: &str) -> Result<Config> {
     let mut arena_bytes = None;
     let mut chosen = None;
     let mut render_iters = DEFAULT_RENDER_ITERS;
+    let mut render_order = RenderOrder::Free;
     let mut on_beat = false;
     let mut bpm = None;
     let mut change = None;
@@ -512,6 +533,11 @@ pub fn parse(query: &str) -> Result<Config> {
             "arena_bytes" => arena_bytes = Some(number(name, value)?),
             "estimator" => chosen = Some(estimator(value)?),
             "render_iters" => render_iters = number(name, value)?,
+            "render_order" => {
+                render_order = RenderOrder::from_name(value).with_context(|| {
+                    format!("query parameter render_order: {value:?} is not one of free, after")
+                })?;
+            }
             "sync" => {
                 on_beat = match value {
                     "latency" => false,
@@ -631,6 +657,7 @@ pub fn parse(query: &str) -> Result<Config> {
         arena_bytes,
         estimator: chosen.unwrap_or_default(),
         render_iters,
+        render_order,
         on_beat,
     })
 }
@@ -936,6 +963,7 @@ mod tests {
                 arena_bytes: Some(134_217_600),
                 estimator: Estimator::default(),
                 render_iters: DEFAULT_RENDER_ITERS,
+                render_order: RenderOrder::Free,
                 on_beat: None,
             }
         );
@@ -965,6 +993,7 @@ mod tests {
                 arena_bytes: None,
                 estimator: Estimator::default(),
                 render_iters: DEFAULT_RENDER_ITERS,
+                render_order: RenderOrder::Free,
                 on_beat: None,
             }
         );
@@ -1261,6 +1290,42 @@ mod tests {
             let chosen = estimator(value).unwrap();
             assert_eq!(estimator_name(chosen), name, "{value}");
             assert_eq!(estimator(name).unwrap(), chosen, "{name}");
+        }
+    }
+
+    #[test]
+    fn render_order_is_free_unless_after_is_asked_for() {
+        assert_eq!(Config::default().render_order, RenderOrder::Free);
+        assert_eq!(parse("").unwrap().render_order, RenderOrder::Free);
+        for (query, order) in [
+            ("?render_order=free", RenderOrder::Free),
+            ("?render_order=after", RenderOrder::After),
+            (
+                "?model=depth&side=266&latency_ms=200&frames=1500&render_iters=50&render_order=after",
+                RenderOrder::After,
+            ),
+            (
+                "?sync=onbeat&bpm=120&render_order=after",
+                RenderOrder::After,
+            ),
+        ] {
+            assert_eq!(parse(query).unwrap().render_order, order, "{query}");
+        }
+        // Nothing else moves with it.
+        assert_eq!(
+            parse("?render_order=after").unwrap(),
+            Config {
+                render_order: RenderOrder::After,
+                ..Config::default()
+            }
+        );
+        for bad in [
+            "?render_order=before",
+            "?render_order=",
+            "?render_order=after&render_order=free",
+            "?model=pass-cost&render_order=after",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
         }
     }
 

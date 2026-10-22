@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use beatlm_core::kernel::Fusion;
 
 use crate::pass_cost::{self, DEFAULT_DEPTH_SIDE, Dispatches};
-use crate::workload::{DEFAULT_RENDER_ITERS, DEFAULT_SLICE_ITERS};
+use crate::workload::{DEFAULT_RENDER_ITERS, DEFAULT_SLICE_ITERS, RenderOrder};
 
 /// The usage text, printed for `--help` and after a bad option.
 pub const USAGE: &str = "\
@@ -19,6 +19,8 @@ usage: beatlm-bench [options]
   --slices S        slices per job                         (default 4)
   --slice-iters N   loop iterations per invocation of a slice kernel
   --render-iters N  loop iterations per pixel of the render pass
+  --render-order O  free, or after: the render pass reads what the frame's
+                    slices write, so it runs after them    (default free)
   --margin-us N     safety margin in the frame budget, us  (default 2000)
   --workload W      synthetic, net, depth or pass-cost     (default synthetic)
   --submit S        when a frame submits its input as a job: every frame,
@@ -219,6 +221,9 @@ pub struct Args {
     pub slice_iters: u32,
     /// Loop iterations per pixel of the render pass.
     pub render_iters: u32,
+    /// Whether the loop's render pass waits for the frame's slices
+    /// (`workload.rs` says how).
+    pub render_order: RenderOrder,
     /// The margin subtracted from each frame's budget, in microseconds.
     pub margin_us: u64,
     /// The load the slices run.
@@ -259,6 +264,7 @@ impl Default for Args {
             slices: 4,
             slice_iters: DEFAULT_SLICE_ITERS,
             render_iters: DEFAULT_RENDER_ITERS,
+            render_order: RenderOrder::Free,
             margin_us: 2_000,
             workload: WorkloadKind::Synthetic,
             submit: Submit::Every,
@@ -347,6 +353,12 @@ where
             }
             "--slice-iters" => out.slice_iters = number(&name, &value()?)?,
             "--render-iters" => out.render_iters = number(&name, &value()?)?,
+            "--render-order" => {
+                let text = value()?;
+                out.render_order = RenderOrder::from_name(&text).with_context(|| {
+                    format!("--render-order: {text:?} is not one of free, after")
+                })?;
+            }
             "--margin-us" => out.margin_us = number(&name, &value()?)?,
             "--workload" => out.workload = workload(&value()?)?,
             "--fusion" => {
@@ -484,8 +496,9 @@ where
 }
 
 /// The options of the loop, which `--workload pass-cost` refuses.
-const LOOP_ONLY: [&str; 12] = [
+const LOOP_ONLY: [&str; 13] = [
     "--latency",
+    "--render-order",
     "--slices",
     "--slice-iters",
     "--margin-us",
@@ -864,6 +877,30 @@ mod tests {
             assert!(pass_cost(&[name, value]).is_ok(), "{name}");
             assert!(parse_strs(&[name, value]).is_err(), "{name}");
         }
+    }
+
+    #[test]
+    fn the_render_order_is_free_unless_after_is_asked_for() {
+        assert_eq!(Args::default().render_order, RenderOrder::Free);
+        let order = |extra: &[&str]| match parse_strs(extra) {
+            Ok(Command::Run(a)) => Ok(a.render_order),
+            Ok(Command::Help) => panic!("expected a run"),
+            Err(e) => Err(e),
+        };
+        assert_eq!(order(&[]).unwrap(), RenderOrder::Free);
+        assert_eq!(
+            order(&["--render-order", "after"]).unwrap(),
+            RenderOrder::After
+        );
+        assert_eq!(order(&["--render-order=free"]).unwrap(), RenderOrder::Free);
+        assert_eq!(
+            order(&["--workload", "depth", "--render-order", "after"]).unwrap(),
+            RenderOrder::After
+        );
+        assert!(order(&["--render-order", "before"]).is_err());
+        assert!(order(&["--render-order"]).is_err());
+        // The pass-cost measurement has no loop to order.
+        assert!(order(&["--workload", "pass-cost", "--render-order", "after"]).is_err());
     }
 
     #[test]

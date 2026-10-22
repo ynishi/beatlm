@@ -7,6 +7,7 @@ use crate::args::{Args, WorkloadKind, fusion_name};
 use crate::engine::{NetReport, Outcome};
 use crate::pace::FRAME_PERIOD;
 use crate::pass_bench::PassOutcome;
+use crate::pass_overlap;
 use crate::stats::{frame_ratio_value, frame_scale_value, histogram, summarize};
 
 /// Where the run happened.
@@ -85,7 +86,7 @@ fn write_report(
     writeln!(out, "backend: {}", env.backend)?;
     write!(
         out,
-        "config: mode={} runs={} frames={} latency={} slices={} slice_iters={} render_iters={} margin_us={} estimator={} submit={} background_load={}",
+        "config: mode={} runs={} frames={} latency={} slices={} slice_iters={} render_iters={} render_order={} margin_us={} estimator={} submit={} background_load={}",
         args.mode.name(),
         args.runs,
         args.frames,
@@ -93,6 +94,7 @@ fn write_report(
         args.slices,
         args.slice_iters,
         args.render_iters,
+        args.render_order.name(),
         args.margin_us,
         args.estimator.name(),
         args.submit.name(),
@@ -156,6 +158,7 @@ fn write_report(
         "gpu_frames_over_period: {over} of {}",
         outcome.gpu_frame_us.len()
     )?;
+    pass_overlap::write_lines(out, &pass_overlap::analyse(&outcome.pass_frames))?;
     writeln!(
         out,
         "frame_ratio: {}",
@@ -310,6 +313,28 @@ fn write_summary(out: &mut String, name: &str, samples: &[u64]) -> std::fmt::Res
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_config_line_prints_the_render_order() {
+        use crate::workload::RenderOrder;
+        let env = Environment {
+            adapter: String::from("adapter"),
+            backend: String::from("backend"),
+        };
+        for order in RenderOrder::ALL {
+            let args = Args {
+                render_order: order,
+                ..Args::default()
+            };
+            let text = render(&env, &args, 1, &Outcome::default());
+            let config = text
+                .lines()
+                .find_map(|l| l.strip_prefix("config: "))
+                .unwrap();
+            let expected = format!(" render_iters=50 render_order={} margin_us=", order.name());
+            assert!(config.contains(&expected), "{config}");
+        }
+    }
 
     #[test]
     fn delivery_rate_is_the_delivered_share_of_the_deadlines_that_arrived() {
