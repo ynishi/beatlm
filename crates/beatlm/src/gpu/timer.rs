@@ -3,10 +3,19 @@
 //! A frame's timing follows one path. [`SliceTimer::begin_frame`] claims a slot
 //! of the readback ring and hands out timestamp writes for the frame's passes.
 //! [`FrameTimestamps::resolve`] records the resolve and the copy into the slot
-//! at the end of the frame's encoder. After the host submits,
-//! [`SliceTimer::start_readback`] requests the map. Once the host has polled the
-//! device, [`SliceTimer::collect_ready`] returns every frame whose map has
+//! at the end of the frame's encoder and returns a [`ResolvedFrame`]. After the
+//! `queue.submit` carrying that encoder, the host hands it to
+//! [`SliceTimer::submitted`], which requests the map. Once the host has polled
+//! the device, [`SliceTimer::collect_ready`] returns every frame whose map has
 //! completed, oldest first.
+//!
+//! **Only a frame handed back as submitted is read.** The timer cannot see
+//! whether an encoder reached the queue, and a map of a slot whose copy never
+//! ran succeeds on what an earlier frame left there, so a frame resolved and
+//! then dropped on an error path would report that frame's durations as its
+//! own and feed them to the cost model. Making "submitted" a step the host
+//! takes, with the value `resolve` returned, rules that out: a
+//! [`ResolvedFrame`] dropped with its encoder frees the slot unread.
 //!
 //! Queries are allocated in the order passes are requested, two per pass, so the
 //! queries a frame resolves are always the contiguous prefix it wrote. A frame
@@ -19,7 +28,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use beatlm_core::time::{FrameIndex, Micros};
 use thiserror::Error;
 
-use super::ring::{Phase, Ring};
+use super::ring::{Phase, Ring, Ticket};
 
 /// How many frames of timing can be in flight at once.
 ///
@@ -280,28 +289,36 @@ impl<T> SliceTimer<T> {
         }
     }
 
-    /// Requests the map of every frame whose resolve has been recorded.
+    /// Takes back a frame whose encoder has been submitted, and requests the
+    /// map of its timestamps.
     ///
-    /// Call it after the submission carrying the frame's encoder: a buffer that
-    /// a not-yet-submitted command buffer will write must not be mapped.
-    pub fn start_readback(&mut self) {
-        for i in 0..self.slots.len() {
-            if !self.ring.advance(i, Phase::Encoded, Phase::Mapping) {
-                continue;
-            }
-            let Some(slot) = self.slots.get(i) else {
-                continue;
-            };
-            let bytes = readback_bytes(slot.entries.len());
-            slot.done.store(MAP_PENDING, Ordering::Release);
-            let done = Arc::clone(&slot.done);
-            slot.readback
-                .slice(0..bytes)
-                .map_async(wgpu::MapMode::Read, move |result| {
-                    let state = if result.is_ok() { MAP_OK } else { MAP_FAILED };
-                    done.store(state, Ordering::Release);
-                });
-        }
+    /// Call it after the `queue.submit` carrying the encoder `resolved` came
+    /// from, never before: a buffer that a not-yet-submitted command buffer
+    /// will write must not be mapped. This call is what makes the frame
+    /// readable; a [`ResolvedFrame`] that is dropped instead is never read.
+    ///
+    /// A frame that was not timed, and one resolved by another timer, are
+    /// accepted and ignored; the other timer's frame goes untimed.
+    pub fn submitted(&mut self, resolved: ResolvedFrame) {
+        let Some(ticket) = resolved.ticket else {
+            return;
+        };
+        let Some(i) = self.ring.submit(ticket) else {
+            return;
+        };
+        let Some(slot) = self.slots.get(i) else {
+            self.ring.release(i);
+            return;
+        };
+        let bytes = readback_bytes(slot.entries.len());
+        slot.done.store(MAP_PENDING, Ordering::Release);
+        let done = Arc::clone(&slot.done);
+        slot.readback
+            .slice(0..bytes)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let state = if result.is_ok() { MAP_OK } else { MAP_FAILED };
+                done.store(state, Ordering::Release);
+            });
     }
 
     /// Returns the timing of every frame whose map has completed, oldest first,
@@ -352,7 +369,8 @@ impl<T> SliceTimer<T> {
         out
     }
 
-    /// How many frames are recorded or requested and not yet collected.
+    /// How many frames are recorded or requested and not yet collected. A
+    /// frame whose [`ResolvedFrame`] was dropped is not among them.
     #[must_use]
     pub fn in_flight(&self) -> usize {
         self.ring.in_flight()
@@ -377,7 +395,8 @@ impl<T> SliceTimer<T> {
 /// writes must be used by the pass they were requested for; a pair that is
 /// requested and never written leaves a stale value in the resolved data.
 /// Dropping the handle without resolving gives the ring slot back, so an
-/// abandoned frame costs nothing.
+/// abandoned frame costs nothing; so does dropping the [`ResolvedFrame`] a
+/// resolve returns.
 #[derive(Debug)]
 #[must_use = "the frame's timing is lost unless the handle is resolved into the encoder"]
 pub struct FrameTimestamps<'a, T> {
@@ -453,30 +472,38 @@ impl<'a, T> FrameTimestamps<'a, T> {
     }
 
     /// Records the resolve of the frame's queries and their copy into the
-    /// frame's readback slot at the end of `encoder`.
+    /// frame's readback slot at the end of `encoder`, and returns what the
+    /// host hands back once `encoder` is submitted.
     ///
     /// Call it after the last timed pass of the frame, then submit the encoder,
-    /// then call [`SliceTimer::start_readback`].
-    pub fn resolve(mut self, encoder: &mut wgpu::CommandEncoder) {
+    /// then pass the result to [`SliceTimer::submitted`]. Dropping the result
+    /// instead — with the encoder, on an error path — frees the slot without
+    /// reading it.
+    pub fn resolve(mut self, encoder: &mut wgpu::CommandEncoder) -> ResolvedFrame {
+        let untimed = ResolvedFrame { ticket: None };
         let Some(i) = self.claimed.take() else {
-            return;
+            return untimed;
         };
         let Some(slot) = self.slots.get(i) else {
             self.ring.release(i);
-            return;
+            return untimed;
         };
         let bytes = readback_bytes(slot.entries.len());
         let Ok(queries) = u32::try_from(slot.entries.len() * 2) else {
             self.ring.release(i);
-            return;
+            return untimed;
         };
         if queries == 0 {
             self.ring.release(i);
-            return;
+            return untimed;
         }
         encoder.resolve_query_set(self.query_set, 0..queries, self.resolve, 0);
         encoder.copy_buffer_to_buffer(self.resolve, 0, &slot.readback, 0, bytes);
-        self.ring.advance(i, Phase::Recording, Phase::Encoded);
+        let ticket = self.ring.encode(i);
+        if ticket.is_none() {
+            self.ring.release(i);
+        }
+        ResolvedFrame { ticket }
     }
 
     /// Allocates the next pair of queries to `entry`, or `None` when the frame
@@ -494,6 +521,48 @@ impl<T> Drop for FrameTimestamps<'_, T> {
         if let Some(i) = self.claimed.take() {
             self.ring.release(i);
         }
+    }
+}
+
+/// A frame whose resolve is recorded in an encoder that has not been
+/// submitted yet: what [`FrameTimestamps::resolve`] returns and
+/// [`SliceTimer::submitted`] takes back.
+///
+/// The timer reads a frame's timestamps only once this value comes back, so
+/// telling the timer the encoder was submitted is a step of the host's, not
+/// something the timer infers. Hand it back after the `queue.submit` carrying
+/// the encoder. Dropped instead, it frees the frame's slot without reading
+/// it, which is right for the case it exists for — the encoder dropped on an
+/// error path, its copy never run, the slot holding an earlier frame's
+/// timestamps.
+///
+/// A drop cannot tell whether the submission happened, so it always means
+/// "not submitted". A host that submits and then loses the value loses that
+/// frame's timing, and nothing is misread: the slot is not mapped for the
+/// frame, and the next frame to take it records its own copy behind the
+/// first on the same queue and is mapped only after its own submission. A
+/// host keeps that from happening by handing the value back straight after
+/// `queue.submit`, with nothing that can fail in between.
+///
+/// What the value proves is that the host submitted, not that the device ran
+/// the commands: a command buffer the device rejects as invalid raises a
+/// validation error and never runs, and its frame would still be read. That
+/// error is the host's to treat, as for any other invalid command buffer.
+///
+/// It holds no borrow of the timer, so the host keeps using the timer while
+/// it holds one; a frame that was not timed returns one that holds nothing.
+#[derive(Debug)]
+#[must_use = "hand it to SliceTimer::submitted after queue.submit, or the frame's timing is dropped"]
+pub struct ResolvedFrame {
+    ticket: Option<Ticket>,
+}
+
+impl ResolvedFrame {
+    /// Whether this frame was timed, and so has timestamps to read once it is
+    /// handed back.
+    #[must_use]
+    pub fn is_timed(&self) -> bool {
+        self.ticket.is_some()
     }
 }
 
@@ -714,34 +783,51 @@ mod tests {
         assert_eq!(timing.render, None);
     }
 
+    /// A device with timestamp queries, on the default adapter.
+    fn timed_device() -> (wgpu::Device, wgpu::Queue) {
+        let instance = wgpu::Instance::default();
+        let adapter =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+                .unwrap();
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_features: wgpu::Features::TIMESTAMP_QUERY,
+            ..Default::default()
+        }))
+        .unwrap()
+    }
+
+    /// Records one frame of one timed compute pass labelled `tag` and returns
+    /// the encoder with the resolve in it, unsubmitted.
+    fn record_frame(
+        device: &wgpu::Device,
+        timer: &mut SliceTimer<u32>,
+        index: u64,
+        tag: u32,
+    ) -> (wgpu::CommandEncoder, ResolvedFrame) {
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        let mut frame = timer.begin_frame(FrameIndex::new(index));
+        assert!(frame.is_timed());
+        let writes = frame.compute_pass(tag).unwrap();
+        drop(encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: writes,
+        }));
+        let resolved = frame.resolve(&mut encoder);
+        assert!(resolved.is_timed());
+        (encoder, resolved)
+    }
+
     /// Needs a real adapter: one frame with one compute pass goes through the
     /// whole path, from timestamp writes to a collected measurement.
     #[test]
     #[ignore = "needs a GPU adapter with TIMESTAMP_QUERY"]
     fn timer_measures_a_compute_pass_on_a_real_device() {
-        let instance = wgpu::Instance::default();
-        let adapter =
-            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
-                .unwrap();
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            required_features: wgpu::Features::TIMESTAMP_QUERY,
-            ..Default::default()
-        }))
-        .unwrap();
-
+        let (device, queue) = timed_device();
         let mut timer: SliceTimer<u32> = SliceTimer::new(&device, &queue, 2).unwrap();
-        let mut encoder =
-            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        let mut frame = timer.begin_frame(FrameIndex::new(0));
-        assert!(frame.is_timed());
-        let writes = frame.compute_pass(7).unwrap();
-        drop(encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: None,
-            timestamp_writes: writes,
-        }));
-        frame.resolve(&mut encoder);
+        let (encoder, resolved) = record_frame(&device, &mut timer, 0, 7);
         queue.submit([encoder.finish()]);
-        timer.start_readback();
+        timer.submitted(resolved);
         device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
         let ready = timer.collect_ready();
         assert_eq!(ready.len(), 1);
@@ -752,5 +838,60 @@ mod tests {
         let span = ready[0].compute_spans[0];
         assert!(span.end_ns >= span.begin_ns, "{span:?}");
         assert_eq!(timer.in_flight(), 0);
+    }
+
+    /// Needs a real adapter: a frame resolved into an encoder that is then
+    /// dropped is never read, though its slot holds an earlier frame's real
+    /// timestamps, and the next frame's are the only ones reported.
+    #[test]
+    #[ignore = "needs a GPU adapter with TIMESTAMP_QUERY"]
+    fn a_frame_whose_encoder_is_dropped_is_never_read() {
+        let (device, queue) = timed_device();
+        let mut timer: SliceTimer<u32> = SliceTimer::new(&device, &queue, 2).unwrap();
+        let run = |timer: &mut SliceTimer<u32>, index: u64| {
+            let (encoder, resolved) = record_frame(&device, timer, index, 100 + index as u32);
+            queue.submit([encoder.finish()]);
+            timer.submitted(resolved);
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            timer.collect_ready()
+        };
+
+        // One lap of the ring, so every slot's readback holds real timestamps.
+        for index in 0..RING_DEPTH as u64 {
+            let ready = run(&mut timer, index);
+            assert_eq!(ready.len(), 1);
+            assert_eq!(ready[0].frame, FrameIndex::new(index));
+        }
+
+        // The next frame lands on the first slot again, and is dropped on an
+        // error path: encoder and resolved frame together, never submitted.
+        let dropped = RING_DEPTH as u64;
+        let (encoder, resolved) = record_frame(&device, &mut timer, dropped, 999);
+        drop(encoder);
+        drop(resolved);
+        assert_eq!(timer.in_flight(), 0);
+
+        // The next frame is the only one reported: nothing for the dropped
+        // frame, nor the first frame's timestamps left in its slot.
+        let next = dropped + 1;
+        let ready = run(&mut timer, next);
+        assert_eq!(ready.len(), 1, "{ready:?}");
+        assert_eq!(ready[0].frame, FrameIndex::new(next));
+        assert_eq!(ready[0].compute.len(), 1);
+        assert_eq!(ready[0].compute[0].0, 100 + next as u32);
+        assert_eq!(timer.in_flight(), 0);
+
+        // The freed slot comes back into use: a full lap more, each frame
+        // reported once and as itself.
+        for index in next + 1..next + 1 + RING_DEPTH as u64 {
+            let ready = run(&mut timer, index);
+            assert_eq!(ready.len(), 1);
+            assert_eq!(ready[0].frame, FrameIndex::new(index));
+            assert_eq!(ready[0].compute[0].0, 100 + index as u32);
+        }
+        let stats = timer.stats();
+        assert_eq!(stats.frames_collected, 2 * RING_DEPTH as u64 + 1);
+        assert_eq!(stats.frames_failed, 0);
+        assert_eq!(stats.frames_skipped, 0);
     }
 }

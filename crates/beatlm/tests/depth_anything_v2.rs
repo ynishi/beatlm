@@ -314,9 +314,9 @@ impl<'g> Loaded<'g> {
                     let writes = stamps.compute_pass(k).unwrap();
                     self.kernels.encode(&mut encoder, k, 0, writes).unwrap();
                 }
-                stamps.resolve(&mut encoder);
+                let resolved = stamps.resolve(&mut encoder);
                 self.gpu.queue.submit([encoder.finish()]);
-                timer.start_readback();
+                timer.submitted(resolved);
             }
             None => {
                 for k in 0..self.kernels.len() {

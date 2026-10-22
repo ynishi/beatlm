@@ -427,12 +427,13 @@
 //! 2. **Slices.** Encode one compute pass per slice the plan hands out, each
 //!    with timestamp writes.
 //! 3. **Render.** Take the canvas's texture for this frame and encode the
-//!    render pass into it, timed; resolve the frame's timestamps, submit, and
-//!    hand the texture back for presentation. The browser shows it once the
-//!    callback returns.
-//! 4. **Measurements.** Request the map of this frame's timestamps, collect
-//!    every earlier frame whose map has completed into the cost model and the
-//!    render estimate, then deliver the plan's results and count its misses.
+//!    render pass into it, timed; resolve the frame's timestamps, submit, hand
+//!    the resolved frame back to the timer, which requests the map of its
+//!    timestamps, and hand the texture back for presentation. The browser
+//!    shows it once the callback returns.
+//! 4. **Measurements.** Collect every earlier frame whose map has completed
+//!    into the cost model and the render estimate, then deliver the plan's
+//!    results and count its misses.
 //!
 //! Then it asks for the next callback. Nothing in a callback waits.
 //!

@@ -21,6 +21,12 @@
 //!   in a browser, where it can never block.
 //! - **Only timestamps are read back.** Timing data is eight bytes per query;
 //!   the steady-state loop reads nothing else from the GPU.
+//! - **Only a frame the host says it submitted is read.** The timer cannot see
+//!   whether an encoder reached the queue, and mapping a slot whose copy never
+//!   ran succeeds on an earlier frame's timestamps. So a resolve returns a
+//!   [`ResolvedFrame`] that the host hands back after `queue.submit`, and one
+//!   dropped instead — with its encoder, on an error path — frees its slot
+//!   unread: a frame's timing may be lost, never misread.
 //!
 //! Memory is the other thing this module realises. [`profile`] is the one place
 //! wgpu's limits and features are read, and becomes the core's
@@ -43,6 +49,6 @@ pub use arenas::{ArenaError, Arenas};
 pub use limits::{LimitsError, required_limits};
 pub use profile::profile;
 pub use timer::{
-    FrameTimestamps, FrameTiming, MAX_SLICES, PassSpan, RING_DEPTH, SliceTimer, TimerError,
-    TimerStats,
+    FrameTimestamps, FrameTiming, MAX_SLICES, PassSpan, RING_DEPTH, ResolvedFrame, SliceTimer,
+    TimerError, TimerStats,
 };

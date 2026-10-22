@@ -251,7 +251,7 @@ async fn measure(
                 label: Some("beatlm-web calibration"),
             });
         let canvas = canvas_texture(gpu);
-        {
+        let resolved = {
             // Frame 0 is untimed: it compiles and first-touches everything.
             let timed = index > 0;
             let mut timestamps = timer.begin_frame(FrameIndex::new(index));
@@ -272,13 +272,13 @@ async fn measure(
                 };
                 workload.encode_render(&mut encoder, view, render);
             }
-            timestamps.resolve(&mut encoder);
-        }
+            timestamps.resolve(&mut encoder)
+        };
         gpu.queue.submit([encoder.finish()]);
+        timer.submitted(resolved);
         if let Some((texture, _)) = canvas {
             gpu.queue.present(texture);
         }
-        timer.start_readback();
         // The next frame starts once this one's timings are back, as the
         // bench's waits on the device; the maps complete between callbacks.
         while timer.in_flight() > 0 {
