@@ -12,6 +12,14 @@
 //! in submission order, delivers the jobs whose deadline arrives and are
 //! complete, and reports the ones that are not as missed.
 //!
+//! Wherever it plans — filling the frame, projecting the frames to come,
+//! summing `spent_estimate`, placing an on-beat deadline — the scheduler reads
+//! a slice at [`CostModel::planning_estimate`]. For every estimator but the
+//! frame-scaled one that is the slice's estimate; that one scales it by a
+//! slowdown measured over whole frames, and [`crate::cost`] ("Planning a
+//! frame against its total") says why. "Estimate" below means the planning
+//! estimate.
+//!
 //! # Jobs run as one sequence
 //!
 //! Jobs of one scheduler share one [`MemoryPlan`](crate::memory::MemoryPlan),
@@ -280,7 +288,8 @@ pub struct FramePlan {
     /// Jobs reported missed by this plan: their deadline arrived without a
     /// complete result, or they were abandoned as unable to make it.
     pub missed: Vec<Missed>,
-    /// The summed estimate of `runs`; never more than `budget`.
+    /// The summed planning estimate of `runs`
+    /// ([`CostModel::planning_estimate`]); never more than `budget`.
     pub spent_estimate: Micros,
     /// The budget the plan was made against.
     pub budget: Budget,
@@ -362,7 +371,7 @@ impl Budgets {
         let mut at = from;
         let mut now = 0;
         for &slice in slices {
-            let estimate = cost.estimate(slice);
+            let estimate = cost.planning_estimate(slice);
             loop {
                 let after = at.spent.saturating_add(estimate);
                 if after <= self.of(at.frame) {
@@ -457,8 +466,8 @@ impl Job {
         }
     }
 
-    /// Hands out the job's next `count` slices, adding their estimates to
-    /// `spent`.
+    /// Hands out the job's next `count` slices, adding their planning
+    /// estimates to `spent`.
     fn hand_out(
         &mut self,
         count: usize,
@@ -475,7 +484,7 @@ impl Job {
                 slice,
                 position: self.scheduled,
             });
-            *spent = spent.saturating_add(cost.estimate(slice));
+            *spent = spent.saturating_add(cost.planning_estimate(slice));
             self.scheduled += 1;
         }
     }
@@ -623,14 +632,15 @@ impl Scheduler {
                     later: self.expected,
                 };
                 let ahead = self.projected_end(input, budgets, cost);
-                let finish = match budgets.place(ahead, &slices, cost).end {
-                    Some(end) => end.instant(input),
-                    None => input.start.saturating_add(
-                        slices
-                            .iter()
-                            .fold(Micros::ZERO, |sum, s| sum.saturating_add(cost.estimate(*s))),
-                    ),
-                };
+                let finish =
+                    match budgets.place(ahead, &slices, cost).end {
+                        Some(end) => end.instant(input),
+                        None => input.start.saturating_add(
+                            slices.iter().fold(Micros::ZERO, |sum, s| {
+                                sum.saturating_add(cost.planning_estimate(*s))
+                            }),
+                        ),
+                    };
                 Due::Beat(beats.next_beat_at_or_after(finish.saturating_add(*margin)))
             }
         };
@@ -1901,6 +1911,211 @@ mod tests {
         assert_eq!(
             (submitted, delivered, missed, pending, early, wasted),
             (150, 144, 3, 3, 2, 25)
+        );
+    }
+
+    fn frame_scaled(frame_window: usize) -> CostModel {
+        CostModel::new(
+            Micros::new(100),
+            Estimator::FrameScaled {
+                window: 4,
+                frame_window,
+                frame_quantile: 0.9,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn frames_are_filled_by_the_planning_estimate() {
+        // Four slices with a median of 100 us, and frames that measured
+        // twice their prediction: the scale is 2, so a slice is planned at
+        // 200 and 450 us holds two of them, not four.
+        let mut c = frame_scaled(2);
+        for slice in 0..4 {
+            for _ in 0..crate::cost::WARM_SAMPLES {
+                c.record(SliceId::new(slice), Micros::new(100));
+            }
+        }
+        c.record_frame(Micros::new(400), Micros::new(800));
+        c.record_frame(Micros::new(400), Micros::new(800));
+        assert_eq!(c.estimate(SliceId::new(0)), Micros::new(100));
+        assert_eq!(c.planning_estimate(SliceId::new(0)), Micros::new(200));
+        let mut s = sched(
+            SyncPolicy::FixedLatency { frames: 5 },
+            MissPolicy::Drop,
+            450,
+        );
+        s.submit(frame(0), slices(&[0, 1, 2, 3]), &c).unwrap();
+        let p = s.plan_frame(frame(0), budget(450), &c);
+        assert_eq!(p.runs.len(), 2);
+        assert_eq!(p.spent_estimate, Micros::new(400));
+        let planned = p
+            .runs
+            .iter()
+            .map(|r| c.planning_estimate(r.slice))
+            .fold(Micros::ZERO, Micros::saturating_add);
+        assert_eq!(planned, p.spent_estimate);
+        assert!(p.spent_estimate <= p.budget.get());
+    }
+
+    /// xorshift64*: a fixed sequence of numbers that look random, so the
+    /// clustered-slowdown runs below are the same every time.
+    struct Sequence(u64);
+
+    impl Sequence {
+        /// The next number, uniform in `[0, 1)`.
+        #[allow(clippy::cast_precision_loss)]
+        fn unit(&mut self) -> f64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            let x = self.0.wrapping_mul(0x2545_F491_4F6C_DD1D);
+            (x >> 11) as f64 / (1_u64 << 53) as f64
+        }
+    }
+
+    /// What [`clustered`] measured over its counted frames.
+    #[derive(Debug)]
+    struct Packing {
+        /// Slices handed out per counted frame, on average.
+        slices_per_frame: f64,
+        /// The share of counted frames whose measured slice time exceeded
+        /// the budget.
+        over: f64,
+        /// The median of the counted frames' measured slice time over the
+        /// budget.
+        median_fill: f64,
+    }
+
+    /// Runs `FRAMES` frames of a budget of 4 ms with an endless queue of
+    /// 48-slice jobs, planned with `estimator`, whose slices are slow
+    /// together by frame, and returns what the frames after the first
+    /// `WARM` measured.
+    ///
+    /// A slice's measurement is its base cost (100 to 220 us) times its
+    /// frame's slowdown (1 in 94% of frames, 2 to 3 in the rest), times 2 in
+    /// 15% of its measurements on its own, times a jitter of 5%. That is the
+    /// shape of the browser's measurements in `crate::cost` ("Planning a
+    /// frame against its total"): slow measurements clustered by frame
+    /// beyond what independent ones would give, with each slice's 0.9
+    /// quantile about twice its median. Every frame's slices are recorded,
+    /// and the frame with what they were planned at.
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    fn clustered(estimator: Estimator) -> Packing {
+        const FRAMES: u64 = 3_000;
+        const WARM: u64 = 400;
+        const BUDGET: u64 = 4_000;
+        const SLICES: u32 = 48;
+        let base = |s: SliceId| 100 + u64::from(s.get() * 37 % 7) * 20;
+        let mut cost = CostModel::new(Micros::new(160), estimator).unwrap();
+        // Deadlines far enough out that the projection never gives a job
+        // up: the comparison is of packing, not of deadlines.
+        let mut s = sched(
+            SyncPolicy::FixedLatency { frames: 40 },
+            MissPolicy::Drop,
+            BUDGET,
+        );
+        let job: Vec<SliceId> = (0..SLICES).map(SliceId::new).collect();
+        let mut queued = 0_usize;
+        let mut draw = Sequence(0x9E37_79B9_7F4A_7C15);
+        let (mut counted, mut ran, mut over) = (0_u64, 0_u64, 0_u64);
+        let mut fills = Vec::new();
+        for i in 0..FRAMES {
+            let f = frame(i);
+            // Always more queued than a frame can take.
+            while queued < job.len() {
+                s.submit(f, job.clone(), &cost).unwrap();
+                queued += job.len();
+            }
+            let p = s.plan_frame(f, budget(BUDGET), &cost);
+            assert!(p.spent_estimate <= p.budget.get(), "frame {i}");
+            assert!(p.missed.is_empty(), "frame {i}");
+            queued -= p.runs.len();
+            let slowdown = if draw.unit() < 0.06 {
+                2.0 + draw.unit()
+            } else {
+                1.0
+            };
+            // The frame's slice time, and its ratio's two sides over the
+            // slices with a frame estimate when it was planned, as a host
+            // takes them.
+            let mut measured = Micros::ZERO;
+            let mut ratio = (Micros::ZERO, Micros::ZERO);
+            let mut samples = Vec::new();
+            for run in &p.runs {
+                let own = if draw.unit() < 0.15 { 2.0 } else { 1.0 };
+                let jitter = 0.1f64.mul_add(draw.unit(), 0.95);
+                let us =
+                    Micros::new((base(run.slice) as f64 * slowdown * own * jitter).round() as u64);
+                if let Some(planned) = cost.frame_estimate(run.slice) {
+                    ratio = (ratio.0.saturating_add(planned), ratio.1.saturating_add(us));
+                }
+                samples.push((run.slice, us));
+                measured = measured.saturating_add(us);
+            }
+            for (slice, us) in samples {
+                cost.record(slice, us);
+            }
+            cost.record_frame(ratio.0, ratio.1);
+            if i >= WARM {
+                counted += 1;
+                ran += p.runs.len() as u64;
+                over += u64::from(measured.get() > BUDGET);
+                fills.push(measured.get() as f64 / BUDGET as f64);
+            }
+        }
+        fills.sort_by(f64::total_cmp);
+        Packing {
+            slices_per_frame: ran as f64 / counted as f64,
+            over: over as f64 / counted as f64,
+            median_fill: fills[fills.len() / 2],
+        }
+    }
+
+    #[test]
+    fn with_slowdowns_clustered_by_frame_the_frame_scale_packs_more_than_slice_quantiles_and_overruns_less_than_medians()
+     {
+        let q = 0.9;
+        let quantiles = clustered(Estimator::WindowedQuantile {
+            window: 32,
+            quantile: q,
+        });
+        let medians = clustered(Estimator::WindowedQuantile {
+            window: 32,
+            quantile: 0.5,
+        });
+        let scaled = clustered(Estimator::FrameScaled {
+            window: 32,
+            frame_window: 64,
+            frame_quantile: q,
+        });
+        // As run: 12.3 slices a frame, a median fill of 0.56 and 5.9% of
+        // frames over for the quantiles; 24.0, 1.10 and 91.8% for the
+        // medians; 18.1, 0.85 and 7.6% for the frame scale.
+        //
+        // The sum of the slices' 0.9 quantiles plans each slice at about
+        // twice its typical cost: the frames measure well under the budget,
+        // and the slow ones run over it anyway.
+        assert!(quantiles.median_fill < 0.7, "{quantiles:?}");
+        // The sum of their medians fills the frame to the budget with the
+        // typical cost, and most frames, slow on some of their own slices,
+        // run over: far more than 1 - q of them.
+        assert!(medians.over > 0.5, "{medians:?}");
+        // The frame scale keeps the overruns within 1 - q of the frames, and
+        // packs more than the quantiles.
+        assert!(scaled.over <= 1.0 - q, "{scaled:?}");
+        assert!(
+            scaled.slices_per_frame > 1.3 * quantiles.slices_per_frame,
+            "{scaled:?} against {quantiles:?}"
+        );
+        assert!(
+            scaled.median_fill > quantiles.median_fill + 0.15,
+            "{scaled:?} against {quantiles:?}"
         );
     }
 }

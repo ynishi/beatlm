@@ -90,6 +90,10 @@ and this project adheres to
   job fits its promised frames (`capacity_frames_needed`).
 - `beatlm::gpu::PassSpan`: each timed pass's begin and end timestamps, kept in
   `FrameTiming` beside the durations.
+- `Estimator::FrameScaled` (opt-in, `--estimator frame-scaled`,
+  `estimator=frame-scaled`): plans warm slices at their loop median times a
+  measured frame scale; with `CostModel::record_frame`, `record_calibration`,
+  `planning_estimate` and the `frame_ratio` / `frame_scale` report lines.
 
 ### Changed
 

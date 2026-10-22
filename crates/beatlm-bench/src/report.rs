@@ -6,7 +6,7 @@ use std::fmt::Write as _;
 use crate::args::{Args, WorkloadKind, fusion_name};
 use crate::engine::{NetReport, Outcome};
 use crate::pace::FRAME_PERIOD;
-use crate::stats::{histogram, summarize};
+use crate::stats::{frame_ratio_value, frame_scale_value, histogram, summarize};
 
 /// Where the run happened.
 pub struct Environment {
@@ -106,6 +106,20 @@ fn write_report(
         out,
         "gpu_frames_over_period: {over} of {}",
         outcome.gpu_frame_us.len()
+    )?;
+    writeln!(
+        out,
+        "frame_ratio: {}",
+        frame_ratio_value(&outcome.frame_ratios)
+    )?;
+    writeln!(
+        out,
+        "frame_scale: {}",
+        frame_scale_value(
+            outcome.frame_scale,
+            outcome.frames_recorded,
+            &outcome.frame_scales
+        )
     )?;
     if let Some(dispatches) = outcome.background_dispatches {
         writeln!(out, "background_dispatches: {dispatches}")?;

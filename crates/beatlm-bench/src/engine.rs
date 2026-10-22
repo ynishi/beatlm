@@ -18,7 +18,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use beatlm::gpu::{FrameTiming, MAX_SLICES, SliceTimer, TimerStats};
 use beatlm_core::budget::Budget;
-use beatlm_core::cost::{CostModel, Estimator, SliceId};
+use beatlm_core::cost::{CostModel, Estimator, FrameScale, SliceId};
 use beatlm_core::kernel::Program;
 use beatlm_core::schedule::{FramePlan, JobId, Scheduler};
 use beatlm_core::sync::{MissPolicy, SyncPolicy};
@@ -31,6 +31,7 @@ use crate::depth;
 use crate::device::Gpu;
 use crate::net::{self, Net, Numbers};
 use crate::pace::{FRAME_PERIOD, Tick, micros_between};
+use crate::stats::frame_ratio;
 use crate::workload::{RENDER_HEIGHT, RENDER_WIDTH, TARGET_FORMAT, Workload};
 
 /// What a slice is assumed to cost until it has been measured.
@@ -52,6 +53,12 @@ pub const COST_WINDOW: usize = 32;
 const COST_QUANTILE: f64 = 0.9;
 /// The most the capped estimate pads the mean, as a multiple of the mean.
 const COST_CAP: f64 = 0.5;
+/// The frames whose ratio the frame-scaled estimate reads its scale from;
+/// `beatlm_core::cost` ("Planning a frame against its total") says why 64.
+pub const COST_FRAME_WINDOW: usize = 64;
+/// The quantile of the frame ratios the frame scale is: the windowed
+/// estimate's quantile, for the reason the same section gives.
+const COST_FRAME_QUANTILE: f64 = COST_QUANTILE;
 /// How many times the final drain waits for the device before giving up on the
 /// timings still in flight.
 const DRAIN_ATTEMPTS: usize = 8;
@@ -100,11 +107,22 @@ const fn estimator(kind: EstimatorKind) -> Estimator {
             sigmas: COST_SIGMAS,
             cap: COST_CAP,
         },
+        EstimatorKind::FrameScaled => Estimator::FrameScaled {
+            window: COST_WINDOW,
+            frame_window: COST_FRAME_WINDOW,
+            frame_quantile: COST_FRAME_QUANTILE,
+        },
     }
 }
 
-/// The label a timed slice carries from the scheduler to the cost model.
-type Tag = (JobId, SliceId);
+/// The label a timed slice carries from the scheduler to the cost model: its
+/// job, the slice, and what a frame's ratio takes the slice at when the frame
+/// was planned ([`CostModel::frame_estimate`], `None` for a slice left out of
+/// it). The timer hands the label back with the measurement, so a frame's
+/// measured slice time is compared with what those same slices were planned
+/// at ([`CostModel::record_frame`]), however many frames later the timing
+/// arrives and whichever of its passes were timed.
+type Tag = (JobId, SliceId, Option<Micros>);
 
 /// Everything a run measured.
 ///
@@ -171,6 +189,18 @@ pub struct Outcome {
     pub measured: BTreeMap<SliceId, (u64, u64)>,
     /// Per slice: the cost model's final estimate.
     pub estimates: BTreeMap<SliceId, Micros>,
+    /// Per timed frame whose slices with a frame estimate were planned at
+    /// more than zero: their measured time over the sum of those estimates
+    /// when the frame was planned ([`CostModel::frame_estimate`]: every slice
+    /// for every estimator but the frame-scaled one, its warm slices for
+    /// that one).
+    pub frame_ratios: Vec<f64>,
+    /// The frame scale of each plan made with a measured one.
+    pub frame_scales: Vec<f64>,
+    /// The frame scale when the run ended.
+    pub frame_scale: FrameScale,
+    /// Frames the cost model folded into its frame scale.
+    pub frames_recorded: u64,
     /// What the timer could not measure.
     pub timer: TimerStats,
     /// Dispatches the competing load submitted, from the one it completed
@@ -551,6 +581,9 @@ impl<'g> Engine<'g> {
         let plan = self.scheduler.plan_frame(frame, budget, &self.cost);
 
         let encoding = Instant::now();
+        // The estimates the plan was made with; nothing records into the
+        // cost model before the frame is encoded.
+        let cost = &self.cost;
         let mut encoder = self
             .gpu
             .device
@@ -559,7 +592,8 @@ impl<'g> Engine<'g> {
             });
         let mut timestamps = self.timer.begin_frame(frame.index);
         for run in &plan.runs {
-            let writes = timestamps.compute_pass((run.job, run.slice))?;
+            let writes =
+                timestamps.compute_pass((run.job, run.slice, cost.frame_estimate(run.slice)))?;
             match &self.net {
                 Some(net) => {
                     net.encode(&mut encoder, net.slot_of(run.job.get()), run.slice, writes)?;
@@ -588,6 +622,9 @@ impl<'g> Engine<'g> {
         self.outcome
             .dispatches_per_frame
             .push(plan.runs.len() as u64);
+        if let FrameScale::Measured(scale) = self.cost.frame_scale() {
+            self.outcome.frame_scales.push(scale);
+        }
         // Counted after the timed intervals, so the bookkeeping is not charged
         // to the encode time it is compared with. Every slice is one compute
         // pass with one dispatch, in every workload.
@@ -626,15 +663,29 @@ impl<'g> Engine<'g> {
         self.outcome.missed += plan.missed.len() as u64;
     }
 
-    /// Feeds one frame's measurements to the cost model and the report.
+    /// Feeds one frame's measurements to the cost model and the report: each
+    /// slice's, then the frame's ratio over the timed slices that had a frame
+    /// estimate when it was planned: what they were planned at against what
+    /// they measured.
     fn absorb(&mut self, timing: FrameTiming<Tag>) {
         let mut gpu = Micros::ZERO;
-        for ((_, slice), duration) in &timing.compute {
+        let (mut predicted, mut in_ratio) = (Micros::ZERO, Micros::ZERO);
+        for ((_, slice, planned), duration) in &timing.compute {
             self.cost.record(*slice, *duration);
             let entry = self.outcome.measured.entry(*slice).or_insert((0, 0));
             entry.0 = entry.0.saturating_add(duration.get());
             entry.1 += 1;
             gpu = gpu.saturating_add(*duration);
+            if let Some(planned) = planned {
+                predicted = predicted.saturating_add(*planned);
+                in_ratio = in_ratio.saturating_add(*duration);
+            }
+        }
+        if !timing.compute.is_empty() {
+            self.cost.record_frame(predicted, in_ratio);
+            if let Some(ratio) = frame_ratio(predicted, in_ratio) {
+                self.outcome.frame_ratios.push(ratio);
+            }
         }
         if let Some(longest) = timing.compute.iter().map(|(_, d)| d.get()).max() {
             self.outcome.longest_dispatch_us.push(longest);
@@ -702,6 +753,8 @@ impl<'g> Engine<'g> {
                 .estimates
                 .insert(slice, self.cost.estimate(slice));
         }
+        self.outcome.frame_scale = self.cost.frame_scale();
+        self.outcome.frames_recorded = self.cost.frames_recorded();
         Ok(self.outcome)
     }
 
@@ -901,12 +954,14 @@ mod tests {
 
     #[test]
     fn every_estimator_the_options_name_is_valid() {
-        for kind in [
-            EstimatorKind::MeanSigmas,
-            EstimatorKind::Quantile,
-            EstimatorKind::Capped,
-        ] {
+        for kind in EstimatorKind::ALL {
             assert!(CostModel::new(SLICE_PRIOR, estimator(kind)).is_ok());
+        }
+        // Only the frame-scaled one has a frame scale.
+        for kind in EstimatorKind::ALL {
+            let cost = CostModel::new(SLICE_PRIOR, estimator(kind)).unwrap();
+            let warming = matches!(cost.frame_scale(), FrameScale::WarmingUp { .. });
+            assert_eq!(warming, kind == EstimatorKind::FrameScaled, "{kind:?}");
         }
     }
 }

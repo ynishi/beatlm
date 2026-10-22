@@ -38,8 +38,9 @@ usage: beatlm-bench [options]
                                                            (default on)
   --mode M          concurrency candidate: sync, thread or async (default sync)
   --runs N          repeat the whole run N times on one device (default 1)
-  --estimator E     cost estimate: mean-sigmas, quantile or capped
-                                                           (default quantile)
+  --estimator E     cost estimate: mean-sigmas, quantile, capped or
+                    frame-scaled (a slice's median times a slowdown
+                    measured over whole frames)            (default quantile)
   --background-load run a competing GPU load from a second device on the
                     same adapter, from before the first frame to after the last
   --background-iters N  loop iterations per invocation of the competing load's
@@ -99,15 +100,27 @@ pub enum EstimatorKind {
     Quantile,
     /// `beatlm_core::cost::Estimator::CappedDeviation`.
     Capped,
+    /// `beatlm_core::cost::Estimator::FrameScaled`.
+    FrameScaled,
 }
 
 impl EstimatorKind {
+    /// Every kind, in the order `--help` and the error for another value
+    /// list them.
+    pub const ALL: [Self; 4] = [
+        Self::MeanSigmas,
+        Self::Quantile,
+        Self::Capped,
+        Self::FrameScaled,
+    ];
+
     /// The spelling `--estimator` accepts and the report prints.
     pub const fn name(self) -> &'static str {
         match self {
             Self::MeanSigmas => "mean-sigmas",
             Self::Quantile => "quantile",
             Self::Capped => "capped",
+            Self::FrameScaled => "frame-scaled",
         }
     }
 }
@@ -433,14 +446,13 @@ fn workload(text: &str) -> Result<WorkloadKind> {
 
 /// Parses the value of `--estimator`.
 fn estimator(text: &str) -> Result<EstimatorKind> {
-    [
-        EstimatorKind::MeanSigmas,
-        EstimatorKind::Quantile,
-        EstimatorKind::Capped,
-    ]
-    .into_iter()
-    .find(|e| e.name() == text)
-    .with_context(|| format!("--estimator: {text:?} is not one of mean-sigmas, quantile, capped"))
+    EstimatorKind::ALL
+        .into_iter()
+        .find(|e| e.name() == text)
+        .with_context(|| {
+            let names: Vec<&str> = EstimatorKind::ALL.iter().map(|e| e.name()).collect();
+            format!("--estimator: {text:?} is not one of {}", names.join(", "))
+        })
 }
 
 /// Parses the value of `--mode`.
@@ -564,16 +576,19 @@ mod tests {
         let a = Args::default();
         assert_eq!(a.estimator, EstimatorKind::Quantile);
         assert!(!a.background_load);
-        for kind in [
-            EstimatorKind::MeanSigmas,
-            EstimatorKind::Quantile,
-            EstimatorKind::Capped,
-        ] {
+        for kind in EstimatorKind::ALL {
             let Command::Run(a) = parse_strs(&["--estimator", kind.name()]).unwrap() else {
                 panic!("expected a run");
             };
             assert_eq!(a.estimator, kind);
+            let spelled = format!("--estimator={}", kind.name());
+            let Command::Run(a) = parse_strs(&[&spelled]).unwrap() else {
+                panic!("expected a run");
+            };
+            assert_eq!(a.estimator, kind);
         }
+        assert!(parse_strs(&["--estimator", "frame"]).is_err());
+        assert!(parse_strs(&["--estimator", "frame-scaled:0.9"]).is_err());
         let Command::Run(a) = parse_strs(&["--background-load", "--background-iters=900"]).unwrap()
         else {
             panic!("expected a run");

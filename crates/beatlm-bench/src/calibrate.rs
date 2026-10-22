@@ -20,7 +20,10 @@
 //!    produced is built on one slot and run the same way, and every part's
 //!    measured durations in the second half of the timed frames, as in pass 1,
 //!    go into a [`CostModel`] built with the run's `--estimator`, which the loop
-//!    then uses. Each part is a new slice to the
+//!    then uses. They go in as calibration's
+//!    ([`CostModel::record_calibration`]): every estimator but `frame-scaled`
+//!    folds them as the loop's, and that one plans a slice with them only until
+//!    the loop has measured it. Each part is a new slice to the
 //!    loop's cost model, which starts every unmeasured slice at the same prior
 //!    whatever it costs, so a job of many parts would have been estimated at
 //!    many priors until each had been measured; measured here, each part starts
@@ -178,9 +181,11 @@ pub fn calibrate(
         // The same second half as pass 1: the first half is the GPU settling
         // into the paced load, and an estimator that keeps every sample would
         // otherwise start the loop from it.
+        // Recorded as calibration's: the frame-scaled estimate keeps them out
+        // of the median it scales; every other one folds them as the loop's.
         measure(gpu, workload, target, &net, |frame, slice, duration| {
             if frame > CALIBRATION_FRAMES / 2 {
-                cost.record(slice, duration);
+                cost.record_calibration(slice, duration);
             }
         })?;
     }

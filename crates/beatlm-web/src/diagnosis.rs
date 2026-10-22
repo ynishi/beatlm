@@ -156,12 +156,38 @@
 //! What is not measured: the GPU's clock itself, which no browser API reads,
 //! so H2 is tested only through what it would do to the times; and the
 //! compositor's GPU work, which is in no query.
+//!
+//! # Planning against the frame's total
+//!
+//! The finding of the lines above, that slow measurements come by frame, is
+//! what `estimator=frame-scaled` plans for (`beatlm_core::cost`, "Planning a
+//! frame against its total"). Two lines, written for every run with
+//! timestamps and named and formatted as the bench's, say what it read:
+//!
+//! - `frame_ratio`: for each timed frame that ran slices, their measured time
+//!   over the sum of the estimates they were planned with, with how many
+//!   frames and its min, p50, p90 and max: every slice's, except that
+//!   `frame-scaled` counts only the slices warm in the loop
+//!   (`beatlm_core::cost::CostModel::frame_estimate`). The page
+//!   carries each slice's estimate when the frame was planned in the label
+//!   its pass is timed with, so the ratio is of the same slices' plan and
+//!   measurement however many frames later the timing comes back. Under
+//!   `frame-scaled` these are the ratios the frame scale is a quantile of;
+//!   under another estimator, how much of what was planned the frames used.
+//! - `frame_scale`: `none` for an estimator without one; otherwise the frame
+//!   scale when the run ended (`final`, `warming_up` before the frame window
+//!   filled), the frames the cost model recorded (`frames_recorded`), and the
+//!   plans made with a measured scale (`planned_scaled`) with its min, p50,
+//!   p90 and max over them.
+//!
+//! The ratios are recorded host-side for the report, apart from the cost
+//! model's own window, which the report does not read.
 
 pub mod tail;
 
 use std::collections::BTreeMap;
 
-use beatlm_core::cost::SliceId;
+use beatlm_core::cost::{FrameScale, SliceId};
 use beatlm_core::time::Micros;
 
 /// Why a job was missed.
@@ -268,6 +294,16 @@ pub struct Diagnosis {
     /// lines ([`tail`]); recorded for a depth run only, the one that writes
     /// them.
     pub frames: Vec<tail::TimedFrame>,
+    /// Per timed frame whose slices were planned at more than zero: their
+    /// measured time over the sum of their estimates when the frame was
+    /// planned, for the `frame_ratio` line.
+    pub frame_ratios: Vec<f64>,
+    /// The frame scale of each plan made with a measured one.
+    pub frame_scales: Vec<f64>,
+    /// The frame scale when the run ended.
+    pub frame_scale: FrameScale,
+    /// Frames the cost model folded into its frame scale.
+    pub frames_recorded: u64,
 }
 
 impl Diagnosis {

@@ -200,7 +200,9 @@ pub async fn calibrate(
         measure(gpu, workload, &net, |frame, compute| {
             if depth::counted(frame) {
                 for &(slice, duration) in compute {
-                    cost.record(slice, duration);
+                    // Calibration's, which the frame-scaled estimate keeps
+                    // out of the median it scales; the bench's call.
+                    cost.record_calibration(slice, duration);
                     let part = usize::try_from(slice.get())
                         .ok()
                         .and_then(|i| parts_us.get_mut(i));
