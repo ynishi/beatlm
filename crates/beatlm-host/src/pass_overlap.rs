@@ -84,8 +84,8 @@
 //!   order is `after`; a render begun before or among the slices was begun
 //!   ahead of work encoded before it.
 //! - `slice_vs_render_overlap`: each compute pass's measured duration over
-//!   the median of the same slice's (slices measured [`MIN_SAMPLES`] times or
-//!   more in those frames), apart by whether the pass overlapped its frame's
+//!   the median of the same slice's in those frames (the slices
+//!   [`slice_medians`] keeps), apart by whether the pass overlapped its frame's
 //!   render: how many, and the ratios' mean, p50 and p90. H7's slowdown
 //!   predicts the overlapped ratios above 1 and the others at or below it;
 //!   overlap with ratios alike is overlap that does not slow the slices.
@@ -181,7 +181,7 @@ use std::fmt::Write as _;
 use beatlm::gpu::{FrameTiming, PassSpan};
 use beatlm_core::cost::SliceId;
 
-use crate::stats::{MIN_SAMPLES, Ratios, nearest_rank, share, step_ns, summarize};
+use crate::stats::{Ratios, share, slice_medians, step_ns, summarize};
 
 /// The least intersection, in nanoseconds, that can count as an overlap
 /// whatever the timestamps' step: one microsecond. The module documentation,
@@ -522,18 +522,7 @@ pub fn analyse(frames: &[Frame]) -> PassOverlap {
             out.overlap_us.push(round_us(covered_ns(render, &spans)));
         }
     }
-    let medians: BTreeMap<SliceId, u64> = by_slice
-        .into_iter()
-        .filter_map(|(slice, mut list)| {
-            if list.len() < MIN_SAMPLES {
-                return None;
-            }
-            list.sort_unstable();
-            nearest_rank(&list, 50)
-                .filter(|&median| median > 0)
-                .map(|median| (slice, median))
-        })
-        .collect();
+    let medians = slice_medians(&mut by_slice);
     let (mut with, mut without) = (Vec::new(), Vec::new());
     for (slice, us, over) in flagged {
         let Some(&median) = medians.get(&slice) else {

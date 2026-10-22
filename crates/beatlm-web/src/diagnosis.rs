@@ -81,8 +81,10 @@
 //! none of them changes what is scheduled or estimated. [`tail`] computes
 //! them and defines their terms: an *outlier* is a measurement above
 //! [`tail::OUTLIER_FACTOR`] times its slice's median in the loop, and every
-//! per-slice figure is over the slices measured [`tail::MIN_SAMPLES`] times or
-//! more. The explanations:
+//! per-slice figure, outliers included, is over the slices
+//! [`tail::slice_medians`] keeps, except that `tail_quantization`, the
+//! timestamp step's own statistic, also keeps a slice whose median is 0, as
+//! [`tail::slice_medians`] says. The explanations:
 //!
 //! - **H1, the first pass waits.** A frame's first compute pass's begin and
 //!   end can enclose time it spent queued behind earlier GPU work, the
@@ -106,7 +108,8 @@
 //!   the step's; the median over slices of one step over the 90th percentile,
 //!   the most the step can add to it; and of one step over the excess of the
 //!   final estimate above the mean, capped at 1, the share of that excess the
-//!   step can account for. A duration is a difference of two timestamps cut
+//!   step can account for, over the slices [`tail::measured_enough`],
+//!   median 0 included. A duration is a difference of two timestamps cut
 //!   to the step, so it is off by less than one step. H4.
 //! - `tail_slice_spread`: over the slices, the median and the 90th percentile
 //!   of each one's p90 / p50, and the median of its max / p50: how heavy the
@@ -447,97 +450,120 @@ mod tests {
         job_estimate_us: (u64, u64),
     }
 
-    /// A loop on the scheduler alone, with the page's budget
-    /// (`beatlm_host::frame::RenderCost`), its `--submit free` admission and
-    /// the core's default estimator: 160 slices of a 29 ms job, each seeded with 32
-    /// measurements of `seed_scale` times what it takes, as calibration seeds
-    /// the model. The render is 1 900 µs, measured alone, the margin 2 ms and
-    /// the latency 25 frames. One pass in `1 / every` measures `slow_us`
-    /// longer than it ran, at pseudo-random. It models the rules, not the
-    /// browser: what makes the page's estimates climb is not in it.
+    /// The page's loop (`web/frame.rs`, `tick`) on its frame step
+    /// ([`beatlm_host::step::FrameStep`]) with scripted timings, under its
+    /// `--submit free` admission and the core's default estimator: 160 slices
+    /// of a 29 ms job, each seeded with 32 measurements of `seed_scale` times
+    /// what it takes, as calibration seeds the model. The render is 1 900 µs,
+    /// measured alone, the margin 2 ms and the latency 25 frames. One pass in
+    /// `1 / every` measures `slow_us` longer than it ran, at pseudo-random.
+    ///
+    /// Each frame is the tick's: plan, the misses' reasons read before the
+    /// step counts the frame, `after_submit`, then the timing of the frame
+    /// before, whose readback completed between callbacks, absorbed, and
+    /// `complete`; so a frame is planned on the measurements of the frames up
+    /// to the one before last. The last frame's timing is absorbed after the
+    /// loop, as the page's drain does. It models the rules, not the browser:
+    /// what makes the page's estimates climb is not in it.
     fn simulate(period_us: u64, every: u64, slow_us: u64, seed_scale: u64, frames: u64) -> Run {
+        use beatlm::gpu::FrameTiming;
         use beatlm_core::cost::{CostModel, Estimator};
-        use beatlm_core::schedule::{Due, Scheduler};
+        use beatlm_core::schedule::Due;
         use beatlm_core::sync::{MissPolicy, SyncPolicy};
         use beatlm_core::time::{FrameIndex, FrameInfo, TimePoint};
-        use beatlm_host::frame::{Admission, RenderCost, Submit};
+        use beatlm_host::frame::{Submit, Tag};
+        use beatlm_host::step::{FrameStep, StepConfig};
 
-        let (period, margin) = (Micros::new(period_us), Micros::new(2_000));
+        /// The page's `absorb`: the passes for the diagnosis, then the step.
+        fn absorb(step: &mut FrameStep, diagnosis: &mut Diagnosis, timing: &FrameTiming<Tag>) {
+            let passes: Vec<(SliceId, Micros)> = timing
+                .compute
+                .iter()
+                .map(|&((_, slice, _), duration)| (slice, duration))
+                .collect();
+            diagnosis.passes(&passes);
+            step.absorb(timing);
+        }
+
+        let period = Micros::new(period_us);
         let costs: Vec<u64> = (0..160).map(|i| [60, 120, 180, 240, 300][i % 5]).collect();
-        let slices: Vec<SliceId> = (0..160).map(SliceId::new).collect();
         let mut cost = CostModel::new(Micros::new(2_000), Estimator::default()).unwrap();
         for _ in 0..32 {
-            for (slice, &us) in slices.iter().zip(&costs) {
-                cost.record(*slice, Micros::new(us * seed_scale));
+            for (slice, &us) in (0..).map(SliceId::new).zip(&costs) {
+                cost.record(slice, Micros::new(us * seed_scale));
             }
         }
-        let estimate =
-            |cost: &CostModel| -> u64 { slices.iter().map(|&s| cost.estimate(s).get()).sum() };
-        let start_estimate = estimate(&cost);
-        let mut scheduler = Scheduler::new(
-            SyncPolicy::FixedLatency { frames: 25 },
-            MissPolicy::HoldPrevious,
-            render_budget(period, margin),
+        let mut step = FrameStep::new(
+            StepConfig {
+                policy: SyncPolicy::FixedLatency { frames: 25 },
+                miss: MissPolicy::HoldPrevious,
+                slices: 160,
+                margin: Micros::new(2_000),
+                prior_period: period,
+                submit: Submit::Free,
+            },
+            cost,
         );
-        let mut render = RenderCost::default();
-        let (mut admission, mut seed) = (Admission::new(Submit::Free), 1_u64);
-        let mut dispatched: BTreeMap<u64, u64> = BTreeMap::new();
-        let mut pending: Vec<(SliceId, Micros)> = Vec::new();
+        // The page's `job_estimate`.
+        let estimate = |step: &FrameStep| -> u64 {
+            step.slices()
+                .iter()
+                .map(|&s| step.cost().planning_estimate(s).get())
+                .sum()
+        };
+        let mut seed = 1_u64;
+        let mut returned: Option<FrameTiming<Tag>> = None;
         let mut run = Run {
             delivered: 0,
             diagnosis: Diagnosis::default(),
             last_slice_frame: None,
-            job_estimate_us: (start_estimate, 0),
+            job_estimate_us: (estimate(&step), 0),
         };
         for index in 0..frames {
-            // Last frame's measurements arrive now, as readbacks do.
-            for &(slice, measured) in &pending {
-                cost.record(slice, measured);
-            }
-            pending.clear();
-            render.record(Micros::new(1_900));
             let frame = FrameInfo {
                 index: FrameIndex::new(index),
                 start: TimePoint::new(index * period_us),
                 period,
             };
-            let expected = render.expected(period, margin);
-            scheduler.set_expected_budget(expected);
-            let job = if admission.takes_input() {
-                Some(scheduler.submit(frame, slices.clone(), &cost).unwrap())
-            } else {
-                None
-            };
-            let now = render.budget(period, margin);
-            let plan = scheduler.plan_frame(frame, now, &cost);
-            for missed in &plan.missed {
+            let planned = step.plan(frame, true).unwrap();
+            for missed in &planned.plan().missed {
                 let Due::Frame(due) = missed.due else {
                     panic!("a fixed latency is due on a frame");
                 };
-                let sent = dispatched.get(&missed.job.get()).copied().unwrap_or(0);
+                let sent = step.dispatched(missed.job);
                 run.diagnosis.missed(reason(sent, due.get(), index));
             }
-            for slice_run in &plan.runs {
-                *dispatched.entry(slice_run.job.get()).or_default() += 1;
+            let mut compute = Vec::new();
+            for slice_run in &planned.plan().runs {
                 seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-                let slow = if (seed >> 33) % every == 0 {
+                let slow = if (seed >> 33).is_multiple_of(every) {
                     slow_us
                 } else {
                     0
                 };
                 let ran = costs[slice_run.slice.get() as usize];
-                pending.push((slice_run.slice, Micros::new(ran + slow)));
+                compute.push((step.tag(slice_run), Micros::new(ran + slow)));
                 run.last_slice_frame = Some(index);
             }
-            admission.planned(job.map(|job| (job, slices.len())), &plan);
-            run.delivered += plan.delivered.len() as u64;
+            let submitted = step.after_submit(planned);
+            if let Some(timing) = returned.take() {
+                absorb(&mut step, &mut run.diagnosis, &timing);
+            }
+            returned = Some(FrameTiming {
+                frame: frame.index,
+                compute,
+                render: Some(Micros::new(1_900)),
+                compute_spans: Vec::new(),
+                render_span: None,
+            });
+            step.complete(submitted);
         }
-        run.job_estimate_us.1 = estimate(&cost);
+        if let Some(timing) = returned.take() {
+            absorb(&mut step, &mut run.diagnosis, &timing);
+        }
+        run.job_estimate_us.1 = estimate(&step);
+        run.delivered = step.finish().delivered;
         run
-    }
-
-    fn render_budget(period: Micros, margin: Micros) -> beatlm_core::budget::Budget {
-        beatlm_core::budget::Budget::for_frame(period, beatlm_host::presets::RENDER_PRIOR, margin)
     }
 
     /// A property of the core's rules, not the page's finding: a slice whose

@@ -173,6 +173,11 @@ and this project adheres to
 - Which calibration frames count (the second half of each pass) and the
   first pass's per-kernel medians come from `beatlm_host::calibration`;
   each host still drives the two passes itself.
+- A slice whose median is 0 (it runs under one timestamp step) is left out
+  of every statistic that compares measurements with a median, in both
+  hosts: the page's `tail_outliers`, `tail_outlier_frames`,
+  `tail_busy_previous` and `tail_loop_over_calibration` no longer count it,
+  as `pass_overlap_*` already did. `tail_quantization` keeps it.
 
 ### Fixed
 

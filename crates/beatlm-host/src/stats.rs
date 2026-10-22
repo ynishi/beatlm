@@ -6,13 +6,43 @@
 
 use std::collections::BTreeMap;
 
-use beatlm_core::cost::FrameScale;
+use beatlm_core::cost::{FrameScale, SliceId};
 use beatlm_core::time::Micros;
 
 /// Slices measured fewer times than this, in the frames a per-slice statistic
 /// reads, are left out of that statistic: a median of fewer says little about
 /// the slice.
 pub const MIN_SAMPLES: usize = 8;
+
+/// Whether a slice's `samples` are enough for a per-slice statistic to read:
+/// [`MIN_SAMPLES`] or more.
+#[must_use]
+pub fn measured_enough(samples: &[u64]) -> bool {
+    samples.len() >= MIN_SAMPLES
+}
+
+/// Each slice's median by nearest rank, over the slices a per-slice statistic
+/// reads; sorts the `samples` of each slice it keeps.
+///
+/// A slice is left out when it was not [`measured_enough`], or when its
+/// median is 0: such a slice runs in less than one timestamp step (65.5 µs on
+/// Chrome, [`step_ns`]), below the timer's resolution, so any ratio with its
+/// median on either side measures the step, not the slice. Every statistic
+/// that compares a slice's measurements with its median reads these slices,
+/// so they all count the same ones. A statistic of the timestamp step itself
+/// keeps a slice whose median is 0: such a slice is the step's plainest case.
+pub fn slice_medians(samples: &mut BTreeMap<SliceId, Vec<u64>>) -> BTreeMap<SliceId, u64> {
+    samples
+        .iter_mut()
+        .filter(|(_, list)| measured_enough(list))
+        .filter_map(|(&slice, list)| {
+            list.sort_unstable();
+            nearest_rank(list, 50)
+                .filter(|&median| median > 0)
+                .map(|median| (slice, median))
+        })
+        .collect()
+}
 
 /// The median, the 99th percentile and the maximum of a set of samples.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,6 +259,32 @@ mod tests {
         let mut samples = vec![1_000; 28];
         samples.extend([9_000, 9_000, 9_000, 20_000]);
         assert_eq!(median(&mut samples), Some(Micros::new(1_000)));
+    }
+
+    #[test]
+    fn slices_measured_too_rarely_or_at_a_median_of_0_have_no_median() {
+        let many = MIN_SAMPLES;
+        let mut samples = BTreeMap::from([
+            (
+                SliceId::new(0),
+                [vec![400; 1], vec![300; many - 1]].concat(),
+            ),
+            (SliceId::new(1), vec![300; many - 1]),
+            (
+                SliceId::new(2),
+                [vec![0; many], vec![66; many - 1]].concat(),
+            ),
+            (
+                SliceId::new(3),
+                [vec![66; many], vec![0; many - 1]].concat(),
+            ),
+        ]);
+        let medians = slice_medians(&mut samples);
+        assert_eq!(
+            medians,
+            BTreeMap::from([(SliceId::new(0), 300), (SliceId::new(3), 66)])
+        );
+        assert!(medians.keys().all(|slice| samples[slice].is_sorted()));
     }
 
     #[test]

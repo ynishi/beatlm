@@ -17,9 +17,9 @@ use std::collections::BTreeMap;
 use beatlm_core::cost::SliceId;
 use beatlm_host::stats::nearest_rank as percentile;
 // Shared with the bench (`beatlm_host::stats`), where the `pass_overlap_*`
-// lines read the same step and ratios and leave slices out by the same count;
-// here the frames a per-slice statistic reads are the loop's.
-pub use beatlm_host::stats::{MIN_SAMPLES, Ratios, step_ns};
+// lines read the same step and ratios and leave out the same slices; here the
+// frames a per-slice statistic reads are the loop's.
+pub use beatlm_host::stats::{MIN_SAMPLES, Ratios, measured_enough, slice_medians, step_ns};
 
 /// A measurement is an outlier when it is more than this many times its
 /// slice's median in the loop.
@@ -87,8 +87,8 @@ impl TimedFrame {
     }
 }
 
-/// How wide each slice's measurements spread, over the slices measured
-/// [`MIN_SAMPLES`] times or more.
+/// How wide each slice's measurements spread, over the slices
+/// [`slice_medians`] keeps.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Spread {
     /// How many slices.
@@ -307,8 +307,8 @@ pub fn analyse(frames: &[TimedFrame], context: Context<'_>) -> Tail {
             }
         }
     }
-    let medians = medians_of(&mut all);
-    let later_medians = medians_of(&mut later);
+    let medians = slice_medians(&mut all);
+    let later_medians = slice_medians(&mut later);
 
     let timestamps: Vec<u64> = ordered
         .iter()
@@ -319,16 +319,17 @@ pub fn analyse(frames: &[TimedFrame], context: Context<'_>) -> Tail {
     let mut tail = Tail {
         step_ns: step,
         timestamps: timestamps.len(),
-        spread: spread(&all),
-        quantization: step.map(|step| quantization(step, &all, context.estimates)),
-        versus_calibration: versus(&all, context.calibration),
+        spread: spread(&all, &medians),
+        quantization: step.map(|step| quantization(step, &mut all, context.estimates)),
+        versus_calibration: versus(&all, &medians, context.calibration),
         ..Tail::default()
     };
 
-    let is_over = |slice: &SliceId, us: u64| -> Option<bool> {
+    // The slice's median, and whether `us` is an outlier against it.
+    let is_over = |slice: &SliceId, us: u64| -> Option<(u64, bool)> {
         medians
             .get(slice)
-            .map(|&median| us > median.saturating_mul(OUTLIER_FACTOR))
+            .map(|&median| (median, us > median.saturating_mul(OUTLIER_FACTOR)))
     };
     let mut per_frame: Vec<(u64, u64)> = Vec::new();
     let mut first_ratios = Vec::new();
@@ -359,7 +360,7 @@ pub fn analyse(frames: &[TimedFrame], context: Context<'_>) -> Tail {
 
         let (mut n, mut k) = (0, 0);
         for (index, (slice, pass)) in frame.compute.iter().enumerate() {
-            if let Some(&median) = later_medians.get(slice).filter(|&&m| m > 0) {
+            if let Some(&median) = later_medians.get(slice) {
                 let ratio = ratio(pass.us, median);
                 if index == 0 {
                     first_ratios.push(ratio);
@@ -370,7 +371,7 @@ pub fn analyse(frames: &[TimedFrame], context: Context<'_>) -> Tail {
                     later_ratios.push(ratio);
                 }
             }
-            let Some(over) = is_over(slice, pass.us) else {
+            let Some((median, over)) = is_over(slice, pass.us) else {
                 continue;
             };
             n += 1;
@@ -393,9 +394,7 @@ pub fn analyse(frames: &[TimedFrame], context: Context<'_>) -> Tail {
                     if over {
                         bucket.over += 1;
                     }
-                    if let Some(&median) = medians.get(slice).filter(|&&m| m > 0) {
-                        ratios.push(ratio(pass.us, median));
-                    }
+                    ratios.push(ratio(pass.us, median));
                 }
                 None => tail.busy_unknown += 1,
             }
@@ -473,35 +472,19 @@ fn ratio(us: u64, median: u64) -> f64 {
     us as f64 / median as f64
 }
 
-/// Each slice's median, over the slices measured [`MIN_SAMPLES`] times or
-/// more; sorts every slice's measurements.
-fn medians_of(samples: &mut BTreeMap<SliceId, Vec<u64>>) -> BTreeMap<SliceId, u64> {
-    samples
-        .iter_mut()
-        .filter_map(|(slice, list)| {
-            list.sort_unstable();
-            if list.len() < MIN_SAMPLES {
-                return None;
-            }
-            percentile(list, 50).map(|median| (*slice, median))
-        })
-        .collect()
-}
-
-/// The spread of each slice's sorted measurements, over the slices measured
-/// [`MIN_SAMPLES`] times or more.
-fn spread(sorted: &BTreeMap<SliceId, Vec<u64>>) -> Option<Spread> {
+/// The spread of each slice's sorted measurements about its median, over the
+/// slices with one in `medians`.
+fn spread(
+    sorted: &BTreeMap<SliceId, Vec<u64>>,
+    medians: &BTreeMap<SliceId, u64>,
+) -> Option<Spread> {
     let mut p90 = Vec::new();
     let mut max = Vec::new();
-    for list in eligible(sorted) {
-        let (Some(median), Some(high), Some(&top)) =
-            (percentile(list, 50), percentile(list, 90), list.last())
-        else {
+    for (_, list, median) in kept(sorted, medians) {
+        // A kept slice has measurements, so neither read is None.
+        let (Some(high), Some(&top)) = (percentile(list, 90), list.last()) else {
             continue;
         };
-        if median == 0 {
-            continue;
-        }
         p90.push(ratio(high, median));
         max.push(ratio(top, median));
     }
@@ -514,14 +497,23 @@ fn spread(sorted: &BTreeMap<SliceId, Vec<u64>>) -> Option<Spread> {
     })
 }
 
-/// The slices' sorted measurements, of those measured [`MIN_SAMPLES`] times
-/// or more.
-fn eligible(sorted: &BTreeMap<SliceId, Vec<u64>>) -> impl Iterator<Item = &Vec<u64>> {
-    sorted.values().filter(|list| list.len() >= MIN_SAMPLES)
+/// Each slice with a median in `medians`, with its sorted measurements and
+/// that median.
+fn kept<'a>(
+    sorted: &'a BTreeMap<SliceId, Vec<u64>>,
+    medians: &'a BTreeMap<SliceId, u64>,
+) -> impl Iterator<Item = (SliceId, &'a [u64], u64)> {
+    medians.iter().filter_map(|(&slice, &median)| {
+        sorted
+            .get(&slice)
+            .map(|list| (slice, list.as_slice(), median))
+    })
 }
 
-/// What a step of `step_ns` can account for in the slices' sorted
-/// measurements and in their final `estimates`.
+/// What a step of `step_ns` can account for in the slices' measurements and
+/// in their final `estimates`, over the slices [`measured_enough`]; sorts the
+/// measurements it reads. A slice whose median is 0 counts here: it runs in
+/// less than one step, the step's plainest case.
 ///
 /// A duration is the difference of two timestamps, each cut down to the
 /// step, so it is off by less than one step either way, and so is any
@@ -529,14 +521,16 @@ fn eligible(sorted: &BTreeMap<SliceId, Vec<u64>>) -> impl Iterator<Item = &Vec<u
 #[allow(clippy::cast_precision_loss)]
 fn quantization(
     step_ns: u64,
-    sorted: &BTreeMap<SliceId, Vec<u64>>,
+    samples: &mut BTreeMap<SliceId, Vec<u64>>,
     estimates: &BTreeMap<SliceId, u64>,
 ) -> Quantization {
     let step_us = step_ns as f64 / 1_000.0;
     let mut within_step = 0;
     let mut over_p90 = Vec::new();
     let mut over_excess = Vec::new();
-    for (slice, list) in sorted.iter().filter(|(_, l)| l.len() >= MIN_SAMPLES) {
+    for (slice, list) in samples.iter_mut().filter(|(_, l)| measured_enough(l)) {
+        list.sort_unstable();
+        // A slice measured enough has measurements, so neither read is None.
         let (Some(median), Some(high)) = (percentile(list, 50), percentile(list, 90)) else {
             continue;
         };
@@ -564,12 +558,16 @@ fn quantization(
 }
 
 /// The loop's sorted measurements of each slice against calibration's of the
-/// same part.
+/// same part, over the slices with a median in `loop_medians`.
 #[allow(clippy::cast_precision_loss)]
-fn versus(sorted: &BTreeMap<SliceId, Vec<u64>>, calibration: &[Vec<u64>]) -> Option<Versus> {
+fn versus(
+    sorted: &BTreeMap<SliceId, Vec<u64>>,
+    loop_medians: &BTreeMap<SliceId, u64>,
+    calibration: &[Vec<u64>],
+) -> Option<Versus> {
     let mut means = Vec::new();
     let mut medians = Vec::new();
-    for (slice, list) in sorted.iter().filter(|(_, l)| l.len() >= MIN_SAMPLES) {
+    for (slice, list, loop_p50) in kept(sorted, loop_medians) {
         let Some(part) = usize::try_from(slice.get())
             .ok()
             .and_then(|i| calibration.get(i))
@@ -580,8 +578,7 @@ fn versus(sorted: &BTreeMap<SliceId, Vec<u64>>, calibration: &[Vec<u64>]) -> Opt
         let mean = |values: &[u64]| values.iter().sum::<u64>() as f64 / values.len() as f64;
         let mut part = part.clone();
         part.sort_unstable();
-        let (Some(loop_p50), Some(calibrated_p50)) = (percentile(list, 50), percentile(&part, 50))
-        else {
+        let Some(calibrated_p50) = percentile(&part, 50) else {
             continue;
         };
         if calibrated_p50 == 0 || mean(&part) <= 0.0 {
@@ -920,6 +917,46 @@ mod tests {
         assert_eq!((versus.mean, versus.p50), (1.2, 1.2));
         let none = analyse(&frames, Context::default());
         assert_eq!(none.versus_calibration, None);
+    }
+
+    /// Slice 1 runs under one timestamp step: 0 µs in nine frames of ten,
+    /// one step in the other. Its median is 0, so it is left out of every
+    /// statistic that compares with a median, and its one measurement of a
+    /// step is no outlier; quantization keeps it.
+    #[test]
+    fn a_slice_with_a_median_of_0_is_left_out() {
+        let frames: Vec<TimedFrame> = (0..10)
+            .map(|i| {
+                let us1 = if i == 0 { 66 } else { 0 };
+                frame(i, i * 8 * MS, &[(0, 1_000), (1, us1)])
+            })
+            .collect();
+        let calibration = vec![vec![1_000; 4], vec![66; 4]];
+        let estimates = BTreeMap::from([(SliceId::new(0), 1_000), (SliceId::new(1), 66)]);
+        let tail = analyse(
+            &frames,
+            Context {
+                calibration: &calibration,
+                estimates: &estimates,
+                period_us: Some(8_000),
+            },
+        );
+        assert_eq!(
+            tail.outliers,
+            Outliers {
+                samples: 10,
+                over: 0,
+                first_samples: 10,
+                first_over: 0,
+            }
+        );
+        assert_eq!(tail.clustering.frames, 0);
+        assert_eq!(tail.spread.unwrap().slices, 1);
+        // The step's own statistic keeps the slice under one step.
+        assert_eq!(tail.quantization.unwrap().within_step, 2);
+        assert_eq!(tail.versus_calibration.unwrap().slices, 1);
+        let bucketed: u64 = tail.busy.iter().map(|b| b.samples).sum();
+        assert_eq!(bucketed + tail.busy_unknown, 10);
     }
 
     #[test]
