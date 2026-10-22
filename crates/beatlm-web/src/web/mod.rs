@@ -3,6 +3,7 @@
 //!
 //! Built only for `wasm32`; the crate documentation describes it.
 
+mod audio;
 mod device;
 mod display;
 mod fetch;
@@ -19,12 +20,13 @@ use wasm_bindgen::prelude::wasm_bindgen;
 
 use crate::config::{self, Config, Latency, Model};
 use crate::depth;
+use crate::onbeat;
 use crate::pace::{Pace, Pacer, WINDOW, ms_to_us};
 use crate::report::{DepthReport, Environment};
 use crate::slots::{self, Net};
 use crate::workload::{DEFAULT_RENDER_ITERS, DEFAULT_SLICE_ITERS, Workload};
 use device::Need;
-use frame::{DepthLoad, Load, Run};
+use frame::{DepthLoad, Load, OnBeatRun, Run};
 
 /// The module's entry point, run by the generated glue once the module is
 /// instantiated: reads the configuration from the page's query string and
@@ -61,9 +63,25 @@ fn describe(config: &Config) -> String {
         Model::Synthetic => "model=synthetic".to_owned(),
         Model::Depth { side } => format!("model=depth side={side}"),
     };
-    let latency = match config.latency {
-        Latency::Frames(frames) => format!("latency={frames}"),
-        Latency::Time(us) => format!("latency_ms={}", crate::report::milliseconds(us.get())),
+    let latency = match (config.on_beat, config.latency) {
+        (Some(on_beat), _) => {
+            let mut text = format!(
+                "sync=onbeat bpm={} margin_ms={}",
+                on_beat.tempo.bpm,
+                crate::report::milliseconds(on_beat.margin.get())
+            );
+            if let Some(change) = on_beat.tempo.change {
+                text.push_str(&format!(" bpm_change={}@{}", change.bpm, change.after_s));
+            }
+            if let Some(beats) = on_beat.beats {
+                text.push_str(&format!(" beats={beats}"));
+            }
+            text
+        }
+        (None, Latency::Frames(frames)) => format!("latency={frames}"),
+        (None, Latency::Time(us)) => {
+            format!("latency_ms={}", crate::report::milliseconds(us.get()))
+        }
     };
     format!(
         "{model} frames={} {latency} estimator={}",
@@ -105,10 +123,13 @@ async fn display_period() -> Result<Micros> {
 /// for the depth model, whose first frames would otherwise be given the
 /// nominal 60 Hz period and, on a faster display, overrun theirs while the
 /// loop's pacer measures it; a run of the synthetic workload with a latency in
-/// frames starts from the nominal period, as it always has.
+/// frames starts from the nominal period, as it always has. An on-beat run
+/// measures it too, to turn `beats` into frames; its latency in frames is
+/// unused.
 async fn latency(config: &Config) -> Result<(Option<Micros>, u32)> {
-    let measure =
-        matches!(config.latency, Latency::Time(_)) || matches!(config.model, Model::Depth { .. });
+    let measure = matches!(config.latency, Latency::Time(_))
+        || matches!(config.model, Model::Depth { .. })
+        || config.on_beat.is_some();
     let period = if measure {
         page::show("status: measuring the display's period");
         Some(display_period().await?)
@@ -130,11 +151,38 @@ async fn latency(config: &Config) -> Result<(Option<Micros>, u32)> {
 /// an `await` on the event loop, before the first frame, where the bench
 /// blocks on the device instead. The depth model's setup comes between the
 /// device and the loop ([`depth_load`]).
-async fn setup(config: Config) -> Result<()> {
+async fn setup(mut config: Config) -> Result<()> {
+    // The audio context starts only from a user gesture, so an on-beat run
+    // waits for the start button before anything else, and says so.
+    let audio = match config.on_beat {
+        Some(_) => {
+            page::show(&format!(
+                "status: waiting for start: {} plays a click on every beat, and a browser \
+                 starts audio only after a click on the page, so the run starts when \
+                 the start button is pressed",
+                describe(&config)
+            ));
+            Some(audio::Audio::new(audio::start_on_click().await?))
+        }
+        None => None,
+    };
     let (period, latency) = latency(&config).await?;
-    let asked = match config.latency {
-        Latency::Time(time) => Some(time),
-        Latency::Frames(_) => None,
+    // A run asked in beats lasts the frames they take at the measured period.
+    let in_beats = config
+        .on_beat
+        .and_then(|on_beat| Some((on_beat, on_beat.beats?)));
+    if let Some((on_beat, beats)) = in_beats {
+        config.frames = onbeat::run_frames(
+            &on_beat.tempo,
+            beats,
+            period.unwrap_or(crate::pace::NOMINAL_PERIOD),
+        );
+    }
+    // An on-beat run asks for no latency: the depth model's default
+    // `latency_ms` is not one it asked for.
+    let asked = match (config.on_beat, config.latency) {
+        (None, Latency::Time(time)) => Some(time),
+        _ => None,
     };
     let (gpu, workload, load) = match config.model {
         Model::Synthetic => {
@@ -149,10 +197,14 @@ async fn setup(config: Config) -> Result<()> {
             page::show(&format!("status: fetching {url}"));
             let loaded = model::load(side).await?;
             // One slot per job that can be in flight; the device is asked for
-            // what the loop's plan of the unsplit model needs.
-            let slots = SyncPolicy::FixedLatency { frames: latency }
-                .max_in_flight()
-                .context("the policy does not bound the jobs in flight")?;
+            // what the loop's plan of the unsplit model needs. On beat the
+            // host bounds the jobs pending ([`onbeat::SLOTS`]).
+            let slots = match config.on_beat {
+                Some(_) => onbeat::SLOTS,
+                None => SyncPolicy::FixedLatency { frames: latency }
+                    .max_in_flight()
+                    .context("the policy does not bound the jobs in flight")?,
+            };
             let plan = slots::memory_plan(&loaded.program, &loaded.numbers, slots)?;
             let gpu = device::open(page::canvas()?, Need::Plan(plan)).await?;
             let workload = Workload::new(&gpu.device, DEFAULT_SLICE_ITERS, DEFAULT_RENDER_ITERS);
@@ -175,10 +227,17 @@ async fn setup(config: Config) -> Result<()> {
         device_limits: gpu.device_limits,
         arena_realised_bytes: gpu.arena_realised_bytes,
     };
-    page::show(&format!(
-        "status: running {} at latency={latency}",
-        describe(&config)
-    ));
+    match config.on_beat {
+        Some(_) => page::show(&format!("status: running {}", describe(&config))),
+        None => page::show(&format!(
+            "status: running {} at latency={latency}",
+            describe(&config)
+        )),
+    }
+    let on_beat = match (config.on_beat, audio) {
+        (Some(config), Some(audio)) => Some(OnBeatRun { config, audio }),
+        _ => None,
+    };
     let run = Run {
         frames: config.frames,
         latency,
@@ -186,6 +245,7 @@ async fn setup(config: Config) -> Result<()> {
         period,
         load,
         estimator: config.estimator,
+        on_beat,
     };
     let host = frame::Host::new(gpu, workload, run).context("cannot start the frame loop")?;
     frame::run(host, env, config)

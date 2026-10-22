@@ -48,8 +48,10 @@
 //! and `capped:<alpha>:<sigmas>:<cap>`; the default is the core's (`quantile`),
 //! and [`config`] has every form, the ranges and what
 //! the choice reaches, and the four estimators measured in a browser at
-//! 120 Hz ("Which estimator, measured in a browser"). Anything else in the
-//! query is refused.
+//! 120 Hz ("Which estimator, measured in a browser"). `sync` chooses the
+//! promise: `latency`, the fixed latency everything above is about and the
+//! default, or `onbeat`, with `bpm`, `bpm_change`, `margin_ms` and `beats`
+//! ("On-beat delivery" below). Anything else in the query is refused.
 //!
 //! **Serving.** `just serve-web` runs `scripts/serve_web.py`, which serves the
 //! built page at `/` and the models directory at `/models/`
@@ -138,10 +140,19 @@
 //! computed. The display's shader carries the synthetic render pass's
 //! per-pixel loop, so the render pass costs what the bench's does beside the
 //! depth model and a frame's budget is the one the native default was measured
-//! under. Like the bench's render pass, it reads no buffer a slice writes: a
-//! job's depth is copied into the display's own buffer after its last slice,
-//! so the render's measurement, which the budget takes, cannot carry a wait
-//! for the slices ([`render_cost`]). Why a job was missed, and what the
+//! under. Like the bench's render pass, it reads no buffer a slice writes: the
+//! depth it draws is the display's own copy. The screen is part of the
+//! delivery promise, so a job's depth is copied there in the frame that
+//! delivers it, after that frame's slices and before its render pass, and
+//! nothing appears before its frame; a copy at the job's last slice, as
+//! before, showed a job early once the jobs before it on screen had missed.
+//! The copy is untimed. In a delivery frame it orders the render behind the
+//! copy, which reads an arena the frame's slices may write; the render was
+//! measured not to carry the slices when it read nothing written in its frame
+//! (`gpu_render_alone_us` against `gpu_render_with_slices_us`,
+//! [`render_cost`]), and a delivery frame comes at most once per job, so the
+//! copy is kept there (the display's documentation, `web/display.rs`, has the
+//! figures). Why a job was missed, and what the
 //! projection read when it abandoned one, is in the report's diagnosis lines
 //! ([`diagnosis`]).
 //!
@@ -203,6 +214,70 @@
 //! not a fault the page is known to have; the line says which criteria failed
 //! and, for delivery, the run's own abandoned jobs and estimates.
 //!
+//! # On-beat delivery
+//!
+//! `?sync=onbeat` runs the core's third promise: a result lands on the first
+//! frame starting at or after a beat. The beats are a click track the page
+//! plays on an `AudioContext`, at `bpm` (30 to 120, default 100), and
+//! [`onbeat`] owns every rule of how they reach the scheduler. For the depth
+//! model at the size the browser holds (below):
+//!
+//! ```text
+//! http://127.0.0.1:8000/?model=depth&side=112&sync=onbeat&bpm=100&beats=300
+//! http://127.0.0.1:8000/?model=depth&side=112&sync=onbeat&bpm=100&bpm_change=120@90&beats=300
+//! ```
+//!
+//! The first runs 300 beats of 600 ms, three minutes of loop after the setup;
+//! the second changes to 120 BPM at the first beat at or after 90 s, beat 150,
+//! and runs 150 beats of 600 ms and 150 of 500 ms, 2 min 45 s. The synthetic
+//! workload takes `sync=onbeat` too, as a check of the host without the model.
+//!
+//! **The user gesture.** A browser lets an `AudioContext` run only once the
+//! user has interacted with the page (its autoplay policy), and a context
+//! created before that stays suspended, without an error. So an on-beat run
+//! starts nothing until a click: the page shows a start button and a status
+//! line saying that the run plays a click on every beat and that the browser
+//! starts audio only after a click on the page, and the context is created and
+//! resumed inside the button's handler. The rest of the setup, the display's
+//! period, the weights, calibration and the check, runs after the click.
+//!
+//! **The clock chain.** The click of beat `n` is scheduled at audio time
+//! `a(n)` on the context's clock; `getOutputTimestamp()` pairs the audio
+//! position the device is presenting with the `performance.now()` instant it
+//! presents it; `performance.now()` is the clock `requestAnimationFrame`'s
+//! timestamps are on; and the frame clock is those timestamps from the run's
+//! first callback ([`pace`]). Beat `n` is so placed on the frame clock when it
+//! is heard, and handed to the scheduler as a `BeatGrid`. Each latency term is
+//! in [`onbeat`] ("Which latency, and why"): the timestamp already holds the
+//! output latency the device reports (Chromium's source says so), so
+//! `outputLatency` is not added to it, and is used, or `baseLatency` without
+//! it, only when the timestamp has no position yet; the display's own latency
+//! is not in the chain, and the landing error is measured on the frame clock.
+//! The mapping is re-derived from a median of one sample per frame and
+//! corrected at a beat when it moved half a millisecond ([`onbeat`], "Drift");
+//! one input is submitted per beat ("Submission"), placed with a margin of
+//! 100 ms ("The margin"); a tempo change is put in effect from the change beat
+//! when its instant comes, and moves only the deadlines fixed after
+//! ("A tempo change").
+//!
+//! **The report** keeps every line of a fixed-latency run and adds the beat
+//! landing error (count, median, p99, max), the deliveries before and after
+//! their beat's frame, which must both be zero, the misses with their
+//! deadlines, the beats no job was placed on, the mapping and the latency it
+//! used, the clicks, and the tempo change ([`report`] lists them).
+//!
+//! **The measured base, and what is open.** Chrome 154 (WebGPU) on an Apple
+//! M1 Pro driving a 120 Hz display, 2026-10-22, Depth Anything V2 Small at 112
+//! pixels under a fixed latency of about 400 ms delivered 64 of 64 results,
+//! with the GPU time of 7 of 1 492 frames over the period, one result about
+//! every 23 frames (about 5 a second); at 266 pixels the model is not stable in
+//! the browser. That is why the demo is sized for 112 pixels and tempos up to
+//! 120 BPM, a beat of 500 ms or more. The on-beat promise itself has not been
+//! measured in a browser yet: the two runs above, in Chrome on the same
+//! machine, are what will settle whether results land on their beat's frame
+//! with no early or late delivery and every miss reported, and what the
+//! landing error is.
+//!
 //! # The host's side of a frame, in a browser
 //!
 //! The order is the one the `beatlm` crate documentation sets out ("The host's
@@ -217,7 +292,9 @@
 //! 1. **Decide.** Set this frame's budget from the last render measured and
 //!    the forecast of later frames from the median of the recent renders,
 //!    submit the frame's input as a job of [`config::SLICES`] slices under
-//!    fixed latency `k`, and plan the frame.
+//!    fixed latency `k`, and plan the frame. An on-beat run first reads the
+//!    audio clock, hands the scheduler any new beat grid and schedules the
+//!    clicks to come, and submits an input only for a beat ([`onbeat`]).
 //! 2. **Slices.** Encode one compute pass per slice the plan hands out, each
 //!    with timestamp writes.
 //! 3. **Render.** Take the canvas's texture for this frame and encode the
@@ -333,6 +410,7 @@
 pub mod config;
 pub mod depth;
 pub mod diagnosis;
+pub mod onbeat;
 pub mod pace;
 pub mod render_cost;
 pub mod report;

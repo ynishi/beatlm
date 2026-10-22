@@ -58,6 +58,31 @@
 //! was turned into frames at (`latency_asked_ms`, `latency_period_us`); the
 //! frames are `config`'s `latency`.
 //!
+//! A run under `sync=onbeat` keeps every line and adds its own after the
+//! depth model's ([`crate::onbeat`] defines each): the tempo and margin
+//! (`onbeat`); the time from each beat to the start of the frame that
+//! delivered its result (`beat_landing_error_us`), the deliveries before and
+//! after their beat's frame (`beat_landing_early`, `beat_landing_late`, both
+//! zero when the promise holds), the same deliveries against the beat as the
+//! mapping at delivery placed it (`beat_landing_remapped_us`) and the slack
+//! each job had (`beat_slack_us`); the beats with and without a job
+//! (`beats`), the inputs owed, submitted and dropped (`beat_inputs`), the
+//! misses with their deadlines (`beat_missed`) and any deadline that moved
+//! (`beat_deadlines_moved`, zero); the audio clock's mapping, which latency it
+//! used and how often and how far it was corrected (`audio_latency`,
+//! `audio_mapping`), the clicks played and the beats whose click came too
+//! late to schedule (`audio_clicks`); and the tempo change (`tempo_change`).
+//! Lines that are
+//! about a latency in frames say `none` (`promised_latency_ms`,
+//! `latency_violations`, the `config:` line's `latency`), and the `config:`
+//! line adds `sync=onbeat` with the tempo, the margin (`beat_margin_us`), the
+//! change and the beats asked for. `submit=` is `beat` (one input per beat) or,
+//! for the depth model, `beat-free` (one per beat once the job before has had
+//! its slices). `latency_frames[k]` keeps counting the frames from input to
+//! delivery. For `capacity_frames_needed` the promise is the frames of the
+//! plan's shortest beat (before or after a tempo change) less the margin, the
+//! time an input submitted at a beat has before the next one.
+//!
 //! `display_period_us` is the period as measured at the end of the run, the
 //! median of the last per-period callback intervals, so that a host which
 //! overran its frames does not read as a slower display and timestamp jitter
@@ -84,6 +109,7 @@ use crate::depth::{
     self, Capacity, Facts, MAX_DISPATCH_US, NATIVE_DEFAULT_LATENCY, NATIVE_DEFAULT_SIDE,
 };
 use crate::diagnosis::{Diagnosis, tail};
+use crate::onbeat::{self, Spread};
 use crate::pace::NOMINAL_PERIOD;
 use crate::stats::{frame_ratio_value, frame_scale_value, histogram, nearest_rank, summarize};
 use crate::workload::{DEFAULT_RENDER_ITERS, DEFAULT_SLICE_ITERS};
@@ -217,7 +243,10 @@ pub struct DepthReport {
 #[derive(Debug, Clone, Default)]
 pub struct Outcome {
     /// The promised latency in frames the run kept: `latency`, or
-    /// `latency_ms` at the display's period measured before the run.
+    /// `latency_ms` at the display's period measured before the run. An
+    /// on-beat run promises no latency in frames; there it is the frames of
+    /// the plan's shortest beat less the margin, which
+    /// `capacity_frames_needed` holds a job to.
     pub latency: u32,
     /// The latency `latency_ms` asked for, in microseconds; `None` when it was
     /// given in frames.
@@ -306,6 +335,9 @@ pub struct Outcome {
     pub canvas_unavailable: u64,
     /// Errors the device raised during the run.
     pub gpu_errors: u64,
+    /// What an on-beat run measured about its beats; `None` under fixed
+    /// latency.
+    pub on_beat: Option<onbeat::Summary>,
 }
 
 /// The first frames whose jobs' misses are reported apart as
@@ -348,21 +380,40 @@ fn write_report(
     if let Some(bytes) = env.arena_realised_bytes {
         writeln!(out, "arena_realised_bytes: {bytes}")?;
     }
-    let (slices, submit) = match &outcome.depth {
-        Some(depth) => (depth.kernels, "free"),
-        None => (SLICES, "every"),
+    let (slices, submit) = match (&outcome.depth, &config.on_beat) {
+        (Some(depth), None) => (depth.kernels, "free"),
+        (None, None) => (SLICES, "every"),
+        (Some(depth), Some(_)) => (depth.kernels, "beat-free"),
+        (None, Some(_)) => (SLICES, "beat"),
+    };
+    let latency = match config.on_beat {
+        Some(_) => String::from("none"),
+        None => outcome.latency.to_string(),
     };
     write!(
         out,
-        "config: frames={} latency={} slices={slices} slice_iters={DEFAULT_SLICE_ITERS} \
+        "config: frames={} latency={latency} slices={slices} slice_iters={DEFAULT_SLICE_ITERS} \
          render_iters={DEFAULT_RENDER_ITERS} margin_us={MARGIN_US} estimator={} \
          submit={submit}",
         config.frames,
-        outcome.latency,
         estimator_name(config.estimator),
     )?;
     if let Some(bytes) = config.arena_bytes {
         write!(out, " arena_bytes={bytes}")?;
+    }
+    if let Some(on_beat) = &config.on_beat {
+        write!(
+            out,
+            " sync=onbeat bpm={} beat_margin_us={}",
+            on_beat.tempo.bpm,
+            on_beat.margin.get()
+        )?;
+        if let Some(change) = on_beat.tempo.change {
+            write!(out, " bpm_change={}@{}", change.bpm, change.after_s)?;
+        }
+        if let Some(beats) = on_beat.beats {
+            write!(out, " beats={beats}")?;
+        }
     }
     match config.model {
         Model::Depth { side } => writeln!(
@@ -382,11 +433,15 @@ fn write_report(
         None => writeln!(out, "display_period_us: none")?,
     }
     let period = period_of(outcome);
-    writeln!(
-        out,
-        "promised_latency_ms: {:.1}",
-        promised_latency_ms(outcome.latency, period)
-    )?;
+    if outcome.on_beat.is_some() {
+        writeln!(out, "promised_latency_ms: none")?;
+    } else {
+        writeln!(
+            out,
+            "promised_latency_ms: {:.1}",
+            promised_latency_ms(outcome.latency, period)
+        )?;
+    }
     writeln!(out, "frames: {}", outcome.cpu_us.len())?;
     writeln!(out, "frames_dropped: {}", outcome.dropped)?;
     writeln!(out, "submitted: {}", outcome.submitted)?;
@@ -398,7 +453,11 @@ fn write_report(
         None => writeln!(out, "delivery_rate: none")?,
     }
     writeln!(out, "pending_at_end: {}", outcome.pending_at_end)?;
-    writeln!(out, "latency_violations: {}", outcome.violations)?;
+    if outcome.on_beat.is_some() {
+        writeln!(out, "latency_violations: none")?;
+    } else {
+        writeln!(out, "latency_violations: {}", outcome.violations)?;
+    }
     writeln!(out, "timings_collected: {}", outcome.timer.frames_collected)?;
     writeln!(out, "timings_skipped: {}", outcome.timer.frames_skipped)?;
     writeln!(out, "timings_failed: {}", outcome.timer.frames_failed)?;
@@ -446,6 +505,9 @@ fn write_report(
     if let Some(depth) = &outcome.depth {
         write_tail(out, depth, outcome)?;
         write_depth(out, depth, outcome)?;
+    }
+    if let Some(summary) = &outcome.on_beat {
+        write_on_beat(out, summary)?;
     }
     writeln!(out, "canvas_unavailable: {}", outcome.canvas_unavailable)?;
     writeln!(out, "gpu_errors: {}", outcome.gpu_errors)?;
@@ -779,11 +841,19 @@ fn write_depth(out: &mut String, depth: &DepthReport, outcome: &Outcome) -> std:
         job_estimate_us: outcome.diagnosis.job_estimate_us,
         run_us: summarize(&depth.runs_us).map(|s| s.p50),
     };
-    writeln!(
-        out,
-        "native_default_holds: {}",
-        one_line(&depth::native_default(&facts))
-    )?;
+    if outcome.on_beat.is_some() {
+        writeln!(
+            out,
+            "native_default_holds: not tested: on-beat delivery promises beats, not the \
+             native default's latency in frames"
+        )?;
+    } else {
+        writeln!(
+            out,
+            "native_default_holds: {}",
+            one_line(&depth::native_default(&facts))
+        )?;
+    }
     let capacity = Capacity::of(
         &outcome.measured,
         outcome.estimates.len(),
@@ -791,6 +861,128 @@ fn write_depth(out: &mut String, depth: &DepthReport, outcome: &Outcome) -> std:
         outcome.latency,
     );
     writeln!(out, "capacity_frames_needed: {}", capacity.line())
+}
+
+/// The on-beat lines ([`crate::onbeat`] defines what each measures).
+fn write_on_beat(out: &mut String, s: &onbeat::Summary) -> std::fmt::Result {
+    let or_none = |value: Option<String>| value.unwrap_or_else(|| String::from("none"));
+    writeln!(
+        out,
+        "onbeat: bpm={} beat_us={} beat_margin_us={} lead_us={} beats_asked={} sample_rate_hz={}",
+        s.bpm,
+        s.beat_us,
+        s.margin_us,
+        onbeat::LEAD.get(),
+        or_none(s.beats_asked.map(|b| b.to_string())),
+        or_none(s.sample_rate_hz.map(|r| r.to_string())),
+    )?;
+    write_spread(out, "beat_landing_error_us", s.landing)?;
+    writeln!(out, "beat_landing_early: {}", s.early)?;
+    writeln!(out, "beat_landing_late: {}", s.late)?;
+    write_spread(out, "beat_landing_remapped_us", s.remapped)?;
+    write_spread(out, "beat_slack_us", s.slack)?;
+    writeln!(
+        out,
+        "beats: elapsed={} with_job={} without_job={} shared={}",
+        s.beats_elapsed,
+        s.beats_elapsed - s.beats_without_job,
+        s.beats_without_job,
+        s.beats_shared
+    )?;
+    writeln!(
+        out,
+        "beat_inputs: owed={} submitted={} skipped={}",
+        s.inputs_owed, s.inputs_submitted, s.inputs_skipped
+    )?;
+    let dues: Vec<String> = s.missed_dues_us.iter().map(u64::to_string).collect();
+    writeln!(
+        out,
+        "beat_missed: {} first_due_us={}",
+        s.missed,
+        if dues.is_empty() {
+            String::from("none")
+        } else {
+            dues.join(",")
+        }
+    )?;
+    writeln!(out, "beat_deadlines_moved: {}", s.deadlines_moved)?;
+    writeln!(out, "beat_pending_at_end: {}", s.pending)?;
+    let m = &s.mapping;
+    let used = match (
+        m.timestamp_samples,
+        m.output_latency_samples,
+        m.base_latency_samples,
+    ) {
+        (0, 0, 0) => "none",
+        (_, 0, 0) => "output_timestamp",
+        (0, _, 0) => "current_time_plus_output_latency",
+        (0, 0, _) => "current_time_plus_base_latency",
+        _ => "mixed",
+    };
+    write!(
+        out,
+        "audio_latency: used={used} output_latency_us={} base_latency_us={}",
+        or_none(m.output_latency_us.map(|us| us.to_string())),
+        or_none(m.base_latency_us.map(|us| us.to_string())),
+    )?;
+    match m.render_ahead_us {
+        Some(r) => writeln!(
+            out,
+            " render_ahead_us_min={} render_ahead_us_median={} render_ahead_us_max={}",
+            r.min, r.p50, r.max
+        )?,
+        None => writeln!(out, " render_ahead_us=none")?,
+    }
+    writeln!(
+        out,
+        "audio_mapping: timestamp_samples={} output_latency_samples={} base_latency_samples={} \
+         unusable={} window={} step_us={} updates={} max_correction_us={}",
+        m.timestamp_samples,
+        m.output_latency_samples,
+        m.base_latency_samples,
+        m.unusable,
+        onbeat::MAPPING_WINDOW,
+        onbeat::MAPPING_STEP.get(),
+        m.updates,
+        m.max_correction_us
+    )?;
+    writeln!(
+        out,
+        "audio_clicks: scheduled={} late={}",
+        s.clicks_scheduled, s.clicks_late
+    )?;
+    match s.change {
+        None => writeln!(out, "tempo_change: none"),
+        Some(c) => writeln!(
+            out,
+            "tempo_change: from_bpm={} to_bpm={} after_s={} change_beat={} announced_us={} \
+             change_us={} fixed_before_after_change={} kept_delivered={} kept_missed={} \
+             later_jobs={} later_off_plan={}",
+            c.from_bpm,
+            c.to_bpm,
+            c.after_s,
+            c.change_beat,
+            or_none(c.announced_us.map(|us| us.to_string())),
+            or_none(c.change_us.map(|us| us.to_string())),
+            c.fixed_before_after_change,
+            c.kept_delivered,
+            c.kept_missed,
+            c.later_jobs,
+            c.later_off_plan
+        ),
+    }
+}
+
+/// `name: count=n min=.. median=.. p99=.. max=..`, or `name: none`.
+fn write_spread(out: &mut String, name: &str, spread: Option<Spread>) -> std::fmt::Result {
+    match spread {
+        Some(s) => writeln!(
+            out,
+            "{name}: count={} min={} median={} p99={} max={}",
+            s.count, s.min, s.p50, s.p99, s.max
+        ),
+        None => writeln!(out, "{name}: none"),
+    }
 }
 
 /// Microseconds as milliseconds to one decimal place, the precision the
@@ -962,6 +1154,82 @@ mod tests {
         assert_eq!(line(&text, "adapter"), Some("unreported"));
         assert_eq!(line(&text, "gpu_frame_us"), Some("none"));
         assert_eq!(line(&text, "delivery_rate"), Some("none"));
+    }
+
+    #[test]
+    fn an_on_beat_run_adds_its_lines_and_keeps_every_other() {
+        let fixed = report(&Environment::default(), &Outcome::default());
+        let config =
+            crate::config::parse("?sync=onbeat&bpm=100&bpm_change=120@60&beats=300").unwrap();
+        let summary = onbeat::Summary {
+            bpm: 100.0,
+            beat_us: 600_000,
+            margin_us: 100_000,
+            beats_asked: Some(300),
+            landing: Spread::of(&[100, 4_000, 8_000]),
+            beats_elapsed: 300,
+            beats_without_job: 2,
+            missed: 2,
+            missed_dues_us: vec![1_640_000, 2_240_000],
+            change: Some(onbeat::ChangeSummary {
+                from_bpm: 100.0,
+                to_bpm: 120.0,
+                after_s: 60.0,
+                change_beat: 100,
+                ..onbeat::ChangeSummary::default()
+            }),
+            ..onbeat::Summary::default()
+        };
+        let outcome = Outcome {
+            on_beat: Some(summary),
+            ..Outcome::default()
+        };
+        let text = render(&Environment::default(), &config, &outcome);
+        for l in text.lines() {
+            let (name, value) = l.split_once(": ").unwrap();
+            assert!(!name.is_empty() && !name.contains(' '), "{l}");
+            assert!(!value.is_empty(), "{l}");
+        }
+        // Every line of a fixed-latency run is there, in the same order.
+        let names = |text: &str| -> Vec<String> {
+            text.lines()
+                .map(|l| l.split_once(": ").unwrap().0.to_owned())
+                .collect()
+        };
+        let all = names(&text);
+        let mut at = 0;
+        for name in names(&fixed) {
+            at += all[at..].iter().position(|n| *n == name).unwrap() + 1;
+        }
+        assert_eq!(
+            line(&text, "beat_landing_error_us"),
+            Some("count=3 min=100 median=4000 p99=8000 max=8000")
+        );
+        assert_eq!(line(&text, "beat_landing_early"), Some("0"));
+        assert_eq!(
+            line(&text, "beats"),
+            Some("elapsed=300 with_job=298 without_job=2 shared=0")
+        );
+        assert_eq!(
+            line(&text, "beat_missed"),
+            Some("2 first_due_us=1640000,2240000")
+        );
+        assert_eq!(line(&text, "promised_latency_ms"), Some("none"));
+        assert_eq!(line(&text, "latency_violations"), Some("none"));
+        assert_eq!(
+            line(&text, "config"),
+            Some(
+                "frames=600 latency=none slices=4 slice_iters=500 render_iters=50 margin_us=2000 \
+                 estimator=quantile submit=beat sync=onbeat bpm=100 beat_margin_us=100000 \
+                 bpm_change=120@60 beats=300"
+            )
+        );
+        assert!(
+            line(&text, "tempo_change")
+                .unwrap()
+                .starts_with("from_bpm=100 to_bpm=120")
+        );
+        assert_eq!(text.lines().last(), Some("status: done"));
     }
 
     #[test]

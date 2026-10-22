@@ -20,7 +20,18 @@
 //! when the job before it has had all its slices (the bench's `--submit free`,
 //! its default for the depth workload), and the render pass is the display,
 //! showing the result the frame delivers or, under the miss policy, the last
-//! one delivered.
+//! one delivered. A result is copied into the display in the frame that
+//! delivers it, after the frame's slices and before its render pass, never
+//! earlier ([`super::display`] says why).
+//!
+//! An on-beat run ([`OnBeatRun`]) adds one step at the start of each frame,
+//! before the frame is decided: read the audio clock, let [`Beats`] decide
+//! what the frame does about the beats, hand the scheduler the grids it
+//! returns, and schedule the clicks about to come. The frame submits its input
+//! only when an input is owed for a beat ([`crate::onbeat`], "Submission")
+//! and its output slot is free ([`Beats::slot_free`]), besides the depth
+//! model's own admission rule, and every submission, completed job, delivery
+//! and miss is recorded for the report.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -32,17 +43,19 @@ use beatlm_core::budget::Budget;
 use beatlm_core::cost::{CostModel, Estimator, FrameScale, SliceId};
 use beatlm_core::schedule::{Due, FramePlan, JobId, Scheduler, SliceRun};
 use beatlm_core::sync::{MissPolicy, SyncPolicy};
-use beatlm_core::time::{FrameIndex, FrameInfo, Micros, TimePoint};
+use beatlm_core::time::{BeatGrid, FrameIndex, FrameInfo, Micros, TimePoint};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
 
+use super::audio::Audio;
 use super::device::{self, Gpu};
 use super::display::Display;
 use super::page;
-use crate::config::{Config, MARGIN_US, SLICES};
-use crate::depth::still_busy;
+use crate::config::{Config, MARGIN_US, OnBeat, SLICES};
+use crate::depth::{delivered_now, frames_for, still_busy};
 use crate::diagnosis::tail::{Pass as TailPass, TimedFrame};
 use crate::diagnosis::{self, Reason, Unstarted};
+use crate::onbeat::{self, Beats};
 use crate::pace::{FrameStart, NOMINAL_PERIOD, Pace, Pacer, ms_to_us};
 use crate::render_cost::{RENDER_PRIOR, RenderCost};
 use crate::report::{DepthReport, Environment, Outcome, STARTUP_FRAMES, render};
@@ -110,6 +123,23 @@ pub struct Run {
     /// a synthetic run builds here, and the placeholder beside the depth
     /// model's, which calibration built with the same estimator.
     pub estimator: Estimator,
+    /// The on-beat promise and its audio clock; `None` for fixed latency.
+    pub on_beat: Option<OnBeatRun>,
+}
+
+/// What an on-beat run starts from: the query's promise, and the audio
+/// context the start button created.
+pub struct OnBeatRun {
+    /// `sync=onbeat` and its parameters.
+    pub config: OnBeat,
+    /// The click track on the context's clock.
+    pub audio: Audio,
+}
+
+/// An on-beat run while it runs.
+struct OnBeatHost {
+    beats: Beats,
+    audio: Audio,
 }
 
 /// The run: the device, the load, the decisions and what was measured.
@@ -121,8 +151,9 @@ pub struct Host {
     /// out, while it has some and has not left the scheduler: a frame submits
     /// no input while there is one.
     busy: Option<(JobId, usize)>,
-    /// The slot whose depth the display shows: the last one delivered.
-    shown: Option<u32>,
+    /// Whether the display holds a delivered depth, the last one delivered:
+    /// false until the first delivery.
+    shown: bool,
     asked: Option<Micros>,
     period: Option<Micros>,
     /// `None` when the device has no timestamp queries.
@@ -143,6 +174,11 @@ pub struct Host {
     outcome: Outcome,
     /// The index of the frame last run, which timings are collected against.
     current_frame: u64,
+    /// The start of the frame last run, which a delivery's frame is checked
+    /// against: it must have started before the beat.
+    previous_start_us: Option<u64>,
+    /// The beats of an on-beat run.
+    on_beat: Option<OnBeatHost>,
 }
 
 impl Host {
@@ -157,13 +193,18 @@ impl Host {
     /// cannot be built, or a page without `performance`.
     pub fn new(gpu: Gpu, workload: Workload, mut run: Run) -> Result<Self> {
         let estimator = run.estimator;
+        let on_beat = run.on_beat.is_some();
         let (slices, jobs, cost) = match &mut run.load {
             // Every frame submits a job, and a job lives `latency` frames past
             // its submission, so `latency + 1` jobs can have slices left in a
-            // frame.
+            // frame. On beat, no more than `SLOTS` are pending.
             Load::Synthetic => (
                 SLICES,
-                run.latency.checked_add(1),
+                if on_beat {
+                    Some(onbeat::SLOTS)
+                } else {
+                    run.latency.checked_add(1)
+                },
                 CostModel::new(SLICE_PRIOR, estimator).context("cannot build the cost model")?,
             ),
             // A frame submits only once the job before has had its slices, so
@@ -199,10 +240,22 @@ impl Host {
         };
         let margin = Micros::new(MARGIN_US);
         let prior = run.period.unwrap_or(NOMINAL_PERIOD);
-        let scheduler = Scheduler::new(
-            SyncPolicy::FixedLatency {
+        let policy = match &run.on_beat {
+            Some(on_beat) => SyncPolicy::OnBeat {
+                margin: on_beat.config.margin,
+                // A placeholder that places no job: no input is submitted
+                // before the first beat, and that beat's frame puts the grid
+                // made from the audio clock in effect from the epoch, which
+                // replaces this one ([`crate::onbeat`], "Drift").
+                grid: BeatGrid::new(TimePoint::new(0), Micros::new(1_000_000))
+                    .map_err(|error| anyhow!("cannot build the placeholder grid: {error}"))?,
+            },
+            None => SyncPolicy::FixedLatency {
                 frames: run.latency,
             },
+        };
+        let scheduler = Scheduler::new(
+            policy,
             MissPolicy::HoldPrevious,
             // Before the display's period is known, the prior; every frame
             // sets its own budget from the period measured by then.
@@ -216,7 +269,7 @@ impl Host {
             workload,
             load: run.load,
             busy: None,
-            shown: None,
+            shown: false,
             asked: run.asked,
             period: run.period,
             timer,
@@ -232,6 +285,15 @@ impl Host {
             drain_from_us: None,
             outcome: Outcome::default(),
             current_frame: 0,
+            previous_start_us: None,
+            on_beat: run.on_beat.map(|on_beat| OnBeatHost {
+                beats: Beats::new(
+                    on_beat.config.tempo,
+                    on_beat.config.margin,
+                    on_beat.config.beats,
+                ),
+                audio: on_beat.audio,
+            }),
         };
         host.outcome.diagnosis.job_estimate_us.0 = host.job_estimate();
         Ok(host)
@@ -277,6 +339,23 @@ impl Host {
             start: TimePoint::new(start.start_us),
             period: start.period,
         };
+        // Whether this frame's input is owed: every frame's under fixed
+        // latency, a beat's on beat.
+        let owed = match &mut self.on_beat {
+            Some(on_beat) => {
+                let owed = beat_step(
+                    on_beat,
+                    &mut self.scheduler,
+                    &self.pacer,
+                    &self.performance,
+                    start,
+                )?;
+                // Jobs are numbered in submission order from zero, so the
+                // next one's number is the count submitted.
+                owed && on_beat.beats.slot_free(self.outcome.submitted)
+            }
+            None => true,
+        };
 
         let planning = self.performance.now();
         // This frame's budget follows the last render measured and the
@@ -287,27 +366,35 @@ impl Host {
         let forecast = self.render.expected(start.period, self.margin);
         self.scheduler.set_expected_budget(forecast);
         self.outcome.expected_budget_us.push(forecast.get().get());
-        let takes_input = match self.load {
-            Load::Synthetic => true,
-            Load::Depth(_) => self.busy.is_none(),
-        };
+        let takes_input = owed
+            && match self.load {
+                Load::Synthetic => true,
+                Load::Depth(_) => self.busy.is_none(),
+            };
         let new_job = if takes_input {
             let job = self
                 .scheduler
                 .submit(frame, self.slices.clone(), &self.cost)
                 .context("the scheduler rejected the frame's job")?;
+            if let (Some(on_beat), Some(Due::Beat(due))) =
+                (&mut self.on_beat, self.scheduler.due(job))
+            {
+                on_beat.beats.submitted(job.get(), due.get());
+            }
             Some(job)
         } else {
             None
         };
         let plan = self.scheduler.plan_frame(frame, budget, &self.cost);
         self.current_frame = start.index;
-        // The render pass shows what this frame delivers.
-        if let Load::Depth(depth) = &self.load {
-            for delivery in &plan.delivered {
-                self.shown = Some(depth.net.slot_of(delivery.job.get()));
-            }
-        }
+        // The render pass shows what this frame delivers: the slot of the job
+        // the display copies in this frame, after the slices that may finish
+        // it and before the render pass.
+        let delivering = match &self.load {
+            Load::Depth(depth) => delivered_now(&plan).map(|job| depth.net.slot_of(job.get())),
+            Load::Synthetic => None,
+        };
+        self.shown |= delivering.is_some();
 
         let encoding = self.performance.now();
         let mut encoder = self
@@ -342,6 +429,7 @@ impl Host {
                     ))?;
                     encode_slice(&self.load, &self.workload, &mut encoder, run, writes)?;
                 }
+                encode_delivery(&self.load, &mut encoder, delivering);
                 if let Some(view) = &view {
                     let writes = timestamps.render_pass()?;
                     encode_render(
@@ -359,6 +447,7 @@ impl Host {
                 for run in &plan.runs {
                     encode_slice(&self.load, &self.workload, &mut encoder, run, None)?;
                 }
+                encode_delivery(&self.load, &mut encoder, delivering);
                 if let Some(view) = &view {
                     encode_render(
                         &self.load,
@@ -410,7 +499,8 @@ impl Host {
         self.outcome.cpu_us.push(between(began, submitted));
 
         self.read_back();
-        self.complete(start.index, &plan);
+        self.complete(start, &plan);
+        self.previous_start_us = Some(start.start_us);
         self.outcome
             .tick_us
             .push(between(began, self.performance.now()));
@@ -490,13 +580,36 @@ impl Host {
             .sum()
     }
 
-    /// Delivers the plan's results and counts its misses.
-    fn complete(&mut self, index: u64, plan: &FramePlan) {
+    /// Delivers the plan's results and counts its misses; on beat, records
+    /// the jobs whose last slice ran, and where each result landed.
+    fn complete(&mut self, start: FrameStart, plan: &FramePlan) {
+        let index = start.index;
+        if let Some(on_beat) = &mut self.on_beat {
+            for run in &plan.runs {
+                if run.position + 1 == self.slices.len() {
+                    on_beat.beats.completed(run.job.get(), start.start_us);
+                }
+            }
+            for delivery in &plan.delivered {
+                on_beat.beats.delivered(
+                    delivery.job.get(),
+                    start.start_us,
+                    self.previous_start_us,
+                    start.period.get(),
+                );
+            }
+            for missed in &plan.missed {
+                if let Due::Beat(due) = missed.due {
+                    on_beat.beats.missed(missed.job.get(), due.get());
+                }
+            }
+        }
         for delivery in &plan.delivered {
             let latency = index.saturating_sub(delivery.input.get());
             self.outcome.latencies.push(latency);
             self.outcome.delivered += 1;
-            if latency != u64::from(self.latency) {
+            // On beat there is no latency in frames to keep.
+            if self.on_beat.is_none() && latency != u64::from(self.latency) {
                 self.outcome.violations += 1;
             }
             let dispatches = self.job_dispatches.remove(&delivery.job.get()).unwrap_or(0);
@@ -589,8 +702,55 @@ impl Host {
         self.outcome.diagnosis.frame_scale = self.cost.frame_scale();
         self.outcome.diagnosis.frames_recorded = self.cost.frames_recorded();
         self.outcome.gpu_errors = device::gpu_errors();
+        if let Some(on_beat) = &self.on_beat {
+            on_beat.audio.close();
+            let mut summary = on_beat.beats.summary();
+            (summary.clicks_scheduled, summary.clicks_late) = on_beat.audio.clicks();
+            // What `capacity_frames_needed` holds a job to: the frames of the
+            // plan's shortest beat, before or after a tempo change, less the
+            // margin.
+            let shortest = on_beat.beats.tempo().shortest_beat().get();
+            let room = Micros::new(shortest.saturating_sub(summary.margin_us));
+            self.outcome.latency = frames_for(room, self.pacer.period());
+            self.outcome.on_beat = Some(summary);
+        }
         self.outcome
     }
+}
+
+/// The on-beat step at the start of a frame: reads the audio clock, puts in
+/// effect the grids the beats decide on, and schedules the clicks to come.
+/// Whether an input is owed.
+///
+/// # Errors
+///
+/// A grid the scheduler or the core refuses, or a click the audio context
+/// refuses.
+fn beat_step(
+    on_beat: &mut OnBeatHost,
+    scheduler: &mut Scheduler,
+    pacer: &Pacer,
+    performance: &web_sys::Performance,
+    start: FrameStart,
+) -> Result<bool> {
+    let beats = &mut on_beat.beats;
+    if beats.audio_time_s(0).is_none() {
+        beats.begin(on_beat.audio.current_time(), on_beat.audio.sample_rate());
+    }
+    // The pacer has read this frame's callback, so its epoch is known.
+    let epoch = pacer.epoch_us().unwrap_or(0);
+    beats.record(&on_beat.audio.reading(performance), epoch);
+    let decided = beats
+        .frame(start.start_us)
+        .map_err(|error| anyhow!("cannot make the beat grid: {error}"))?;
+    for (from, grid) in decided.grids {
+        scheduler
+            .replace_beat_grid(from, grid)
+            .context("the scheduler refused the beat grid")?;
+    }
+    // Inputs at beats 0 to `beats - 1` are placed up to beat `beats`.
+    on_beat.audio.schedule(beats, beats.beats_asked())?;
+    Ok(decided.owed)
 }
 
 /// One frame's timing as the `tail_*` lines read it: each pass's duration, as
@@ -616,8 +776,7 @@ fn timed(timing: &FrameTiming<Tag>) -> TimedFrame {
     }
 }
 
-/// Records the slice `run` hands out as its own compute pass, and after a depth
-/// job's last slice, the copy of its depth the display draws.
+/// Records the slice `run` hands out as its own compute pass.
 fn encode_slice(
     load: &Load,
     workload: &Workload,
@@ -633,22 +792,27 @@ fn encode_slice(
         Load::Depth(depth) => {
             let slot = depth.net.slot_of(run.job.get());
             depth.net.encode(encoder, slot, run.slice, writes)?;
-            // The job is complete: its depth goes to the display's own buffer,
-            // which no slice writes, so the render pass waits for none.
-            if run.slice.get().saturating_add(1) == depth.net.kernel_count() {
-                depth.display.keep(encoder, slot);
-            }
             Ok(())
         }
     }
 }
 
+/// Records the copy of the depth of slot `delivering`, whose job the frame
+/// delivers, into the display: between the frame's slices and its render
+/// pass, untimed. Nothing for a frame that delivers nothing or a synthetic
+/// run.
+fn encode_delivery(load: &Load, encoder: &mut wgpu::CommandEncoder, delivering: Option<u32>) {
+    if let (Load::Depth(depth), Some(slot)) = (load, delivering) {
+        depth.display.deliver(encoder, slot);
+    }
+}
+
 /// Records the frame's render pass into `view`: the synthetic one, or the
-/// display of slot `shown`.
+/// display, with the depth delivered last once `shown`.
 fn encode_render(
     load: &Load,
     workload: &Workload,
-    shown: Option<u32>,
+    shown: bool,
     encoder: &mut wgpu::CommandEncoder,
     view: &wgpu::TextureView,
     writes: Option<wgpu::RenderPassTimestampWrites<'_>>,
