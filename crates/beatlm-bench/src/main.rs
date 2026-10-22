@@ -680,7 +680,7 @@
 //! | `delivery_rate` | `delivered` over `delivered` plus `missed`: the share of deadlines that arrived with their result; `none` when no deadline arrived |
 //! | `pending_at_end` | jobs submitted whose deadline was after the last frame |
 //! | `latency_violations` | deliveries whose latency was not `--latency`; the L1 promise broke when this is not zero |
-//! | `timings_collected`, `timings_skipped`, `timings_failed` | frames whose GPU timing was read, was not taken because the readback ring was full, and was lost to a failed map |
+//! | `timings_collected`, `timings_skipped`, `timings_failed` | frames whose GPU timing was read, was not taken because the readback ring was full, and was lost to a failed map; the bench never marks a frame as rejected ([`SliceTimer::invalidate_submitted`](beatlm::gpu::SliceTimer::invalidate_submitted)), since a rejected command buffer panics in wgpu's default error handler first |
 //! | `latency_frames[n]` | how many deliveries had a latency of `n` frames |
 //! | `dispatches_per_job` | compute dispatches encoded for each delivered job, over every frame that ran one of its slices: p50, p99, max |
 //! | `dispatches_per_frame` | compute dispatches encoded in each frame, every job's slices included: p50, p99, max |

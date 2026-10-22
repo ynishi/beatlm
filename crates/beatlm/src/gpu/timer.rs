@@ -17,6 +17,12 @@
 //! takes, with the value `resolve` returned, rules that out: a
 //! [`ResolvedFrame`] dropped with its encoder frees the slot unread.
 //!
+//! Submitted is not accepted: a command buffer the device rejects never runs
+//! either, and its map succeeds the same way. The host that learns of a
+//! rejection marks what it submitted with
+//! [`SliceTimer::invalidate_submitted`], which has the rule, and a marked frame
+//! is never decoded.
+//!
 //! Queries are allocated in the order passes are requested, two per pass, so the
 //! queries a frame resolves are always the contiguous prefix it wrote. A frame
 //! with fewer slices than the timer's capacity resolves fewer queries, and never
@@ -28,7 +34,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use beatlm_core::time::{FrameIndex, Micros};
 use thiserror::Error;
 
-use super::ring::{Phase, Ring, Ticket};
+use super::ring::{Collect, Map, Phase, Ring, Ticket, collect};
 
 /// How many frames of timing can be in flight at once.
 ///
@@ -129,7 +135,9 @@ pub struct TimerStats {
     pub frames_skipped: u64,
     /// Frames whose timing was collected.
     pub frames_collected: u64,
-    /// Frames whose map failed, so their timing was lost.
+    /// Frames handed back as submitted whose timing was lost: their map
+    /// failed, or the host marked them with
+    /// [`SliceTimer::invalidate_submitted`].
     pub frames_failed: u64,
 }
 
@@ -328,30 +336,45 @@ impl<T> SliceTimer<T> {
     /// completed stays in flight for a later call. See the type documentation
     /// for how to poll without waiting.
     pub fn collect_ready(&mut self) -> Vec<FrameTiming<T>> {
-        let mut ready: Vec<usize> = self
+        let decide = |i: usize| -> Collect {
+            let map = match self.slots.get(i).map(|s| s.done.load(Ordering::Acquire)) {
+                Some(MAP_OK) => Map::Ok,
+                Some(MAP_FAILED) => Map::Failed,
+                _ => Map::Pending,
+            };
+            self.ring
+                .phase(i)
+                .map_or(Collect::Wait, |phase| collect(phase, map))
+        };
+        let mut ready: Vec<(usize, Collect)> = self
             .ring
             .slots_in(Phase::Mapping)
-            .filter(|&i| {
-                self.slots
-                    .get(i)
-                    .is_some_and(|s| s.done.load(Ordering::Acquire) != MAP_PENDING)
-            })
+            .chain(self.ring.slots_in(Phase::Invalid))
+            .map(|i| (i, decide(i)))
+            .filter(|&(_, verdict)| verdict != Collect::Wait)
             .collect();
-        ready.sort_by_key(|&i| self.slots.get(i).map_or(0, |s| s.order));
+        ready.sort_by_key(|&(i, _)| self.slots.get(i).map_or(0, |s| s.order));
 
         let mut out = Vec::with_capacity(ready.len());
-        for i in ready {
+        for (i, verdict) in ready {
             let Some(slot) = self.slots.get_mut(i) else {
                 continue;
             };
             // A failed map leaves the buffer unmapped, and unmapping it again is
             // a validation error, which wgpu's default handler turns into a panic.
-            let ticks = if slot.done.load(Ordering::Acquire) == MAP_OK {
-                let ticks = read_ticks(&slot.readback, slot.entries.len());
-                slot.readback.unmap();
-                ticks
-            } else {
-                None
+            let ticks = match verdict {
+                Collect::Read => {
+                    let ticks = read_ticks(&slot.readback, slot.entries.len());
+                    slot.readback.unmap();
+                    ticks
+                }
+                Collect::Drop { unmap } => {
+                    if unmap {
+                        slot.readback.unmap();
+                    }
+                    None
+                }
+                Collect::Wait => continue,
             };
             let entries = std::mem::take(&mut slot.entries);
             let frame = slot.frame;
@@ -367,6 +390,34 @@ impl<T> SliceTimer<T> {
             }
         }
         out
+    }
+
+    /// Marks every frame handed to [`submitted`](Self::submitted) and not yet
+    /// collected as one whose commands the device may have rejected, and
+    /// returns how many were marked.
+    ///
+    /// **A frame whose submission the device rejected is read only if the
+    /// host leaves it unmarked.** A rejected command buffer never runs, so
+    /// its copy never writes the frame's readback slot, yet the map requested
+    /// by `submitted` still succeeds, on the timestamps an earlier lap left
+    /// there; [`ResolvedFrame`] proves the host submitted, not that the
+    /// device accepted. The timer cannot see the rejection, so the host that
+    /// learns of one calls this before its next
+    /// [`collect_ready`](Self::collect_ready). A marked frame is never
+    /// decoded: its slot is freed once its map completes and the frame is
+    /// counted in [`TimerStats::frames_failed`], whatever the map read.
+    ///
+    /// It marks everything submitted and uncollected, not one frame, because
+    /// that is what a host can know when the error reaches it after the
+    /// submission (a browser's `uncapturederror`, or an error scope popped
+    /// later): the rejected frame is among them, and the valid frames marked
+    /// with it lose their timing, never have it misread. Natively an error
+    /// scope around `finish` and `queue.submit` pops at once, so a host can
+    /// call this straight after `submitted`, which marks the rejected frame
+    /// and the frames still in flight before it. Frames resolved but not yet
+    /// handed back are not marked.
+    pub fn invalidate_submitted(&mut self) -> usize {
+        self.ring.invalidate()
     }
 
     /// How many frames are recorded or requested and not yet collected. A
@@ -545,9 +596,8 @@ impl<T> Drop for FrameTimestamps<'_, T> {
 /// `queue.submit`, with nothing that can fail in between.
 ///
 /// What the value proves is that the host submitted, not that the device ran
-/// the commands: a command buffer the device rejects as invalid raises a
-/// validation error and never runs, and its frame would still be read. That
-/// error is the host's to treat, as for any other invalid command buffer.
+/// the commands; a host that learns the device rejected them says so through
+/// [`SliceTimer::invalidate_submitted`].
 ///
 /// It holds no borrow of the timer, so the host keeps using the timer while
 /// it holds one; a frame that was not timed returns one that holds nothing.
@@ -892,6 +942,72 @@ mod tests {
         let stats = timer.stats();
         assert_eq!(stats.frames_collected, 2 * RING_DEPTH as u64 + 1);
         assert_eq!(stats.frames_failed, 0);
+        assert_eq!(stats.frames_skipped, 0);
+    }
+
+    /// Needs a real adapter: a frame whose command buffer the device rejects
+    /// is submitted and handed back, its map completes on the timestamps an
+    /// earlier lap left in its slot, and once the host marks it the frame is
+    /// counted as failed and only the next, valid frame is reported.
+    #[test]
+    #[ignore = "needs a GPU adapter with TIMESTAMP_QUERY"]
+    fn a_frame_the_device_rejected_is_counted_and_never_read() {
+        let (device, queue) = timed_device();
+        let mut timer: SliceTimer<u32> = SliceTimer::new(&device, &queue, 2).unwrap();
+        let run = |timer: &mut SliceTimer<u32>, index: u64| {
+            let (encoder, resolved) = record_frame(&device, timer, index, 100 + index as u32);
+            queue.submit([encoder.finish()]);
+            timer.submitted(resolved);
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            timer.collect_ready()
+        };
+
+        // One lap of the ring, so every slot's readback holds real timestamps.
+        for index in 0..RING_DEPTH as u64 {
+            assert_eq!(run(&mut timer, index).len(), 1);
+        }
+
+        // The next frame lands on the first slot again with a dispatch that
+        // has no pipeline, inside an error scope, so the device rejects the
+        // command buffer and the test, not wgpu's default handler, sees it.
+        let rejected = RING_DEPTH as u64;
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        let mut frame = timer.begin_frame(FrameIndex::new(rejected));
+        let writes = frame.compute_pass(999).unwrap();
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: writes,
+            });
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        let resolved = frame.resolve(&mut encoder);
+        queue.submit([encoder.finish()]);
+        timer.submitted(resolved);
+        let error = pollster::block_on(scope.pop());
+        assert!(error.is_some(), "the command buffer was not rejected");
+
+        // The map completes, on the first frame's timestamps; the host marks
+        // the frame before collecting, and nothing is reported for it.
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        assert_eq!(timer.invalidate_submitted(), 1);
+        assert_eq!(timer.in_flight(), 1);
+        assert!(timer.collect_ready().is_empty());
+        assert_eq!(timer.in_flight(), 0);
+
+        // The next frame is valid and the only one reported, and the freed
+        // slot is readable again on the following lap.
+        for index in rejected + 1..rejected + 2 + RING_DEPTH as u64 {
+            let ready = run(&mut timer, index);
+            assert_eq!(ready.len(), 1, "{ready:?}");
+            assert_eq!(ready[0].frame, FrameIndex::new(index));
+            assert_eq!(ready[0].compute[0].0, 100 + index as u32);
+        }
+        let stats = timer.stats();
+        assert_eq!(stats.frames_failed, 1);
+        assert_eq!(stats.frames_collected, 2 * RING_DEPTH as u64 + 1);
         assert_eq!(stats.frames_skipped, 0);
     }
 }

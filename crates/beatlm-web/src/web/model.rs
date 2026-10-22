@@ -268,6 +268,7 @@ async fn measure(
     let kernels = net.kernel_count();
     let mut timer: SliceTimer<SliceId> = SliceTimer::new(&gpu.device, &gpu.queue, kernels)
         .context("cannot build the calibration timer")?;
+    let mut errors = device::ErrorWatch::from_now();
     for index in 0..=CALIBRATION_FRAMES {
         let started = ms_to_us(next_frame().await?);
         lost()?;
@@ -310,7 +311,7 @@ async fn measure(
         while timer.in_flight() > 0 {
             let now = ms_to_us(next_frame().await?);
             lost()?;
-            for timing in timer.collect_ready() {
+            for timing in errors.collect_ready(&mut timer) {
                 record(timing.frame.get(), &timing.compute);
             }
             if now.saturating_sub(started) > TIMING_TIMEOUT_US {

@@ -454,7 +454,15 @@
 //! [`RING_DEPTH`](beatlm::gpu::RING_DEPTH) frames in flight; a frame whose
 //! slot is still waiting for its map when the frame needs it is not timed, and
 //! `timings_skipped` counts it, as natively. `Device::poll` is not
-//! called: in a browser it does nothing.
+//! called: in a browser it does nothing. A command buffer the device rejects
+//! is not fatal here, as it is natively, and reaches the page only as an
+//! error counted in `gpu_errors`; before each collection, everything
+//! submitted and uncollected when that count has grown is marked
+//! ([`SliceTimer::invalidate_submitted`](beatlm::gpu::SliceTimer::invalidate_submitted))
+//! and lands in `timings_failed`. `web::device::ErrorWatch` says when the
+//! count is seen in time, and why the specification does not promise it is:
+//! a rejected frame whose error arrives after its map completed, or is never
+//! raised, is still read.
 //!
 //! # What differs from the native bench, and why
 //!

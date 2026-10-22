@@ -12,6 +12,13 @@
 //! unread. Without the rule a slot whose encoder was dropped would still be
 //! mapped, the map would succeed on whatever an earlier frame left in the
 //! buffer, and those durations would be reported as this frame's.
+//!
+//! And the third: **a slot the host has invalidated is never decoded.**
+//! [`Ring::invalidate`] moves every slot whose map was requested to
+//! [`Phase::Invalid`], and [`collect`] turns an invalid slot whose map has
+//! completed into [`Collect::Drop`], whatever the map read. The slot is not
+//! freed before its map completes: a buffer with a map pending cannot take
+//! the next lap's copy.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,6 +37,52 @@ pub(crate) enum Phase {
     /// The host has said the encoder was submitted; the map is requested and
     /// has not been collected.
     Mapping,
+    /// The map is requested, and the host has since said the frame's
+    /// submission is not to be trusted; the slot is dropped unread once the
+    /// map completes.
+    Invalid,
+}
+
+/// Where a slot's map request stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Map {
+    /// Not completed.
+    Pending,
+    /// Completed, and the buffer is mapped.
+    Ok,
+    /// Completed with an error, and the buffer is not mapped.
+    Failed,
+}
+
+/// What collecting a slot does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Collect {
+    /// Not collectable yet: leave it in flight.
+    Wait,
+    /// Read the timestamps, unmap, free the slot.
+    Read,
+    /// Free the slot without reading it, after unmapping it when `unmap`;
+    /// the frame's timing is lost.
+    Drop {
+        /// Whether the buffer is mapped and must be unmapped before reuse.
+        unmap: bool,
+    },
+}
+
+/// What collecting a slot in `phase` whose map stands at `map` does.
+///
+/// Only a slot in [`Phase::Mapping`] whose map succeeded is read. An
+/// [`Phase::Invalid`] slot is dropped once its map completes, so that its
+/// buffer is no longer pending when the next lap copies into it. A slot in
+/// any other phase has no map to collect.
+pub(crate) fn collect(phase: Phase, map: Map) -> Collect {
+    match (phase, map) {
+        (Phase::Mapping | Phase::Invalid, Map::Pending)
+        | (Phase::Free | Phase::Recording | Phase::Encoded, _) => Collect::Wait,
+        (Phase::Mapping, Map::Ok) => Collect::Read,
+        (Phase::Invalid, Map::Ok) => Collect::Drop { unmap: true },
+        (Phase::Mapping | Phase::Invalid, Map::Failed) => Collect::Drop { unmap: false },
+    }
 }
 
 /// The proof that a slot's resolve was recorded, which the host hands back
@@ -144,6 +197,25 @@ impl Ring {
         // Handed back: its drop must not mark the slot abandoned.
         ticket.abandoned = None;
         Some(slot)
+    }
+
+    /// Moves every slot in [`Phase::Mapping`] to [`Phase::Invalid`] and
+    /// returns how many moved. Slots not yet handed back as submitted are
+    /// left as they are.
+    pub(crate) fn invalidate(&mut self) -> usize {
+        let mut moved = 0;
+        for phase in &mut self.phases {
+            if *phase == Phase::Mapping {
+                *phase = Phase::Invalid;
+                moved += 1;
+            }
+        }
+        moved
+    }
+
+    /// The phase of `slot`, `None` for a slot the ring does not have.
+    pub(crate) fn phase(&self, slot: usize) -> Option<Phase> {
+        self.phases.get(slot).copied()
     }
 
     /// Returns `slot` to the free state, whatever state it was in.
@@ -339,6 +411,109 @@ mod tests {
         assert!(ring.encode(9).is_none());
         ring.release(9);
         assert_eq!(ring.in_flight(), 0);
+    }
+
+    /// Claims, encodes and submits one frame, returning its slot.
+    fn submit_one(ring: &mut Ring) -> usize {
+        let slot = ring.claim().unwrap();
+        let ticket = ring.encode(slot).unwrap();
+        ring.submit(ticket).unwrap()
+    }
+
+    #[test]
+    fn only_a_valid_completed_map_is_read() {
+        use Collect::{Drop, Read, Wait};
+        assert_eq!(collect(Phase::Mapping, Map::Ok), Read);
+        assert_eq!(collect(Phase::Mapping, Map::Pending), Wait);
+        assert_eq!(collect(Phase::Mapping, Map::Failed), Drop { unmap: false });
+        assert_eq!(collect(Phase::Invalid, Map::Pending), Wait);
+        assert_eq!(collect(Phase::Invalid, Map::Ok), Drop { unmap: true });
+        assert_eq!(collect(Phase::Invalid, Map::Failed), Drop { unmap: false });
+        for phase in [Phase::Free, Phase::Recording, Phase::Encoded] {
+            for map in [Map::Pending, Map::Ok, Map::Failed] {
+                assert_eq!(collect(phase, map), Wait, "{phase:?} {map:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_slot_invalidated_before_its_map_completes_waits_then_drops() {
+        let mut ring = Ring::new(2);
+        let slot = submit_one(&mut ring);
+        assert_eq!(ring.invalidate(), 1);
+        assert_eq!(ring.phase(slot), Some(Phase::Invalid));
+        // Still holding the slot: its buffer has a map pending.
+        assert_eq!(ring.in_flight(), 1);
+        assert_eq!(
+            collect(ring.phase(slot).unwrap(), Map::Pending),
+            Collect::Wait
+        );
+        // The map completes on whatever the buffer held; it is not read.
+        assert_eq!(
+            collect(ring.phase(slot).unwrap(), Map::Ok),
+            Collect::Drop { unmap: true }
+        );
+        ring.release(slot);
+        assert_eq!(ring.in_flight(), 0);
+    }
+
+    #[test]
+    fn a_slot_invalidated_after_its_map_completed_is_still_dropped() {
+        let mut ring = Ring::new(2);
+        let slot = submit_one(&mut ring);
+        // The map has completed (Read, were it collected now), and the host
+        // invalidates before the slot is collected.
+        assert_eq!(collect(ring.phase(slot).unwrap(), Map::Ok), Collect::Read);
+        ring.invalidate();
+        assert_eq!(
+            collect(ring.phase(slot).unwrap(), Map::Ok),
+            Collect::Drop { unmap: true }
+        );
+    }
+
+    #[test]
+    fn invalidation_spares_frames_not_yet_handed_back() {
+        let mut ring = Ring::new(3);
+        let first = ring.claim().unwrap();
+        let first = ring.encode(first).unwrap();
+        let second = submit_one(&mut ring);
+        let third = ring.claim().unwrap();
+        // Out of order: the second is submitted, the first and third are not.
+        assert_eq!(ring.invalidate(), 1);
+        assert_eq!(ring.phase(second), Some(Phase::Invalid));
+        assert_eq!(ring.phase(third), Some(Phase::Recording));
+        assert_eq!(ring.submit(first), Some(0));
+        assert_eq!(ring.phase(0), Some(Phase::Mapping));
+        let third = ring.encode(third).unwrap();
+        assert_eq!(ring.submit(third), Some(2));
+        assert_eq!(
+            ring.slots_in(Phase::Mapping).collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+        assert_eq!(ring.slots_in(Phase::Invalid).collect::<Vec<_>>(), vec![1]);
+        // A second invalidation with nothing new in flight moves only the
+        // slots submitted since.
+        assert_eq!(ring.invalidate(), 2);
+        assert_eq!(ring.invalidate(), 0);
+    }
+
+    #[test]
+    fn an_invalid_slot_holds_its_place_and_the_next_lap_is_readable() {
+        let mut ring = Ring::new(2);
+        let a = submit_one(&mut ring);
+        let b = submit_one(&mut ring);
+        ring.invalidate();
+        // Both slots wait on their maps: the ring is full, the cursor stays.
+        assert_eq!(ring.claim(), None);
+        ring.release(a);
+        ring.release(b);
+        // The next lap on the same slots is a fresh, valid frame.
+        let again = submit_one(&mut ring);
+        assert_eq!(again, a);
+        assert_eq!(ring.phase(again), Some(Phase::Mapping));
+        assert_eq!(collect(ring.phase(again).unwrap(), Map::Ok), Collect::Read);
+        assert_eq!(submit_one(&mut ring), b);
+        assert_eq!(ring.phase(b), Some(Phase::Mapping));
     }
 
     #[test]
