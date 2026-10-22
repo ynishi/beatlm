@@ -94,6 +94,14 @@ and this project adheres to
   `estimator=frame-scaled`): plans warm slices at their loop median times a
   measured frame scale; with `CostModel::record_frame`, `record_calibration`,
   `planning_estimate` and the `frame_ratio` / `frame_scale` report lines.
+- `beatlm-web` `sync=onbeat`: results delivered on beats from a Web Audio
+  clock (`bpm`, `bpm_change`, `margin_ms`, `beats`), started by a click, with
+  beat landing error and tempo-change lines in the report.
+
+### Fixed
+
+- `beatlm-web`: a depth result reaches the screen only in the frame that
+  delivers it; a later job on the same slot could show its depth before then.
 
 ### Changed
 
