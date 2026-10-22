@@ -2,10 +2,13 @@
 //! in a fixed order, so it can be scraped from the page and diffed against a
 //! native run.
 //!
-//! The lines the two hosts share have the bench's names and formats
-//! (`beatlm-bench`'s `report.rs`), so a browser report and a native one compare
-//! line by line; percentiles come from `beatlm_host::stats`, as the bench's do. The lines
-//! only a browser has say where it ran (`user_agent`, `date`), what the device
+//! The lines the two hosts share are written by [`beatlm_host::report`], which
+//! lists them in their order, so a browser report and a native one compare
+//! line by line; the browser's own summaries among them
+//! (`callback_interval_us`, `gpu_render_*`) are handed in at their places
+//! there. `frame_ratio` and `frame_scale` are among the shared lines and sit
+//! where the bench's report has them, after the `pass_overlap_*` lines. The
+//! lines only a browser has say where it ran (`user_agent`, `date`), what the device
 //! was given (`timestamp_query`, the limits), what the display did
 //! (`display_period_us`, `callback_interval_us`) and what went wrong on the GPU
 //! (`gpu_errors`), and the render pass's GPU time apart in frames with and
@@ -17,7 +20,8 @@
 //! one that says whether the next frame's slices began before its render
 //! ended (`pass_overlap_next_frame`), follow
 //! `gpu_frames_over_period` in both hosts' reports, from the module both
-//! compile ([`beatlm_host::pass_overlap`]). The browser's own lines go on
+//! compile ([`beatlm_host::pass_overlap`]). After the shared lines and the
+//! `slice[i]` lines the browser's own go on
 //! with the diagnosis of the misses ([`crate::diagnosis`]): how many were
 //! abandoned before they started (`missed_unstarted`), after
 //! (`missed_started`) or missed at their deadline (`missed_at_deadline`), when
@@ -27,9 +31,7 @@
 //! (`timing_lag_frames`), the frame's first compute pass apart from the later
 //! ones (`first_pass_us`, `later_pass_us`, `first_pass_over_later_mean`), and
 //! a job's estimated GPU time when the loop began and ended
-//! (`job_estimate_us`), and the frames' measured slice time against what they
-//! were planned at with the frame scale read from it (`frame_ratio`,
-//! `frame_scale`, the bench's lines); and, for the depth model, where the time of the slow
+//! (`job_estimate_us`); and, for the depth model, where the time of the slow
 //! slice measurements comes from (`tail_*`, which [`crate::diagnosis`] lists
 //! with what each tests). The last line is `status: done`, so a reader can tell a
 //! finished report from one still being written.
@@ -110,11 +112,9 @@ use beatlm::load::depth_anything_v2::reference::{
 };
 use beatlm_core::cost::SliceId;
 use beatlm_core::time::Micros;
-use beatlm_host::pass_overlap;
 use beatlm_host::presets::MARGIN_US;
-use beatlm_host::stats::{
-    frame_ratio_value, frame_scale_value, histogram, nearest_rank, share, summarize,
-};
+use beatlm_host::report::{self, write_summary};
+use beatlm_host::stats::{nearest_rank, share, summarize};
 use beatlm_host::workload::{DEFAULT_RENDER_ITERS, DEFAULT_SLICE_ITERS};
 
 use crate::config::{Config, Model, SLICES, estimator_name};
@@ -416,9 +416,7 @@ fn write_pass_cost(
     }
     writeln!(out)?;
     writeln!(out, "frames: {}", outcome.frames)?;
-    writeln!(out, "timings_collected: {}", outcome.timer.frames_collected)?;
-    writeln!(out, "timings_skipped: {}", outcome.timer.frames_skipped)?;
-    writeln!(out, "timings_failed: {}", outcome.timer.frames_failed)?;
+    report::write_timings(out, outcome.timer)?;
     writeln!(out, "canvas_unavailable: {}", outcome.canvas_unavailable)?;
     writeln!(out, "gpu_errors: {}", outcome.gpu_errors)?;
     measurements.write_report(out, settings)?;
@@ -513,77 +511,48 @@ fn write_report(
         Some(us) => writeln!(out, "display_period_us: {us}")?,
         None => writeln!(out, "display_period_us: none")?,
     }
-    let period = period_of(outcome);
-    if outcome.on_beat.is_some() {
-        writeln!(out, "promised_latency_ms: none")?;
-    } else {
-        writeln!(
-            out,
-            "promised_latency_ms: {:.1}",
-            promised_latency_ms(outcome.latency, period)
-        )?;
-    }
-    writeln!(out, "frames: {}", outcome.cpu_us.len())?;
-    writeln!(out, "frames_dropped: {}", outcome.dropped)?;
-    writeln!(out, "submitted: {}", outcome.submitted)?;
-    writeln!(out, "delivered: {}", outcome.delivered)?;
-    writeln!(out, "missed: {}", outcome.missed)?;
-    writeln!(out, "startup_missed: {}", outcome.startup_missed)?;
-    match delivery_rate(outcome.delivered, outcome.missed) {
-        Some(rate) => writeln!(out, "delivery_rate: {rate:.4}")?,
-        None => writeln!(out, "delivery_rate: none")?,
-    }
-    writeln!(out, "pending_at_end: {}", outcome.pending_at_end)?;
-    if outcome.on_beat.is_some() {
-        writeln!(out, "latency_violations: none")?;
-    } else {
-        writeln!(out, "latency_violations: {}", outcome.violations)?;
-    }
-    writeln!(out, "timings_collected: {}", outcome.timer.frames_collected)?;
-    writeln!(out, "timings_skipped: {}", outcome.timer.frames_skipped)?;
-    writeln!(out, "timings_failed: {}", outcome.timer.frames_failed)?;
-    for (frames, count) in histogram(outcome.latencies.iter().copied()) {
-        writeln!(out, "latency_frames[{frames}]: {count}")?;
-    }
-    write_summary(out, "dispatches_per_job", &outcome.dispatches_per_job)?;
-    write_summary(out, "dispatches_per_frame", &outcome.dispatches_per_frame)?;
-    write_summary(out, "callback_interval_us", &outcome.interval_us)?;
-    write_summary(out, "frame_start_lateness_us", &outcome.lateness_us)?;
-    write_summary(out, "cpu_start_to_submit_us", &outcome.cpu_us)?;
-    write_summary(out, "cpu_start_to_tick_end_us", &outcome.tick_us)?;
-    write_summary(out, "cpu_plan_us", &outcome.plan_us)?;
-    write_summary(out, "cpu_encode_us", &outcome.encode_us)?;
-    write_summary(out, "cpu_queue_submit_us", &outcome.submit_us)?;
-    write_summary(out, "gpu_frame_us", &outcome.gpu_frame_us)?;
-    write_summary(out, "gpu_render_alone_us", &outcome.render_alone_us)?;
-    write_summary(
+    // The lines the bench's report shares (`beatlm_host::report`), at the
+    // display's period; the summaries passed in are the browser's own.
+    let d = &outcome.diagnosis;
+    report::write_lines(
         out,
-        "gpu_render_with_slices_us",
-        &outcome.render_with_slices_us,
+        &report::Lines {
+            latency: outcome.on_beat.is_none().then_some(outcome.latency),
+            period: period_of(outcome),
+            dropped: outcome.dropped,
+            submitted: outcome.submitted,
+            delivered: outcome.delivered,
+            missed: outcome.missed,
+            startup_missed: outcome.startup_missed,
+            pending_at_end: outcome.pending_at_end,
+            violations: outcome.violations,
+            timer: outcome.timer,
+            latencies: &outcome.latencies,
+            dispatches_per_job: &outcome.dispatches_per_job,
+            dispatches_per_frame: &outcome.dispatches_per_frame,
+            after_dispatches: &[("callback_interval_us", &outcome.interval_us)],
+            lateness_us: &outcome.lateness_us,
+            cpu_us: &outcome.cpu_us,
+            tick_us: &outcome.tick_us,
+            after_tick: &[],
+            plan_us: &outcome.plan_us,
+            encode_us: &outcome.encode_us,
+            submit_us: &outcome.submit_us,
+            gpu_frame_us: &outcome.gpu_frame_us,
+            after_gpu_frame: &[
+                ("gpu_render_alone_us", &outcome.render_alone_us),
+                ("gpu_render_with_slices_us", &outcome.render_with_slices_us),
+            ],
+            longest_dispatch_us: &outcome.longest_dispatch_us,
+            pass_frames: &outcome.pass_frames,
+            frame_ratios: &d.frame_ratios,
+            frame_scale: d.frame_scale,
+            frames_recorded: d.frames_recorded,
+            frame_scales: &d.frame_scales,
+        },
     )?;
-    write_summary(out, "longest_dispatch_us", &outcome.longest_dispatch_us)?;
-    writeln!(
-        out,
-        "gpu_frames_over_period: {} of {}",
-        gpu_frames_over_period(&outcome.gpu_frame_us, period),
-        outcome.gpu_frame_us.len()
-    )?;
-    pass_overlap::write_lines(out, &pass_overlap::analyse(&outcome.pass_frames))?;
-    for (slice, estimate) in &outcome.estimates {
-        let (sum, count) = outcome.measured.get(slice).copied().unwrap_or((0, 0));
-        write!(
-            out,
-            "slice[{}]: estimate_us={} measured_samples={}",
-            slice.get(),
-            estimate.get(),
-            count
-        )?;
-        match sum.checked_div(count) {
-            Some(mean) => writeln!(out, " measured_mean_us={mean}")?,
-            None => writeln!(out, " measured_mean_us=none")?,
-        }
-    }
-    write_diagnosis(out, &outcome.diagnosis)?;
+    report::write_slices(out, &outcome.estimates, &outcome.measured)?;
+    write_diagnosis(out, d)?;
     if let Some(depth) = &outcome.depth {
         write_tail(out, depth, outcome)?;
         write_depth(out, depth, outcome)?;
@@ -656,12 +625,6 @@ fn write_diagnosis(out: &mut String, d: &Diagnosis) -> std::fmt::Result {
         out,
         "job_estimate_us: loop_start={} loop_end={}",
         d.job_estimate_us.0, d.job_estimate_us.1
-    )?;
-    writeln!(out, "frame_ratio: {}", frame_ratio_value(&d.frame_ratios))?;
-    writeln!(
-        out,
-        "frame_scale: {}",
-        frame_scale_value(d.frame_scale, d.frames_recorded, &d.frame_scales)
     )
 }
 
@@ -1090,41 +1053,16 @@ fn write_limits(out: &mut String, name: &str, limits: SizeLimits) -> std::fmt::R
     )
 }
 
-fn write_summary(out: &mut String, name: &str, samples: &[u64]) -> std::fmt::Result {
-    match summarize(samples) {
-        Some(s) => writeln!(out, "{name}: p50={} p99={} max={}", s.p50, s.p99, s.max),
-        None => writeln!(out, "{name}: none"),
-    }
-}
-
-/// Delivered over delivered plus missed: the share of deadlines that arrived
-/// with their result. `None` when no deadline arrived.
-#[allow(clippy::cast_precision_loss)]
-fn delivery_rate(delivered: u64, missed: u64) -> Option<f64> {
-    let total = delivered.saturating_add(missed);
-    (total > 0).then(|| delivered as f64 / total as f64)
-}
-
-/// The period the run's frames were given: the display's as measured, or the
-/// nominal one when the run was too short to measure it.
+/// The period the run's frames were given, which `promised_latency_ms` and
+/// `gpu_frames_over_period` take: the display's as measured, or the nominal
+/// one when the run was too short to measure it. The time a promise in frames
+/// is worth follows the display, so `promised_latency_ms` is not the bench's
+/// figure unless the display is 60 Hz, and a 120 Hz run's frames are held to
+/// 8.3 ms.
 fn period_of(outcome: &Outcome) -> Micros {
     outcome
         .display_period_us
         .map_or(NOMINAL_PERIOD, Micros::new)
-}
-
-/// The promised latency of `frames` frames of `period`, in milliseconds. The
-/// time a promise in frames is worth follows the display, so this is not the
-/// bench's figure unless the display is 60 Hz.
-#[allow(clippy::cast_precision_loss)]
-fn promised_latency_ms(frames: u32, period: Micros) -> f64 {
-    f64::from(frames) * period.get() as f64 / 1_000.0
-}
-
-/// Timed frames whose render plus slices took longer than the frame `period`,
-/// the display's, so a 120 Hz run is held to 8.3 ms.
-fn gpu_frames_over_period(gpu_frame_us: &[u64], period: Micros) -> usize {
-    gpu_frame_us.iter().filter(|&&us| us > period.get()).count()
 }
 
 #[cfg(test)]
@@ -1329,6 +1267,165 @@ mod tests {
         );
     }
 
+    /// A synthetic run asked for its latency in time, with every line it
+    /// writes, at fixed numbers.
+    fn full_outcome() -> Outcome {
+        use beatlm::gpu::PassSpan;
+        use beatlm_core::cost::FrameScale;
+        use beatlm_host::pass_overlap::{Frame, Pass};
+        let q = 65_536;
+        let span = |begin_ns, end_ns| PassSpan { begin_ns, end_ns };
+        Outcome {
+            latency: 2,
+            latency_asked_us: Some(33_000),
+            latency_period_us: Some(16_667),
+            depth: None,
+            diagnosis: Diagnosis {
+                unstarted: 1,
+                started: 0,
+                at_deadline: 0,
+                abandoned: vec![
+                    crate::diagnosis::Unstarted {
+                        frame: 7,
+                        now_us: 9_000,
+                        expected_us: 12_000,
+                        largest_us: 2_000,
+                        sum_us: 8_000,
+                        frames_left: 1,
+                        projected_end: Some(8),
+                    },
+                    crate::diagnosis::Unstarted {
+                        frame: 9,
+                        now_us: 1_000,
+                        expected_us: 1_500,
+                        largest_us: 3_000,
+                        sum_us: 8_000,
+                        frames_left: 1,
+                        projected_end: None,
+                    },
+                ],
+                starts: vec![0, 1, 3],
+                lag_frames: vec![2, 2, 3],
+                first_pass_us: vec![1_700, 1_800],
+                later_pass_us: vec![1_400, 1_500, 1_450],
+                // The same passes by slice: 0 first at 1 700 and later at
+                // 1 400 and 1 450, 1 first at 1 800 and later at 1 500.
+                passes: [
+                    (SliceId::new(0), ((1_700, 1), (2_850, 2))),
+                    (SliceId::new(1), ((1_800, 1), (1_500, 1))),
+                ]
+                .into_iter()
+                .collect(),
+                job_estimate_us: (8_000, 6_400),
+                frame_ratios: vec![1.1, 0.9, 1.25],
+                frame_scales: vec![1.0, 1.2],
+                frame_scale: FrameScale::Measured(1.2),
+                frames_recorded: 70,
+                ..Diagnosis::default()
+            },
+            cpu_us: vec![900, 1_100, 1_000],
+            tick_us: vec![1_200, 1_300, 1_250],
+            plan_us: vec![50, 60, 55],
+            encode_us: vec![100, 110, 105],
+            submit_us: vec![30, 40, 35],
+            dispatches_per_frame: vec![4, 4, 3],
+            dispatches_per_job: vec![4, 4],
+            lateness_us: vec![0, 10, 500],
+            dropped: 1,
+            display_period_us: Some(16_667),
+            interval_us: vec![16_600, 16_700, 33_400],
+            expected_budget_us: vec![12_000, 12_500],
+            gpu_frame_us: vec![6_000, 17_000, 7_000],
+            render_alone_us: vec![400],
+            render_with_slices_us: vec![500, 650],
+            longest_dispatch_us: vec![1_500, 1_600],
+            latencies: vec![2, 2, 3],
+            submitted: 3,
+            delivered: 2,
+            missed: 1,
+            startup_missed: 1,
+            violations: 1,
+            pending_at_end: 2,
+            measured: [(SliceId::new(0), (3_000, 2))].into_iter().collect(),
+            estimates: [
+                (SliceId::new(0), Micros::new(1_600)),
+                (SliceId::new(1), Micros::new(2_000)),
+            ]
+            .into_iter()
+            .collect(),
+            timer: TimerStats {
+                frames_skipped: 1,
+                frames_collected: 3,
+                frames_failed: 0,
+            },
+            pass_frames: vec![Frame {
+                index: 0,
+                compute: vec![Pass {
+                    slice: SliceId::new(0),
+                    us: 655,
+                    span: span(3 * q, 13 * q),
+                }],
+                render: Some(span(10 * q, 41 * q)),
+            }],
+            canvas_unavailable: 1,
+            gpu_errors: 0,
+            on_beat: None,
+        }
+    }
+
+    /// The report's names, order and formatting, held to the text in
+    /// `report/`: a run with every value present, an empty one where each
+    /// value that can be absent says `none`, and an on-beat one, whose lines
+    /// about a latency in frames say `none`.
+    #[test]
+    fn the_report_is_the_golden_text() {
+        let env = Environment {
+            adapter: String::from("Test Adapter"),
+            backend: String::from("webgpu"),
+            user_agent: String::from("Test Browser/1.0"),
+            date: String::from("2026-01-01T00:00:00Z"),
+            timestamp_query: true,
+            adapter_limits: SizeLimits {
+                max_storage_buffer_binding_size: 1 << 30,
+                max_buffer_size: 1 << 31,
+            },
+            device_limits: SizeLimits {
+                max_storage_buffer_binding_size: 1 << 27,
+                max_buffer_size: 1 << 28,
+            },
+            arena_realised_bytes: None,
+        };
+        let config = crate::config::parse("?latency_ms=33").unwrap();
+        assert_eq!(
+            render(&env, &config, &full_outcome()),
+            include_str!("report/full.txt")
+        );
+        assert_eq!(
+            render(
+                &Environment::default(),
+                &Config::default(),
+                &Outcome::default()
+            ),
+            include_str!("report/empty.txt")
+        );
+        let config = crate::config::parse("?sync=onbeat&bpm=100&beats=300").unwrap();
+        let outcome = Outcome {
+            on_beat: Some(onbeat::Summary {
+                bpm: 100.0,
+                beat_us: 600_000,
+                margin_us: 100_000,
+                beats_asked: Some(300),
+                beats_elapsed: 300,
+                ..onbeat::Summary::default()
+            }),
+            ..full_outcome()
+        };
+        assert_eq!(
+            render(&env, &config, &outcome),
+            include_str!("report/onbeat.txt")
+        );
+    }
+
     #[test]
     fn every_line_is_one_name_and_one_value() {
         let text = report(&Environment::default(), &Outcome::default());
@@ -1473,24 +1570,6 @@ mod tests {
             Some("timings=0 span_us none per_dispatch_us=none")
         );
         assert_eq!(lines.last(), Some(&"status: done"));
-    }
-
-    #[test]
-    fn the_promise_and_the_period_follow_the_display() {
-        assert_eq!(promised_latency_ms(0, NOMINAL_PERIOD), 0.0);
-        assert!((promised_latency_ms(5, NOMINAL_PERIOD) - 83.335).abs() < 1e-9);
-        assert!((promised_latency_ms(2, Micros::new(8_333)) - 16.666).abs() < 1e-9);
-        let period = NOMINAL_PERIOD;
-        let over = [
-            period.get() - 1,
-            period.get(),
-            period.get() + 1,
-            period.get() * 2,
-        ];
-        assert_eq!(gpu_frames_over_period(&over, period), 2);
-        assert_eq!(gpu_frames_over_period(&over, Micros::new(8_333)), 4);
-        assert_eq!(delivery_rate(0, 0), None);
-        assert_eq!(delivery_rate(5, 0), Some(1.0));
     }
 
     #[test]

@@ -156,6 +156,11 @@ and this project adheres to
   derived from the window) and the four bare estimator presets live once in
   `beatlm_host::presets`; the per-slice sample cutoff is one
   `beatlm_host::stats::MIN_SAMPLES`. Every value is unchanged.
+- The report lines both hosts write come from one writer,
+  `beatlm_host::report`, pinned by golden tests of each host's full report.
+  In the page's report `frame_ratio` and `frame_scale` moved from after
+  `job_estimate_us` to after the `pass_overlap_*` lines, where the bench
+  writes them; no other line changed name, order or format.
 
 ### Fixed
 

@@ -206,8 +206,9 @@
 //!
 //! The finding of the lines above, that slow measurements come by frame, is
 //! what `estimator=frame-scaled` plans for (`beatlm_core::cost`, "Planning a
-//! frame against its total"). Two lines, written for every run with
-//! timestamps and named and formatted as the bench's, say what it read:
+//! frame against its total"). Two of the lines the report shares with the
+//! bench ([`beatlm_host::report`]), written for every run with timestamps,
+//! say what it read:
 //!
 //! - `frame_ratio`: for each timed frame that ran slices, their measured time
 //!   over the sum of the estimates they were planned with, with how many
