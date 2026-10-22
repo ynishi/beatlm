@@ -22,9 +22,13 @@
 //!   compute kernel per slice and one render pass, and the render order;
 //! - [`slots`]: a lowered program realised with one input and one output slot
 //!   per job in flight ([`slots::Net`]), which the depth model runs through;
-//! - [`frame`]: the pieces of a frame's step that read no clock: the label a
-//!   timed slice carries, the render's budget and forecast, the admission of
-//!   an input, and the timer's capacity;
+//! - [`step`]: the frame's step itself ([`step::FrameStep`]): it plans each
+//!   frame, labels its timed passes, takes the timings that come back, counts
+//!   deliveries and misses, and closes the run into the numbers the shared
+//!   report lines are written from;
+//! - [`frame`]: the rules the step is made of: the label a timed slice
+//!   carries, the render's budget and forecast, the admission of an input,
+//!   and the timer's capacity;
 //! - [`pass_cost`]: the `pass-cost` workload's encoding, cells and lines;
 //! - [`pass_overlap`]: the `pass_overlap_*` lines, read from a frame's
 //!   timestamps;
@@ -50,6 +54,12 @@
 //! own, needs no executor and starts no thread, so it builds for
 //! `wasm32-unknown-unknown`; `just wasm-check` lints it there on every change.
 //!
+//! **What a host keeps is what only it has**: its clock and pacing, its
+//! device, timer and surface, how it waits (the bench blocks on the device for
+//! its warm-up and drain, a page cannot), its I/O and the report lines only it
+//! writes. What it does with the frame's plan and timings between those is
+//! the [`step`]'s.
+//!
 //! # Why a crate of its own
 //!
 //! These files were the bench's, and the browser host compiled them from the
@@ -59,11 +69,6 @@
 //! The bench cannot lend them as a library: it reads `Instant`, which panics
 //! on `wasm32-unknown-unknown`, and turns on wgpu's `counters` feature, which
 //! a dependency on it would turn on in the browser build too.
-//!
-//! The rest of the frame's bookkeeping that both hosts do (the delivery and
-//! miss counts, what each measurement feeds) is written in each host;
-//! `beatlm-web`'s crate documentation ("What is shared with the bench") says
-//! why.
 //!
 //! The crate is not published (`publish = false`): its API is the two hosts'
 //! and changes with them.
@@ -78,4 +83,5 @@ pub mod presets;
 pub mod report;
 pub mod slots;
 pub mod stats;
+pub mod step;
 pub mod workload;

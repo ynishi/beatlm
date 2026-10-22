@@ -115,6 +115,7 @@ use beatlm_core::time::Micros;
 use beatlm_host::presets::MARGIN_US;
 use beatlm_host::report::{self, write_summary};
 use beatlm_host::stats::{nearest_rank, share, summarize};
+use beatlm_host::step::Tally;
 use beatlm_host::workload::{DEFAULT_RENDER_ITERS, DEFAULT_SLICE_ITERS};
 
 use crate::config::{Config, Model, SLICES, estimator_name};
@@ -284,10 +285,9 @@ pub struct Outcome {
     pub encode_us: Vec<u64>,
     /// Inside `queue.submit`, in microseconds.
     pub submit_us: Vec<u64>,
-    /// Compute dispatches encoded in each frame.
-    pub dispatches_per_frame: Vec<u64>,
-    /// Compute dispatches encoded for each delivered job.
-    pub dispatches_per_job: Vec<u64>,
+    /// What the frame's step counted and sampled, which the shared lines are
+    /// written from.
+    pub tally: Tally,
     /// How late each frame's callback came after the time the previous
     /// callback and the periods its gap counted as put it at, in microseconds
     /// ([`crate::pace`] defines it).
@@ -306,9 +306,6 @@ pub struct Outcome {
     /// and the margin), in microseconds: what `capacity_frames_needed` takes
     /// its median of.
     pub expected_budget_us: Vec<u64>,
-    /// Render plus every slice measured in the same frame, per timed frame, in
-    /// microseconds.
-    pub gpu_frame_us: Vec<u64>,
     /// The render pass's measured GPU time in each timed frame that ran no
     /// slice, in microseconds: the render's own cost.
     pub render_alone_us: Vec<u64>,
@@ -318,34 +315,8 @@ pub struct Outcome {
     /// takes the render measured, shrinks by it
     /// ([`RenderCost`](beatlm_host::frame::RenderCost)).
     pub render_with_slices_us: Vec<u64>,
-    /// The longest compute pass measured in each timed frame that ran one, in
-    /// microseconds.
-    pub longest_dispatch_us: Vec<u64>,
-    /// Latency in frames of each delivered result.
-    pub latencies: Vec<u64>,
-    /// Inputs submitted as jobs: one per frame.
-    pub submitted: u64,
-    /// Results delivered.
-    pub delivered: u64,
-    /// Deadlines that arrived without a complete result.
-    pub missed: u64,
-    /// The part of `missed` that belongs to jobs submitted in the first
-    /// [`STARTUP_FRAMES`](beatlm_host::presets::STARTUP_FRAMES) frames.
-    pub startup_missed: u64,
-    /// Deliveries whose latency was not the promised one.
-    pub violations: u64,
-    /// Jobs still awaiting their deadline when the run ended.
-    pub pending_at_end: usize,
-    /// Per slice: sum and count of measured microseconds.
-    pub measured: BTreeMap<SliceId, (u64, u64)>,
-    /// Per slice: the cost model's final estimate.
-    pub estimates: BTreeMap<SliceId, Micros>,
     /// What the timer could not measure.
     pub timer: TimerStats,
-    /// Every timed frame's passes with their timestamps, for the
-    /// `pass_overlap_*` lines ([`beatlm_host::pass_overlap`]); recorded for every
-    /// run, the synthetic workload's too.
-    pub pass_frames: Vec<beatlm_host::pass_overlap::Frame>,
     /// Frames whose canvas texture could not be acquired, so their render pass
     /// did not run.
     pub canvas_unavailable: u64,
@@ -514,23 +485,23 @@ fn write_report(
     }
     // The lines the bench's report shares (`beatlm_host::report`), at the
     // display's period; the summaries passed in are the browser's own.
-    let d = &outcome.diagnosis;
+    let (d, t) = (&outcome.diagnosis, &outcome.tally);
     report::write_lines(
         out,
         &report::Lines {
             latency: outcome.on_beat.is_none().then_some(outcome.latency),
             period: period_of(outcome),
             dropped: outcome.dropped,
-            submitted: outcome.submitted,
-            delivered: outcome.delivered,
-            missed: outcome.missed,
-            startup_missed: outcome.startup_missed,
-            pending_at_end: outcome.pending_at_end,
-            violations: outcome.violations,
+            submitted: t.submitted,
+            delivered: t.delivered,
+            missed: t.missed,
+            startup_missed: t.startup_missed,
+            pending_at_end: t.pending_at_end,
+            violations: t.violations,
             timer: outcome.timer,
-            latencies: &outcome.latencies,
-            dispatches_per_job: &outcome.dispatches_per_job,
-            dispatches_per_frame: &outcome.dispatches_per_frame,
+            latencies: &t.latencies,
+            dispatches_per_job: &t.dispatches_per_job,
+            dispatches_per_frame: &t.dispatches_per_frame,
             after_dispatches: &[("callback_interval_us", &outcome.interval_us)],
             lateness_us: &outcome.lateness_us,
             cpu_us: &outcome.cpu_us,
@@ -539,20 +510,20 @@ fn write_report(
             plan_us: &outcome.plan_us,
             encode_us: &outcome.encode_us,
             submit_us: &outcome.submit_us,
-            gpu_frame_us: &outcome.gpu_frame_us,
+            gpu_frame_us: &t.gpu_frame_us,
             after_gpu_frame: &[
                 ("gpu_render_alone_us", &outcome.render_alone_us),
                 ("gpu_render_with_slices_us", &outcome.render_with_slices_us),
             ],
-            longest_dispatch_us: &outcome.longest_dispatch_us,
-            pass_frames: &outcome.pass_frames,
-            frame_ratios: &d.frame_ratios,
-            frame_scale: d.frame_scale,
-            frames_recorded: d.frames_recorded,
-            frame_scales: &d.frame_scales,
+            longest_dispatch_us: &t.longest_dispatch_us,
+            pass_frames: &t.pass_frames,
+            frame_ratios: &t.frame_ratios,
+            frame_scale: t.frame_scale,
+            frames_recorded: t.frames_recorded,
+            frame_scales: &t.frame_scales,
         },
     )?;
-    report::write_slices(out, &outcome.estimates, &outcome.measured)?;
+    report::write_slices(out, &t.estimates, &t.measured)?;
     write_diagnosis(out, d)?;
     if let Some(depth) = &outcome.depth {
         write_tail(out, depth, outcome)?;
@@ -634,6 +605,7 @@ fn write_diagnosis(out: &mut String, d: &Diagnosis) -> std::fmt::Result {
 /// measurements come from", says what each line tests).
 fn write_tail(out: &mut String, depth: &DepthReport, outcome: &Outcome) -> std::fmt::Result {
     let estimates: BTreeMap<SliceId, u64> = outcome
+        .tally
         .estimates
         .iter()
         .map(|(&slice, estimate)| (slice, estimate.get()))
@@ -869,10 +841,10 @@ fn write_depth(out: &mut String, depth: &DepthReport, outcome: &Outcome) -> std:
         side: depth.side,
         latency: outcome.latency,
         period,
-        gpu_frame_p99: summarize(&outcome.gpu_frame_us).map(|s| s.p99),
-        violations: outcome.violations,
-        delivered: outcome.delivered,
-        missed: outcome.missed,
+        gpu_frame_p99: summarize(&outcome.tally.gpu_frame_us).map(|s| s.p99),
+        violations: outcome.tally.violations,
+        delivered: outcome.tally.delivered,
+        missed: outcome.tally.missed,
         unstarted: outcome.diagnosis.unstarted,
         job_estimate_us: outcome.diagnosis.job_estimate_us,
         run_us: summarize(&depth.runs_us).map(|s| s.p50),
@@ -891,8 +863,8 @@ fn write_depth(out: &mut String, depth: &DepthReport, outcome: &Outcome) -> std:
         )?;
     }
     let capacity = Capacity::of(
-        &outcome.measured,
-        outcome.estimates.len(),
+        &outcome.tally.measured,
+        outcome.tally.estimates.len(),
         summarize(&outcome.expected_budget_us).map(|s| s.p50),
         outcome.latency,
     );
@@ -1088,11 +1060,14 @@ mod tests {
     fn the_lines_shared_with_the_bench_have_its_names_and_formats() {
         let outcome = Outcome {
             cpu_us: vec![900, 1_100, 1_000],
-            gpu_frame_us: vec![6_000, 17_000, 7_000],
-            latencies: vec![2, 2, 2],
-            submitted: 3,
-            delivered: 3,
-            missed: 1,
+            tally: Tally {
+                gpu_frame_us: vec![6_000, 17_000, 7_000],
+                latencies: vec![2, 2, 2],
+                submitted: 3,
+                delivered: 3,
+                missed: 1,
+                ..Tally::default()
+            },
             ..Outcome::default()
         };
         let text = report(&Environment::default(), &outcome);
@@ -1132,28 +1107,31 @@ mod tests {
         let q = 65_536;
         let span = |begin_ns, end_ns| PassSpan { begin_ns, end_ns };
         let outcome = Outcome {
-            pass_frames: vec![
-                Frame {
-                    index: 0,
-                    compute: vec![Pass {
-                        slice: SliceId::new(0),
-                        us: 655,
-                        span: span(3 * q, 13 * q),
-                    }],
-                    render: Some(span(10 * q, 41 * q)),
-                },
-                // The next frame's slice began two steps before the render
-                // above ended.
-                Frame {
-                    index: 1,
-                    compute: vec![Pass {
-                        slice: SliceId::new(0),
-                        us: 655,
-                        span: span(39 * q, 49 * q),
-                    }],
-                    render: None,
-                },
-            ],
+            tally: Tally {
+                pass_frames: vec![
+                    Frame {
+                        index: 0,
+                        compute: vec![Pass {
+                            slice: SliceId::new(0),
+                            us: 655,
+                            span: span(3 * q, 13 * q),
+                        }],
+                        render: Some(span(10 * q, 41 * q)),
+                    },
+                    // The next frame's slice began two steps before the render
+                    // above ended.
+                    Frame {
+                        index: 1,
+                        compute: vec![Pass {
+                            slice: SliceId::new(0),
+                            us: 655,
+                            span: span(39 * q, 49 * q),
+                        }],
+                        render: None,
+                    },
+                ],
+                ..Tally::default()
+            },
             ..Outcome::default()
         };
         let text = report(&Environment::default(), &outcome);
@@ -1318,10 +1296,6 @@ mod tests {
                 .into_iter()
                 .collect(),
                 job_estimate_us: (8_000, 6_400),
-                frame_ratios: vec![1.1, 0.9, 1.25],
-                frame_scales: vec![1.0, 1.2],
-                frame_scale: FrameScale::Measured(1.2),
-                frames_recorded: 70,
                 ..Diagnosis::default()
             },
             cpu_us: vec![900, 1_100, 1_000],
@@ -1329,45 +1303,51 @@ mod tests {
             plan_us: vec![50, 60, 55],
             encode_us: vec![100, 110, 105],
             submit_us: vec![30, 40, 35],
-            dispatches_per_frame: vec![4, 4, 3],
-            dispatches_per_job: vec![4, 4],
+            tally: Tally {
+                dispatches_per_frame: vec![4, 4, 3],
+                dispatches_per_job: vec![4, 4],
+                gpu_frame_us: vec![6_000, 17_000, 7_000],
+                longest_dispatch_us: vec![1_500, 1_600],
+                latencies: vec![2, 2, 3],
+                submitted: 3,
+                delivered: 2,
+                missed: 1,
+                startup_missed: 1,
+                violations: 1,
+                pending_at_end: 2,
+                measured: [(SliceId::new(0), (3_000, 2))].into_iter().collect(),
+                estimates: [
+                    (SliceId::new(0), Micros::new(1_600)),
+                    (SliceId::new(1), Micros::new(2_000)),
+                ]
+                .into_iter()
+                .collect(),
+                frame_ratios: vec![1.1, 0.9, 1.25],
+                frame_scales: vec![1.0, 1.2],
+                frame_scale: FrameScale::Measured(1.2),
+                frames_recorded: 70,
+                pass_frames: vec![Frame {
+                    index: 0,
+                    compute: vec![Pass {
+                        slice: SliceId::new(0),
+                        us: 655,
+                        span: span(3 * q, 13 * q),
+                    }],
+                    render: Some(span(10 * q, 41 * q)),
+                }],
+            },
             lateness_us: vec![0, 10, 500],
             dropped: 1,
             display_period_us: Some(16_667),
             interval_us: vec![16_600, 16_700, 33_400],
             expected_budget_us: vec![12_000, 12_500],
-            gpu_frame_us: vec![6_000, 17_000, 7_000],
             render_alone_us: vec![400],
             render_with_slices_us: vec![500, 650],
-            longest_dispatch_us: vec![1_500, 1_600],
-            latencies: vec![2, 2, 3],
-            submitted: 3,
-            delivered: 2,
-            missed: 1,
-            startup_missed: 1,
-            violations: 1,
-            pending_at_end: 2,
-            measured: [(SliceId::new(0), (3_000, 2))].into_iter().collect(),
-            estimates: [
-                (SliceId::new(0), Micros::new(1_600)),
-                (SliceId::new(1), Micros::new(2_000)),
-            ]
-            .into_iter()
-            .collect(),
             timer: TimerStats {
                 frames_skipped: 1,
                 frames_collected: 3,
                 frames_failed: 0,
             },
-            pass_frames: vec![Frame {
-                index: 0,
-                compute: vec![Pass {
-                    slice: SliceId::new(0),
-                    us: 655,
-                    span: span(3 * q, 13 * q),
-                }],
-                render: Some(span(10 * q, 41 * q)),
-            }],
             canvas_unavailable: 1,
             gpu_errors: 0,
             on_beat: None,
@@ -1578,7 +1558,10 @@ mod tests {
         let outcome = Outcome {
             display_period_us: Some(8_333),
             interval_us: vec![8_300, 8_400, 8_333],
-            gpu_frame_us: vec![8_000, 9_000],
+            tally: Tally {
+                gpu_frame_us: vec![8_000, 9_000],
+                ..Tally::default()
+            },
             ..Outcome::default()
         };
         let text = report(&Environment::default(), &outcome);
@@ -1619,8 +1602,11 @@ mod tests {
             latency_asked_us: Some(83_335),
             latency_period_us: Some(8_333),
             display_period_us: Some(8_333),
-            gpu_frame_us: vec![7_000, 7_500],
-            delivered: 50,
+            tally: Tally {
+                gpu_frame_us: vec![7_000, 7_500],
+                delivered: 50,
+                ..Tally::default()
+            },
             depth: Some(DepthReport {
                 side: 266,
                 weights_url: "models/depth-anything-v2-small/model.safetensors".to_owned(),
@@ -1728,7 +1714,10 @@ mod tests {
                 frames,
                 ..Diagnosis::default()
             },
-            estimates: BTreeMap::from([(SliceId::new(0), Micros::new(1_000))]),
+            tally: Tally {
+                estimates: BTreeMap::from([(SliceId::new(0), Micros::new(1_000))]),
+                ..Tally::default()
+            },
             depth: Some(DepthReport {
                 parts_us: vec![vec![500; 4]],
                 ..DepthReport::default()
@@ -1797,14 +1786,17 @@ mod tests {
             latency: 10,
             display_period_us: Some(8_333),
             expected_budget_us: vec![2_000, 4_334, 4_400, 4_334, 4_300],
-            measured: BTreeMap::from([
-                (SliceId::new(0), (54_000, 2)),
-                (SliceId::new(1), (27_000, 1)),
-            ]),
-            estimates: BTreeMap::from([
-                (SliceId::new(0), Micros::new(27_500)),
-                (SliceId::new(1), Micros::new(27_000)),
-            ]),
+            tally: Tally {
+                measured: BTreeMap::from([
+                    (SliceId::new(0), (54_000, 2)),
+                    (SliceId::new(1), (27_000, 1)),
+                ]),
+                estimates: BTreeMap::from([
+                    (SliceId::new(0), Micros::new(27_500)),
+                    (SliceId::new(1), Micros::new(27_000)),
+                ]),
+                ..Tally::default()
+            },
             depth: Some(DepthReport::default()),
             ..Outcome::default()
         };

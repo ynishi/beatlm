@@ -11,9 +11,8 @@
 //! inside a frame, for the CPU times the report quotes, which are durations on
 //! one clock and need no frame time.
 //!
-//! The frame's work is the bench's synchronous `tick` (`beatlm-bench`'s
-//! `engine.rs`): the same budget and forecast, admission and timer capacity
-//! ([`beatlm_host::frame`]), the same scheduler and cost model, one timed
+//! The frame's work is the bench's synchronous `tick`: the same step
+//! ([`FrameStep`], which [`beatlm_host::step`] says how to drive), one timed
 //! compute pass per slice handed out and one timed render pass; the crate
 //! documentation says what differs and why. The job is the synthetic one or
 //! the depth model ([`Load`]). The depth model's slices are its kernels' parts
@@ -34,22 +33,18 @@
 //! and miss is recorded for the report.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use beatlm::gpu::{FrameTiming, MAX_SLICES, PassSpan, SliceTimer};
-use beatlm_core::budget::Budget;
-use beatlm_core::cost::{CostModel, Estimator, FrameScale, SliceId};
-use beatlm_core::schedule::{Due, FramePlan, Scheduler, SliceRun};
+use beatlm_core::cost::{CostModel, Estimator, SliceId};
+use beatlm_core::schedule::{Due, FramePlan, SliceRun};
 use beatlm_core::sync::{MissPolicy, SyncPolicy};
 use beatlm_core::time::{BeatGrid, FrameIndex, FrameInfo, Micros, TimePoint};
-use beatlm_host::frame::{
-    Admission, InFlight, RenderCost, Submit, Tag, jobs_with_slices, timer_capacity,
-};
-use beatlm_host::presets::{MARGIN_US, RENDER_PRIOR, SLICE_PRIOR, STARTUP_FRAMES};
+use beatlm_host::frame::{InFlight, Submit, Tag, jobs_with_slices, timer_capacity};
+use beatlm_host::presets::{MARGIN_US, SLICE_PRIOR};
 use beatlm_host::slots::Net;
-use beatlm_host::stats::frame_ratio;
+use beatlm_host::step::{FrameStep, StepConfig, Submitted};
 use beatlm_host::workload::Workload;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
@@ -165,9 +160,6 @@ pub struct Host {
     gpu: Gpu,
     workload: Workload,
     load: Load,
-    /// Whether the load's rule takes a frame's input; on beat, an input is
-    /// also owed and its slot free.
-    admission: Admission,
     /// Whether the display holds a delivered depth, the last one delivered:
     /// false until the first delivery.
     shown: bool,
@@ -175,15 +167,9 @@ pub struct Host {
     period: Option<Micros>,
     /// `None` when the device has no timestamp queries.
     timer: Option<SliceTimer<Tag>>,
-    scheduler: Scheduler,
-    cost: CostModel,
-    /// The render's measurements, which set the budgets.
-    render: RenderCost,
-    slices: Vec<SliceId>,
-    margin: Micros,
-    latency: u32,
-    /// Dispatches encoded so far for each job not yet delivered or missed.
-    job_dispatches: BTreeMap<u64, u64>,
+    /// The scheduler, the cost model and what they counted. Its admission is
+    /// the load's rule; on beat, an input is also owed and its slot free.
+    step: FrameStep,
     pacer: Pacer,
     performance: web_sys::Performance,
     /// When the first callback after the last frame began, in microseconds.
@@ -246,7 +232,6 @@ impl Host {
         } else {
             None
         };
-        let margin = Micros::new(MARGIN_US);
         let prior = run.period.unwrap_or(NOMINAL_PERIOD);
         let policy = match &run.on_beat {
             Some(on_beat) => SyncPolicy::OnBeat {
@@ -262,12 +247,18 @@ impl Host {
                 frames: run.latency,
             },
         };
-        let scheduler = Scheduler::new(
-            policy,
-            MissPolicy::HoldPrevious,
-            // Before the display's period is known, the prior; every frame
-            // sets its own budget from the period measured by then.
-            Budget::for_frame(prior, RENDER_PRIOR, margin),
+        let step = FrameStep::new(
+            StepConfig {
+                policy,
+                miss: MissPolicy::HoldPrevious,
+                slices,
+                margin: Micros::new(MARGIN_US),
+                // Before the display's period is known, the prior; every frame
+                // sets its own budget from the period measured by then.
+                prior_period: prior,
+                submit,
+            },
+            cost,
         );
         let performance = page::window()?
             .performance()
@@ -276,22 +267,19 @@ impl Host {
             gpu,
             workload,
             load: run.load,
-            admission: Admission::new(submit),
             shown: false,
             asked: run.asked,
             period: run.period,
             timer,
-            scheduler,
-            cost,
-            render: RenderCost::default(),
-            slices: (0..slices).map(SliceId::new).collect(),
-            margin,
-            latency: run.latency,
-            job_dispatches: BTreeMap::new(),
+            step,
             pacer: Pacer::with_prior(run.frames, prior),
             performance,
             drain_from_us: None,
-            outcome: Outcome::default(),
+            // On beat, replaced at the end by the frames the beats allow.
+            outcome: Outcome {
+                latency: run.latency,
+                ..Outcome::default()
+            },
             current_frame: 0,
             previous_start_us: None,
             on_beat: run.on_beat.map(|on_beat| OnBeatHost {
@@ -353,46 +341,34 @@ impl Host {
             Some(on_beat) => {
                 let owed = beat_step(
                     on_beat,
-                    &mut self.scheduler,
+                    &mut self.step,
                     &self.pacer,
                     &self.performance,
                     start,
                 )?;
-                // Jobs are numbered in submission order from zero, so the
-                // next one's number is the count submitted.
-                owed && on_beat.beats.slot_free(self.outcome.submitted)
+                owed && on_beat.beats.slot_free(self.step.submitted())
             }
             None => true,
         };
 
         let planning = self.performance.now();
-        // This frame's budget and the forecast of the frames to come, at the
-        // display's measured period; `RenderCost` says why the two differ.
-        let budget = self.render.budget(start.period, self.margin);
-        let forecast = self.render.expected(start.period, self.margin);
-        self.scheduler.set_expected_budget(forecast);
-        self.outcome.expected_budget_us.push(forecast.get().get());
-        let new_job = if owed && self.admission.takes_input() {
-            let job = self
-                .scheduler
-                .submit(frame, self.slices.clone(), &self.cost)
-                .context("the scheduler rejected the frame's job")?;
-            if let (Some(on_beat), Some(Due::Beat(due))) =
-                (&mut self.on_beat, self.scheduler.due(job))
-            {
-                on_beat.beats.submitted(job.get(), due.get());
-            }
-            Some(job)
-        } else {
-            None
-        };
-        let plan = self.scheduler.plan_frame(frame, budget, &self.cost);
+        // At the display's measured period.
+        let planned = self.step.plan(frame, owed)?;
+        self.outcome
+            .expected_budget_us
+            .push(planned.expected().get().get());
+        if let (Some(on_beat), Some(job), Some(Due::Beat(due))) =
+            (&mut self.on_beat, planned.job(), planned.due())
+        {
+            on_beat.beats.submitted(job.get(), due.get());
+        }
+        let plan = planned.plan();
         self.current_frame = start.index;
         // The render pass shows what this frame delivers: the slot of the job
         // the display copies in this frame, after the slices that may finish
         // it and before the render pass.
         let delivering = match &self.load {
-            Load::Depth(depth) => delivered_now(&plan).map(|job| depth.net.slot_of(job.get())),
+            Load::Depth(depth) => delivered_now(plan).map(|job| depth.net.slot_of(job.get())),
             Load::Synthetic => None,
         };
         self.shown |= delivering.is_some();
@@ -416,18 +392,11 @@ impl Host {
                 .texture
                 .create_view(&wgpu::TextureViewDescriptor::default())
         });
-        // The estimates the plan was made with; nothing records into the cost
-        // model before the frame is encoded.
-        let cost = &self.cost;
         let resolved = match &mut self.timer {
             Some(timer) => {
                 let mut timestamps = timer.begin_frame(frame.index);
                 for run in &plan.runs {
-                    let writes = timestamps.compute_pass((
-                        run.job,
-                        run.slice,
-                        cost.frame_estimate(run.slice),
-                    ))?;
+                    let writes = timestamps.compute_pass(self.step.tag(run))?;
                     encode_slice(&self.load, &self.workload, &mut encoder, run, writes)?;
                 }
                 encode_delivery(&self.load, &mut encoder, delivering);
@@ -480,28 +449,20 @@ impl Host {
         self.outcome.plan_us.push(between(planning, encoding));
         self.outcome.encode_us.push(between(encoding, submitting));
         self.outcome.submit_us.push(between(submitting, submitted));
-        self.outcome
-            .dispatches_per_frame
-            .push(plan.runs.len() as u64);
-        if let FrameScale::Measured(scale) = self.cost.frame_scale() {
-            self.outcome.diagnosis.frame_scales.push(scale);
-        }
-        if new_job.is_some() {
-            self.outcome.submitted += 1;
-        }
-        self.admission
-            .planned(new_job.map(|job| (job, self.slices.len())), &plan);
         // After the frame's CPU times are taken, so the diagnosis is not
-        // charged to `cpu_plan_us`, the bench's line; before the slices are
-        // counted, which it reads.
-        self.diagnose(start.index, &plan, budget.get(), forecast.get());
-        for run in &plan.runs {
-            *self.job_dispatches.entry(run.job.get()).or_default() += 1;
-        }
+        // charged to `cpu_plan_us`, the bench's line; before the step counts
+        // the frame, since it reads the dispatches of the frames before.
+        self.diagnose(
+            start.index,
+            plan,
+            planned.budget().get(),
+            planned.expected().get(),
+        );
+        let submitted_frame = self.step.after_submit(planned);
         self.outcome.cpu_us.push(between(began, submitted));
 
         self.read_back();
-        self.complete(start, &plan);
+        self.complete(start, submitted_frame);
         self.previous_start_us = Some(start.start_us);
         self.outcome
             .tick_us
@@ -509,7 +470,7 @@ impl Host {
         Ok(())
     }
 
-    /// Feeds every frame whose map has completed to the cost model and the
+    /// Feeds every frame whose map has completed to the frame's step and the
     /// report. The map of the frame just submitted was requested with its
     /// submission.
     ///
@@ -521,22 +482,17 @@ impl Host {
             None => return,
         };
         for timing in ready {
-            let lag = self.current_frame.saturating_sub(timing.frame.get());
-            self.outcome.diagnosis.lag_frames.push(lag);
-            self.absorb(timing);
+            self.absorb(&timing);
         }
     }
 
     /// Records why the plan's misses were missed, what the projection read for
     /// a job abandoned before it started, and which jobs started, before the
-    /// frame's slices are counted ([`crate::diagnosis`]).
+    /// step counts the frame's slices ([`FrameStep::dispatched`];
+    /// [`crate::diagnosis`]).
     fn diagnose(&mut self, index: u64, plan: &FramePlan, now: Micros, expected: Micros) {
         for missed in &plan.missed {
-            let dispatched = self
-                .job_dispatches
-                .get(&missed.job.get())
-                .copied()
-                .unwrap_or(0);
+            let dispatched = self.step.dispatched(missed.job);
             let due = match missed.due {
                 Due::Frame(due) => due.get(),
                 Due::Beat(_) => index,
@@ -544,12 +500,8 @@ impl Host {
             let reason = diagnosis::reason(dispatched, due, index);
             self.outcome.diagnosis.missed(reason);
             if reason == Reason::Unstarted {
-                // What the projection read: the planning estimates.
-                let estimates: Vec<Micros> = self
-                    .slices
-                    .iter()
-                    .map(|&s| self.cost.planning_estimate(s))
-                    .collect();
+                // What the projection read.
+                let estimates = planning_estimates(&self.step);
                 self.outcome.diagnosis.abandoned.push(Unstarted {
                     frame: index,
                     now_us: now.get(),
@@ -564,7 +516,7 @@ impl Host {
         let mut started: Vec<u64> = Vec::new();
         for run in &plan.runs {
             let job = run.job.get();
-            if !self.job_dispatches.contains_key(&job) && !started.contains(&job) {
+            if self.step.dispatched(run.job) == 0 && !started.contains(&job) {
                 started.push(job);
                 self.outcome.diagnosis.starts.push(index);
             }
@@ -574,19 +526,17 @@ impl Host {
     /// The sum of every slice's planning estimate now: the job as the
     /// projection sees it.
     fn job_estimate(&self) -> u64 {
-        self.slices
-            .iter()
-            .map(|&s| self.cost.planning_estimate(s).get())
-            .sum()
+        planning_estimates(&self.step).iter().map(|e| e.get()).sum()
     }
 
-    /// Delivers the plan's results and counts its misses; on beat, records
+    /// Has the step count the frame's deliveries and misses; on beat, records
     /// the jobs whose last slice ran, and where each result landed.
-    fn complete(&mut self, start: FrameStart, plan: &FramePlan) {
-        let index = start.index;
+    fn complete(&mut self, start: FrameStart, submitted: Submitted) {
+        let plan = self.step.complete(submitted);
         if let Some(on_beat) = &mut self.on_beat {
+            let slices = self.step.slices().len();
             for run in &plan.runs {
-                if run.position + 1 == self.slices.len() {
+                if run.position + 1 == slices {
                     on_beat.beats.completed(run.job.get(), start.start_us);
                 }
             }
@@ -604,87 +554,38 @@ impl Host {
                 }
             }
         }
-        for delivery in &plan.delivered {
-            let latency = index.saturating_sub(delivery.input.get());
-            self.outcome.latencies.push(latency);
-            self.outcome.delivered += 1;
-            // On beat there is no latency in frames to keep.
-            if self.on_beat.is_none() && latency != u64::from(self.latency) {
-                self.outcome.violations += 1;
-            }
-            let dispatches = self.job_dispatches.remove(&delivery.job.get()).unwrap_or(0);
-            self.outcome.dispatches_per_job.push(dispatches);
-        }
-        for missed in &plan.missed {
-            self.job_dispatches.remove(&missed.job.get());
-            if missed.input.get() < STARTUP_FRAMES {
-                self.outcome.startup_missed += 1;
-            }
-        }
-        self.outcome.missed += plan.missed.len() as u64;
     }
 
-    /// Feeds one frame's measurements to the cost model and the report: each
-    /// slice's, then the frame's measured slice time against the estimates
-    /// its timed slices were planned with.
-    fn absorb(&mut self, timing: FrameTiming<Tag>) {
+    /// Feeds one frame's measurements to the frame's step, and records the
+    /// page's own readings of it: how late it was collected, its passes for
+    /// the diagnosis and the `tail_*` lines, and its render alone or with
+    /// slices.
+    fn absorb(&mut self, timing: &FrameTiming<Tag>) {
         let passes: Vec<(SliceId, Micros)> = timing
             .compute
             .iter()
             .map(|&((_, slice, _), duration)| (slice, duration))
             .collect();
         self.outcome.diagnosis.passes(&passes);
-        self.outcome
-            .pass_frames
-            .push(beatlm_host::pass_overlap::Frame::of(
-                &timing,
-                |&(_, slice, _)| slice,
-            ));
         // Only a depth run writes the `tail_*` lines that read them.
         if matches!(self.load, Load::Depth(_)) {
-            self.outcome.diagnosis.frames.push(timed(&timing));
+            self.outcome.diagnosis.frames.push(timed(timing));
         }
-        let mut gpu = Micros::ZERO;
-        // The ratio's two sides, over the timed slices that had a frame
-        // estimate when the frame was planned.
-        let (mut predicted, mut in_ratio) = (Micros::ZERO, Micros::ZERO);
-        for ((_, slice, planned), duration) in &timing.compute {
-            self.cost.record(*slice, *duration);
-            let entry = self.outcome.measured.entry(*slice).or_insert((0, 0));
-            entry.0 = entry.0.saturating_add(duration.get());
-            entry.1 += 1;
-            gpu = gpu.saturating_add(*duration);
-            if let Some(planned) = planned {
-                predicted = predicted.saturating_add(*planned);
-                in_ratio = in_ratio.saturating_add(*duration);
-            }
-        }
-        if !timing.compute.is_empty() {
-            self.cost.record_frame(predicted, in_ratio);
-            if let Some(ratio) = frame_ratio(predicted, in_ratio) {
-                self.outcome.diagnosis.frame_ratios.push(ratio);
-            }
-        }
-        if let Some(longest) = timing.compute.iter().map(|(_, d)| d.get()).max() {
-            self.outcome.longest_dispatch_us.push(longest);
-        }
-        if let Some(render) = timing.render {
-            self.render.record(render);
-            if timing.compute.is_empty() {
-                self.outcome.render_alone_us.push(render.get());
-            } else {
+        let absorbed = self.step.absorb(timing);
+        let lag = self.current_frame.saturating_sub(absorbed.frame.get());
+        self.outcome.diagnosis.lag_frames.push(lag);
+        if let Some(render) = absorbed.render {
+            if absorbed.ran_slices {
                 self.outcome.render_with_slices_us.push(render.get());
+            } else {
+                self.outcome.render_alone_us.push(render.get());
             }
-            self.outcome
-                .gpu_frame_us
-                .push(gpu.saturating_add(render).get());
         }
     }
 
     /// Closes the run and returns what it measured.
     fn finish(mut self) -> Outcome {
         self.outcome.diagnosis.job_estimate_us.1 = self.job_estimate();
-        self.outcome.latency = self.latency;
         if let Some(asked) = self.asked {
             self.outcome.latency_asked_us = Some(asked.get());
             self.outcome.latency_period_us = self.period.map(Micros::get);
@@ -696,17 +597,10 @@ impl Host {
         self.outcome.lateness_us = self.pacer.lateness_us().to_vec();
         self.outcome.display_period_us = self.pacer.measured_period().map(Micros::get);
         self.outcome.interval_us = self.pacer.intervals_us().to_vec();
-        self.outcome.pending_at_end = self.scheduler.pending();
         if let Some(timer) = &self.timer {
             self.outcome.timer = timer.stats();
         }
-        for &slice in &self.slices {
-            self.outcome
-                .estimates
-                .insert(slice, self.cost.estimate(slice));
-        }
-        self.outcome.diagnosis.frame_scale = self.cost.frame_scale();
-        self.outcome.diagnosis.frames_recorded = self.cost.frames_recorded();
+        self.outcome.tally = self.step.finish();
         self.outcome.gpu_errors = device::gpu_errors();
         if let Some(on_beat) = &self.on_beat {
             on_beat.audio.close();
@@ -724,6 +618,16 @@ impl Host {
     }
 }
 
+/// Each slice's planning estimate now, in order: the job as the projection
+/// reads it.
+fn planning_estimates(step: &FrameStep) -> Vec<Micros> {
+    let cost = step.cost();
+    step.slices()
+        .iter()
+        .map(|&slice| cost.planning_estimate(slice))
+        .collect()
+}
+
 /// The on-beat step at the start of a frame: reads the audio clock, puts in
 /// effect the grids the beats decide on, and schedules the clicks to come.
 /// Whether an input is owed.
@@ -734,7 +638,7 @@ impl Host {
 /// refuses.
 fn beat_step(
     on_beat: &mut OnBeatHost,
-    scheduler: &mut Scheduler,
+    step: &mut FrameStep,
     pacer: &Pacer,
     performance: &web_sys::Performance,
     start: FrameStart,
@@ -750,8 +654,7 @@ fn beat_step(
         .frame(start.start_us)
         .map_err(|error| anyhow!("cannot make the beat grid: {error}"))?;
     for (from, grid) in decided.grids {
-        scheduler
-            .replace_beat_grid(from, grid)
+        step.replace_beat_grid(from, grid)
             .context("the scheduler refused the beat grid")?;
     }
     // Inputs at beats 0 to `beats - 1` are placed up to beat `beats`.

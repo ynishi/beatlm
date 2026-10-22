@@ -1,5 +1,5 @@
-//! The pieces of a frame's step that read no clock, which both hosts take
-//! each frame or at setup: the label a timed slice carries ([`Tag`]), the
+//! The rules a frame's step is made of, which [`crate::step`] takes each
+//! frame and a host at setup: the label a timed slice carries ([`Tag`]), the
 //! render pass's budget and forecast ([`RenderCost`]), whether a frame's input
 //! becomes a job ([`Admission`]), and how many slices the loop's timer must
 //! hold ([`timer_capacity`], [`jobs_with_slices`]).
@@ -51,8 +51,8 @@ pub type Tag = (JobId, SliceId, Option<Micros>);
 /// for each delivered. Since, a job with no job behind it is kept, as every
 /// job of the [`Submit::Free`] admission is, and runs in the frames whose own
 /// budget has room, so the alternation halves what is delivered instead. The
-/// test `a_render_that_waits_for_the_slices_slows_the_jobs` shows it on the
-/// scheduler alone. It was suspected of the depth model's
+/// test `a_render_that_waits_for_the_slices_slows_the_jobs` of
+/// [`crate::step`] shows it on the step alone. It was suspected of the depth model's
 /// collapse in Chrome and measured not to be it: with the display reading no
 /// buffer a slice writes, the render measured p50 1 245 µs in frames with
 /// slices and 1 901 µs without (Chrome 154, WebGPU, Apple M1 Pro, 120 Hz,
@@ -159,7 +159,7 @@ impl Submit {
 }
 
 /// Whether a frame's input becomes a job: the [`Submit`] rule, kept apart
-/// from the device so a test can drive it against the scheduler alone. A
+/// from the device so a test can drive it without one ([`crate::step`]). A
 /// host may hold an input back for reasons of its own besides (a page's
 /// on-beat run submits only when a beat is owed one); this says only what the
 /// rule allows.
@@ -262,10 +262,6 @@ pub const fn jobs_with_slices(submit: Submit, in_flight: InFlight) -> Option<u32
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use beatlm_core::cost::{CostModel, Estimator};
-    use beatlm_core::schedule::Scheduler;
-    use beatlm_core::sync::{MissPolicy, SyncPolicy};
-    use beatlm_core::time::{FrameIndex, FrameInfo, TimePoint};
 
     #[test]
     fn the_budget_follows_the_last_render_and_the_forecast_the_median() {
@@ -289,87 +285,6 @@ mod tests {
             render.record(Micros::new(2_000));
         }
         assert_eq!(render.forecast(), Micros::new(2_000));
-    }
-
-    /// What a simulated run delivered and missed.
-    #[derive(Debug)]
-    struct Delivery {
-        delivered: u64,
-        missed: u64,
-    }
-
-    /// The depth model's loop on the scheduler alone, at the period, margin
-    /// and latency of the Chrome run that collapsed (8 300 µs, 2 ms, 25
-    /// frames), with the [`Submit::Free`] admission, a job of 160 slices of
-    /// about 29 ms, estimated at what they take, and a render pass of
-    /// 1 900 µs whose measurement also counts the frame's slices when
-    /// `waits` is set. Each frame's measurements reach the budget the next
-    /// frame, as readbacks arrive between callbacks.
-    fn simulate(waits: bool, frames: u64) -> Delivery {
-        let (period, margin, render_us) = (Micros::new(8_300), Micros::new(2_000), 1_900);
-        let costs: Vec<u64> = (0..160).map(|i| [60, 120, 180, 240, 300][i % 5]).collect();
-        let slices: Vec<SliceId> = (0..160).map(SliceId::new).collect();
-        let mut cost = CostModel::new(Micros::new(2_000), Estimator::default()).unwrap();
-        for _ in 0..32 {
-            for (slice, &us) in slices.iter().zip(&costs) {
-                cost.record(*slice, Micros::new(us));
-            }
-        }
-        let mut scheduler = Scheduler::new(
-            SyncPolicy::FixedLatency { frames: 25 },
-            MissPolicy::HoldPrevious,
-            Budget::for_frame(period, RENDER_PRIOR, margin),
-        );
-        let mut render = RenderCost::default();
-        let mut admission = Admission::new(Submit::Free);
-        let mut measured = None;
-        let mut delivery = Delivery {
-            delivered: 0,
-            missed: 0,
-        };
-        for index in 0..frames {
-            if let Some(us) = measured.take() {
-                render.record(Micros::new(us));
-            }
-            let frame = FrameInfo {
-                index: FrameIndex::new(index),
-                start: TimePoint::new(index * period.get()),
-                period,
-            };
-            scheduler.set_expected_budget(render.expected(period, margin));
-            let job = if admission.takes_input() {
-                Some(scheduler.submit(frame, slices.clone(), &cost).unwrap())
-            } else {
-                None
-            };
-            let plan = scheduler.plan_frame(frame, render.budget(period, margin), &cost);
-            let ran: u64 = plan
-                .runs
-                .iter()
-                .map(|run| costs[run.slice.get() as usize])
-                .sum();
-            measured = Some(render_us + if waits { ran } else { 0 });
-            admission.planned(job.map(|job| (job, slices.len())), &plan);
-            delivery.delivered += plan.delivered.len() as u64;
-            delivery.missed += plan.missed.len() as u64;
-        }
-        delivery
-    }
-
-    #[test]
-    fn a_render_that_waits_for_the_slices_slows_the_jobs() {
-        // A job of 29 ms over budgets of 4.4 ms takes 7 frames, so a 25-frame
-        // promise is met by every job when the render is measured alone...
-        let alone = simulate(false, 3_000);
-        assert_eq!((alone.delivered, alone.missed), (425, 0), "{alone:?}");
-        // ...and when its measurement carries the slices the frames alternate
-        // between full and empty, and the forecast median, a render that fills
-        // the period, leaves no expected frame room for a slice. The job, with
-        // none behind it, is kept and runs in the full frames: every promise
-        // is still met, at about half the rate. Before #41 it was abandoned
-        // and more than three jobs were missed for each delivered.
-        let waits = simulate(true, 3_000);
-        assert_eq!((waits.delivered, waits.missed), (218, 0), "{waits:?}");
     }
 
     #[test]
@@ -407,70 +322,5 @@ mod tests {
         let one = jobs_with_slices(Submit::Free, InFlight::Latency(10)).unwrap();
         assert_eq!(timer_capacity(155, one), Some(155));
         assert_eq!(timer_capacity(MAX_SLICES + 1, one), None);
-    }
-
-    /// The scheduler alone, for `frames` frames of a 10 ms budget, expected
-    /// and real, with jobs of `slices` slices each estimated at 1 ms, under
-    /// latency `k` and `submit`: how many inputs were submitted, delivered and
-    /// missed. The period, which a budget given outright does not read, is
-    /// the bench's.
-    fn schedule_alone(submit: Submit, slices: u32, k: u32, frames: u64) -> (u64, u64, u64) {
-        const PERIOD: Micros = Micros::new(16_667);
-        let cost = CostModel::new(
-            Micros::new(1_000),
-            Estimator::MeanPlusSigmas {
-                alpha: 1.0,
-                sigmas: 0.0,
-            },
-        )
-        .unwrap();
-        let policy = SyncPolicy::FixedLatency { frames: k };
-        let budget = Budget::new(Micros::new(10_000));
-        let mut scheduler = Scheduler::new(policy, MissPolicy::HoldPrevious, budget);
-        let mut admission = Admission::new(submit);
-        let job: Vec<SliceId> = (0..slices).map(SliceId::new).collect();
-        let (mut submitted, mut delivered, mut missed) = (0, 0, 0);
-        for i in 0..frames {
-            let frame = FrameInfo {
-                index: FrameIndex::new(i),
-                start: TimePoint::new(i * PERIOD.get()),
-                period: PERIOD,
-            };
-            let new_job = admission.takes_input().then(|| {
-                submitted += 1;
-                let id = scheduler.submit(frame, job.clone(), &cost).unwrap();
-                (id, job.len())
-            });
-            let plan = scheduler.plan_frame(frame, budget, &cost);
-            admission.planned(new_job, &plan);
-            delivered += plan.delivered.len() as u64;
-            missed += plan.missed.len() as u64;
-        }
-        (submitted, delivered, missed)
-    }
-
-    #[test]
-    fn a_job_longer_than_a_frame_misses_most_inputs_when_every_frame_submits_and_none_when_free() {
-        // 45 ms of work at 10 ms a frame is five frames, and latency 5 gives
-        // a job six. Every frame's input: a job whose projection behind the
-        // unfinished work ahead does not fit its six frames is abandoned once
-        // the next frame's input queues behind it, and the inputs that fit are
-        // delivered; the last input, with nothing behind it, is still pending
-        // when the run ends. Before jobs were abandoned each kept job held the
-        // budget to its deadline, the one behind started too late, and this
-        // delivered 1 and missed 114. Until #41 a job was abandoned in the
-        // frame it arrived, the last one too, and this missed 93.
-        assert_eq!(schedule_alone(Submit::Every, 45, 5, 120), (120, 26, 92));
-        // Only once the last job's slices are all handed out: one input every
-        // five frames, and every deadline that arrived is met.
-        assert_eq!(schedule_alone(Submit::Free, 45, 5, 120), (24, 23, 0));
-        // At latency 3 a job gets four frames and needs five. With no job
-        // behind it, it is kept: it runs four frames' slices, so they are
-        // measured, and is missed at its deadline, and the frame after takes
-        // the next input: one in four is submitted, and every one is missed.
-        // Until #41 each was missed in the frame it was submitted, without
-        // running a slice, and every frame took an input: 120 submitted, 120
-        // missed.
-        assert_eq!(schedule_alone(Submit::Free, 45, 3, 120), (30, 0, 30));
     }
 }

@@ -226,14 +226,15 @@
 //!   plans made with a measured scale (`planned_scaled`) with its min, p50,
 //!   p90 and max over them.
 //!
-//! The ratios are recorded host-side for the report, apart from the cost
-//! model's own window, which the report does not read.
+//! The ratios are recorded for the report by the frame's step
+//! ([`beatlm_host::step::Tally`]), apart from the cost model's own window,
+//! which the report does not read.
 
 pub mod tail;
 
 use std::collections::BTreeMap;
 
-use beatlm_core::cost::{FrameScale, SliceId};
+use beatlm_core::cost::SliceId;
 use beatlm_core::time::Micros;
 
 /// Why a job was missed.
@@ -340,16 +341,6 @@ pub struct Diagnosis {
     /// lines ([`tail`]); recorded for a depth run only, the one that writes
     /// them.
     pub frames: Vec<tail::TimedFrame>,
-    /// Per timed frame whose slices were planned at more than zero: their
-    /// measured time over the sum of their estimates when the frame was
-    /// planned, for the `frame_ratio` line.
-    pub frame_ratios: Vec<f64>,
-    /// The frame scale of each plan made with a measured one.
-    pub frame_scales: Vec<f64>,
-    /// The frame scale when the run ended.
-    pub frame_scale: FrameScale,
-    /// Frames the cost model folded into its frame scale.
-    pub frames_recorded: u64,
 }
 
 impl Diagnosis {

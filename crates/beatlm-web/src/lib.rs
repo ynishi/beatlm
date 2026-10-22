@@ -417,7 +417,8 @@
 //! # The host's side of a frame, in a browser
 //!
 //! The order is the one the `beatlm` crate documentation sets out ("The host's
-//! side of a frame"), and each step is the bench's synchronous `tick`. One
+//! side of a frame"), and each step is the bench's synchronous `tick`: the
+//! deciding and the counting are the [`beatlm_host::step`] both drive. One
 //! `requestAnimationFrame` callback runs:
 //!
 //! 0. **Pace.** The callback is the frame. Give the pacer the callback's
@@ -528,24 +529,25 @@
 //!
 //! # What is shared with the bench
 //!
-//! The load, the depth model's slots, the pieces of the frame's step that
-//! read no clock (the budget and forecast, the admission of an input, the
-//! timer's capacity), the pass-cost measurement, the report's shared lines
-//! and its statistics come from [`beatlm_host`], the crate both hosts depend
-//! on, whose documentation lists what it holds; so the two hosts time the
-//! same kernels at the same sizes, decide a frame from the same rules and
-//! quote the same statistic. The model, its loader and its reference
-//! comparison come from `beatlm::model` and `beatlm::load`, the kernels from
-//! `beatlm::codegen`, the timer, the limits and the arenas from `beatlm::gpu`,
-//! and the decisions from `beatlm_core`.
+//! The load, the depth model's slots, the frame's step (its plan, the labels
+//! of its timed passes, what each measurement feeds, the delivery and miss
+//! counts, and the rules it is made of), the timer's capacity, the pass-cost
+//! measurement, the report's shared lines and its statistics come from
+//! [`beatlm_host`], the crate both hosts depend on, whose documentation lists
+//! what it holds; so the two hosts time the same kernels at the same sizes,
+//! decide and count a frame the same way and quote the same statistic. The
+//! model, its loader and its reference comparison come from `beatlm::model`
+//! and `beatlm::load`, the kernels from `beatlm::codegen`, the timer, the
+//! limits and the arenas from `beatlm::gpu`, and the decisions from
+//! `beatlm_core`.
 //!
-//! The rest of the frame's bookkeeping — the delivery and miss counts, what
-//! each measurement feeds — and calibration's two passes follow the bench's
-//! `engine.rs` and `calibrate.rs`, and a change to one is owed to the other.
-//! They are written twice because the bench's engine reads
-//! `std::time::Instant` and blocks on the device for its warm-up and drain,
-//! neither of which exists in a page, and carries the planned workloads and
-//! the bench's options.
+//! What the page keeps around the step is what only a page has: the
+//! `requestAnimationFrame` loop and its pacer, `performance.now()`, the canvas
+//! and the display, the timer it may lack, the beats, the diagnosis of the
+//! misses, and a warm-up, a calibration and a drain that wait on the event
+//! loop rather than block. Calibration's two passes follow the bench's
+//! `calibrate.rs` in that form: the bench blocks on the device between them,
+//! which a page cannot.
 //!
 //! # Builds
 //!
