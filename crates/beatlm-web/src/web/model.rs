@@ -296,7 +296,7 @@ async fn measure(
 }
 
 /// Fails once the device has been lost.
-fn lost() -> Result<()> {
+pub(super) fn lost() -> Result<()> {
     match device::device_lost() {
         Some(lost) => bail!("the device was lost: {lost}"),
         None => Ok(()),
@@ -305,7 +305,7 @@ fn lost() -> Result<()> {
 
 /// The canvas's texture for this frame and a view of it, when the canvas has
 /// one to give.
-fn canvas_texture(gpu: &Gpu) -> Option<(wgpu::SurfaceTexture, wgpu::TextureView)> {
+pub(super) fn canvas_texture(gpu: &Gpu) -> Option<(wgpu::SurfaceTexture, wgpu::TextureView)> {
     match gpu.surface.get_current_texture() {
         wgpu::CurrentSurfaceTexture::Success(texture)
         | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => {

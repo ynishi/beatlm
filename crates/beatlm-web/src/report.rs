@@ -354,12 +354,70 @@ pub fn render(env: &Environment, config: &Config, outcome: &Outcome) -> String {
     out
 }
 
-fn write_report(
+/// What a `model=pass-cost` run measured besides its cells' samples.
+#[derive(Debug, Clone, Default)]
+pub struct PassCostOutcome {
+    /// Frames encoded, the untimed round included.
+    pub frames: u64,
+    /// What the timer could and could not read.
+    pub timer: TimerStats,
+    /// Frames of `render=on` whose canvas texture could not be acquired, so
+    /// their render pass did not run.
+    pub canvas_unavailable: u64,
+    /// Errors the device reported outside an error scope during the run.
+    pub gpu_errors: u64,
+}
+
+/// Renders the summary of a finished `model=pass-cost` run: the lines every
+/// report starts with, then the bench's lines for the workload
+/// ([`crate::pass_cost`] defines them), then `status: done`.
+#[must_use]
+pub fn render_pass_cost(
+    env: &Environment,
+    config: &Config,
+    settings: &crate::pass_cost::Settings,
+    measurements: &crate::pass_cost::Measurements,
+    outcome: &PassCostOutcome,
+) -> String {
+    let mut out = String::new();
+    // Writing to a String cannot fail.
+    let _ = write_pass_cost(&mut out, env, config, settings, measurements, outcome);
+    out
+}
+
+fn write_pass_cost(
     out: &mut String,
     env: &Environment,
     config: &Config,
-    outcome: &Outcome,
+    settings: &crate::pass_cost::Settings,
+    measurements: &crate::pass_cost::Measurements,
+    outcome: &PassCostOutcome,
 ) -> std::fmt::Result {
+    write_environment(out, env)?;
+    write!(
+        out,
+        "config: workload=pass-cost frames={} render_iters={DEFAULT_RENDER_ITERS}",
+        config.frames
+    )?;
+    // As the bench's line has them with `--kernels depth`; the page always
+    // fuses.
+    if let crate::pass_cost::Dispatches::Depth { side } = settings.dispatches {
+        write!(out, " size={side} fusion=on")?;
+    }
+    writeln!(out)?;
+    writeln!(out, "frames: {}", outcome.frames)?;
+    writeln!(out, "timings_collected: {}", outcome.timer.frames_collected)?;
+    writeln!(out, "timings_skipped: {}", outcome.timer.frames_skipped)?;
+    writeln!(out, "timings_failed: {}", outcome.timer.frames_failed)?;
+    writeln!(out, "canvas_unavailable: {}", outcome.canvas_unavailable)?;
+    writeln!(out, "gpu_errors: {}", outcome.gpu_errors)?;
+    measurements.write_report(out, settings)?;
+    writeln!(out, "status: done")
+}
+
+/// The lines every report starts with: where the run happened and what the
+/// device was created with.
+fn write_environment(out: &mut String, env: &Environment) -> std::fmt::Result {
     writeln!(out, "run: 1/1")?;
     writeln!(out, "adapter: {}", reported(&env.adapter))?;
     writeln!(out, "backend: {}", reported(&env.backend))?;
@@ -380,6 +438,16 @@ fn write_report(
     if let Some(bytes) = env.arena_realised_bytes {
         writeln!(out, "arena_realised_bytes: {bytes}")?;
     }
+    Ok(())
+}
+
+fn write_report(
+    out: &mut String,
+    env: &Environment,
+    config: &Config,
+    outcome: &Outcome,
+) -> std::fmt::Result {
+    write_environment(out, env)?;
     let (slices, submit) = match (&outcome.depth, &config.on_beat) {
         (Some(depth), None) => (depth.kernels, "free"),
         (None, None) => (SLICES, "every"),
@@ -420,7 +488,8 @@ fn write_report(
             out,
             " workload=depth size={side} fusion=on split=on max_dispatch_us={MAX_DISPATCH_US}"
         )?,
-        Model::Synthetic => writeln!(out)?,
+        // A pass-cost run is reported by `render_pass_cost`, never here.
+        Model::Synthetic | Model::PassCost(_) => writeln!(out)?,
     }
     if let Some(us) = outcome.latency_asked_us {
         writeln!(out, "latency_asked_ms: {}", milliseconds(us))?;
@@ -1246,6 +1315,46 @@ mod tests {
             line(&report(&env, &Outcome::default()), "timestamp_query"),
             Some("available")
         );
+    }
+
+    #[test]
+    fn a_pass_cost_report_starts_as_every_report_and_ends_done() {
+        let config = crate::config::parse("?model=pass-cost&frames=2&passes=1,4").unwrap();
+        let Model::PassCost(settings) = &config.model else {
+            panic!("expected pass-cost");
+        };
+        let measurements = crate::pass_cost::Measurements::new(settings.cells(), config.frames);
+        let env = Environment {
+            adapter: "Apple M1 Pro".to_owned(),
+            timestamp_query: true,
+            ..Environment::default()
+        };
+        let outcome = PassCostOutcome {
+            frames: 24,
+            ..PassCostOutcome::default()
+        };
+        let text = render_pass_cost(&env, &config, settings, &measurements, &outcome);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            &lines[..3],
+            ["run: 1/1", "adapter: Apple M1 Pro", "backend: unreported"]
+        );
+        assert_eq!(
+            line(&text, "config"),
+            Some("workload=pass-cost frames=2 render_iters=50")
+        );
+        assert_eq!(line(&text, "frames"), Some("24"));
+        assert_eq!(line(&text, "timings_skipped"), Some("0"));
+        assert!(
+            line(&text, "pass_cost_config")
+                .unwrap()
+                .starts_with("frames_per_cell=2 cells=8 order=interleaved kernels=trivial")
+        );
+        assert_eq!(
+            line(&text, "pass_cost[one-pass,4]"),
+            Some("timings=0 span_us none per_dispatch_us=none")
+        );
+        assert_eq!(lines.last(), Some(&"status: done"));
     }
 
     #[test]

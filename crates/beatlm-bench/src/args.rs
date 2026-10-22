@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use beatlm_core::kernel::Fusion;
 
+use crate::pass_cost::{self, DEFAULT_DEPTH_SIDE, Dispatches};
 use crate::workload::{DEFAULT_RENDER_ITERS, DEFAULT_SLICE_ITERS};
 
 /// The usage text, printed for `--help` and after a bad option.
@@ -19,15 +20,16 @@ usage: beatlm-bench [options]
   --slice-iters N   loop iterations per invocation of a slice kernel
   --render-iters N  loop iterations per pixel of the render pass
   --margin-us N     safety margin in the frame budget, us  (default 2000)
-  --workload W      synthetic, net or depth                (default synthetic)
+  --workload W      synthetic, net, depth or pass-cost     (default synthetic)
   --submit S        when a frame submits its input as a job: every frame,
                     or free, only once the last job's slices are all handed
                     out                                    (default every;
                     depth: free)
-  --size N          depth only: input side in pixels, a multiple of 14
-                                                           (default 266)
-  --fusion F        net and depth: fuse element-wise operations into the
-                    kernel before them, on or off          (default on)
+  --size N          depth, and pass-cost with --kernels depth: input side in
+                    pixels, a multiple of 14   (default 266; pass-cost: 112)
+  --fusion F        net, depth, and pass-cost with --kernels depth: fuse
+                    element-wise operations into the kernel before them, on
+                    or off                                 (default on)
   --dump-wgsl DIR   net only: write each generated kernel's WGSL into DIR
                     before the run
   --max-dispatch-us N  net and depth: calibrate each kernel before the run,
@@ -45,6 +47,17 @@ usage: beatlm-bench [options]
                     same adapter, from before the first frame to after the last
   --background-iters N  loop iterations per invocation of the competing load's
                     kernel                                  (default 4000)
+
+  pass-cost only (--frames is then frames per cell; --runs and
+  --render-iters apply, the loop's other options do not):
+  --passes LIST     dispatches per frame, comma-separated  (default 1,8,32,128)
+  --variants LIST   per-pass, ends, one-pass, every:<k>    (default
+                    per-pass,ends,one-pass,every:8)
+  --kernels K       what each dispatch runs: trivial, or depth, the first
+                    kernels of the depth model             (default trivial)
+  --groups N        trivial only: workgroups per dispatch  (default 1)
+  --render R        end each frame with the render pass, on or off
+                                                           (default off)
   --help            print this text";
 
 /// Loop iterations per invocation of the competing load's kernel; see the
@@ -162,6 +175,9 @@ pub enum WorkloadKind {
     /// per kernel like the network: [`crate::depth::kernel_count`] slices for
     /// `--size` and `--fusion`.
     Depth,
+    /// The measurement of what a compute pass costs (`pass_cost.rs`): no job,
+    /// no scheduler, no promise, so the loop's options do not apply.
+    PassCost,
 }
 
 /// The spelling `--fusion` accepts and the report prints.
@@ -179,6 +195,7 @@ impl WorkloadKind {
             Self::Synthetic => "synthetic",
             Self::Net => "net",
             Self::Depth => "depth",
+            Self::PassCost => "pass-cost",
         }
     }
 
@@ -230,6 +247,8 @@ pub struct Args {
     pub background_load: bool,
     /// Loop iterations per invocation of the competing load's kernel.
     pub background_iters: u32,
+    /// What `--workload pass-cost` measures; unused by the other workloads.
+    pub pass_cost: pass_cost::Settings,
 }
 
 impl Default for Args {
@@ -252,6 +271,7 @@ impl Default for Args {
             estimator: EstimatorKind::Quantile,
             background_load: false,
             background_iters: DEFAULT_BACKGROUND_ITERS,
+            pass_cost: pass_cost::Settings::default(),
         }
     }
 }
@@ -273,7 +293,8 @@ pub enum Command {
 ///
 /// An unknown option, a missing or malformed value, a value out of range
 /// (zero frames, zero slices or zero runs, a depth size that is not whole
-/// patches), or an option of the `net` or `depth` workload without it.
+/// patches), an option of the `net`, `depth` or `pass-cost` workload without
+/// it, or an option of the loop with `pass-cost`.
 pub fn parse<I>(args: I) -> Result<Command>
 where
     I: IntoIterator<Item = String>,
@@ -287,6 +308,9 @@ where
     let mut submit_given = false;
     let mut bound_given: Option<u64> = None;
     let mut split_given: Option<bool> = None;
+    let mut given: Vec<String> = Vec::new();
+    let mut kernels_depth = false;
+    let mut groups = 1;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let (name, inline) = match arg.split_once('=') {
@@ -296,6 +320,7 @@ where
         if name == "--help" || name == "-h" {
             return Ok(Command::Help);
         }
+        given.push(name.clone());
         let mut value = || -> Result<String> {
             match inline.clone() {
                 Some(v) => Ok(v),
@@ -339,6 +364,25 @@ where
                 out.background_iters = number(&name, &value()?)?;
                 background_iters_given = true;
             }
+            "--passes" => {
+                out.pass_cost.passes =
+                    pass_cost::parse_passes(&value()?).with_context(|| name.clone())?;
+            }
+            "--variants" => {
+                out.pass_cost.variants =
+                    pass_cost::parse_variants(&value()?).with_context(|| name.clone())?;
+            }
+            "--kernels" => {
+                kernels_depth = match value()?.as_str() {
+                    "trivial" => false,
+                    "depth" => true,
+                    other => bail!("--kernels: {other:?} is not one of trivial, depth"),
+                };
+            }
+            "--groups" => {
+                groups = pass_cost::parse_groups(&value()?).with_context(|| name.clone())?;
+            }
+            "--render" => out.pass_cost.render = on_off(&name, &value()?)?,
             _ => bail!("unknown option {name}"),
         }
     }
@@ -356,6 +400,38 @@ where
     }
     if background_iters_given && !out.background_load {
         bail!("--background-iters has no effect without --background-load");
+    }
+    let seen =
+        |names: &[&'static str]| names.iter().copied().find(|n| given.iter().any(|g| g == n));
+    if out.workload == WorkloadKind::PassCost {
+        // Nothing is scheduled, so the loop's options would be silently
+        // ignored; they are refused instead.
+        if let Some(name) = seen(&LOOP_ONLY) {
+            bail!("{name} has no effect with --workload pass-cost, which schedules nothing");
+        }
+        if !kernels_depth && (size_given || fusion_given) {
+            bail!("--size and --fusion have no effect without --kernels depth");
+        }
+        if kernels_depth && seen(&["--groups"]).is_some() {
+            bail!("--groups has no effect with --kernels depth");
+        }
+        if kernels_depth {
+            if !size_given {
+                out.size = DEFAULT_DEPTH_SIDE;
+            }
+            out.pass_cost.dispatches = Dispatches::Depth { side: out.size };
+            // A pass count above the model's kernels is refused here, before
+            // the device opens and the weights load.
+            let kernels = crate::depth::kernel_count(out.size, out.fusion)?;
+            out.pass_cost
+                .check_kernels(usize::try_from(kernels).unwrap_or(usize::MAX))?;
+        } else {
+            out.pass_cost.dispatches = Dispatches::Trivial { groups };
+        }
+        return Ok(Command::Run(out));
+    }
+    if let Some(name) = seen(&PASS_COST_ONLY) {
+        bail!("{name} has no effect without --workload pass-cost");
     }
     if size_given && out.workload != WorkloadKind::Depth {
         bail!("--size has no effect without --workload depth");
@@ -407,6 +483,31 @@ where
     Ok(Command::Run(out))
 }
 
+/// The options of the loop, which `--workload pass-cost` refuses.
+const LOOP_ONLY: [&str; 12] = [
+    "--latency",
+    "--slices",
+    "--slice-iters",
+    "--margin-us",
+    "--submit",
+    "--mode",
+    "--estimator",
+    "--background-load",
+    "--background-iters",
+    "--max-dispatch-us",
+    "--split",
+    "--dump-wgsl",
+];
+
+/// The options only `--workload pass-cost` reads.
+const PASS_COST_ONLY: [&str; 5] = [
+    "--passes",
+    "--variants",
+    "--kernels",
+    "--groups",
+    "--render",
+];
+
 /// Parses the value of `--submit`.
 fn submit(text: &str) -> Result<Submit> {
     [Submit::Every, Submit::Free]
@@ -438,10 +539,11 @@ fn workload(text: &str) -> Result<WorkloadKind> {
         WorkloadKind::Synthetic,
         WorkloadKind::Net,
         WorkloadKind::Depth,
+        WorkloadKind::PassCost,
     ]
     .into_iter()
     .find(|w| w.name() == text)
-    .with_context(|| format!("--workload: {text:?} is not one of synthetic, net, depth"))
+    .with_context(|| format!("--workload: {text:?} is not one of synthetic, net, depth, pass-cost"))
 }
 
 /// Parses the value of `--estimator`.
@@ -680,6 +782,88 @@ mod tests {
             panic!("expected a run");
         };
         assert_eq!((a.submit, a.latency), (Submit::Free, 2));
+    }
+
+    #[test]
+    fn the_pass_cost_workload_has_its_own_options_and_refuses_the_loops() {
+        let pass_cost = |extra: &[&str]| {
+            let mut all = vec!["--workload", "pass-cost"];
+            all.extend_from_slice(extra);
+            match parse_strs(&all) {
+                Ok(Command::Run(a)) => Ok(a),
+                Ok(Command::Help) => panic!("expected a run"),
+                Err(e) => Err(e),
+            }
+        };
+        let a = pass_cost(&[]).unwrap();
+        assert_eq!(a.workload, WorkloadKind::PassCost);
+        assert_eq!(a.pass_cost, pass_cost::Settings::default());
+        let a = pass_cost(&[
+            "--passes=1,64",
+            "--variants",
+            "per-pass,every:4",
+            "--groups",
+            "16",
+            "--render",
+            "on",
+            "--frames",
+            "300",
+            "--runs",
+            "2",
+            "--render-iters",
+            "10",
+        ])
+        .unwrap();
+        assert_eq!(a.pass_cost.passes, vec![1, 64]);
+        assert_eq!(
+            a.pass_cost.variants,
+            vec![pass_cost::Variant::PerPass, pass_cost::Variant::Every(4)]
+        );
+        assert_eq!(a.pass_cost.dispatches, Dispatches::Trivial { groups: 16 });
+        assert!(a.pass_cost.render);
+        assert_eq!((a.frames, a.runs, a.render_iters), (300, 2, 10));
+        let a = pass_cost(&["--kernels", "depth"]).unwrap();
+        assert_eq!(
+            a.pass_cost.dispatches,
+            Dispatches::Depth {
+                side: DEFAULT_DEPTH_SIDE
+            }
+        );
+        let a = pass_cost(&["--kernels=depth", "--size", "154", "--fusion", "off"]).unwrap();
+        assert_eq!(
+            (a.pass_cost.dispatches, a.fusion),
+            (Dispatches::Depth { side: 154 }, Fusion::Off)
+        );
+        for bad in [
+            &["--passes", "0"][..],
+            &["--passes", "1,1"],
+            &["--variants", "every:0"],
+            &["--variants", "fast"],
+            &["--kernels", "net"],
+            &["--groups", "0"],
+            &["--render", "maybe"],
+            &["--size", "112"],
+            &["--fusion", "off"],
+            &["--kernels", "depth", "--groups", "4"],
+            &["--kernels", "depth", "--size", "100"],
+            // More passes than the model at 112 pixels has kernels.
+            &["--kernels", "depth", "--passes", "1,2000"],
+            &["--latency", "3"],
+            &["--mode", "sync"],
+            &["--estimator", "capped"],
+            &["--split", "off"],
+            &["--background-load"],
+        ] {
+            assert!(pass_cost(bad).is_err(), "{bad:?}");
+        }
+        // Each with a value it accepts, so the refusal is for the workload.
+        for (name, value) in PASS_COST_ONLY
+            .into_iter()
+            .zip(["1", "ends", "trivial", "1", "on"])
+        {
+            assert!(pass_cost(&[name, value]).is_ok(), "{name}");
+            assert!(parse_strs(&[name, value]).is_err(), "{name}");
+        }
     }
 
     #[test]

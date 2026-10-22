@@ -51,7 +51,9 @@
 //! 120 Hz ("Which estimator, measured in a browser"). `sync` chooses the
 //! promise: `latency`, the fixed latency everything above is about and the
 //! default, or `onbeat`, with `bpm`, `bpm_change`, `margin_ms` and `beats`
-//! ("On-beat delivery" below). Anything else in the query is refused.
+//! ("On-beat delivery" below). `model=pass-cost` is no job at all but the
+//! bench's measurement of what a compute pass costs, with parameters of its
+//! own ("What a pass costs" below). Anything else in the query is refused.
 //!
 //! **Serving.** `just serve-web` runs `scripts/serve_web.py`, which serves the
 //! built page at `/` and the models directory at `/models/`
@@ -278,6 +280,121 @@
 //! with no early or late delivery and every miss reported, and what the
 //! landing error is.
 //!
+//! # What a pass costs
+//!
+//! `?model=pass-cost` runs the bench's `pass-cost` workload ([`pass_cost`],
+//! compiled by path, which owns the design and defines the report's lines):
+//! no job, no scheduler and no promise, but frames that each encode `P`
+//! dispatches as one pass each with timestamps on every pass (`per-pass`,
+//! what the engine does), on the ends only (`ends`), on every `k`-th
+//! (`every:<k>`), or as one pass for all (`one-pass`), and read their span on
+//! the GPU and their encode and submit time on `performance.now()`. It is the
+//! first step of #49: in a browser a job's GPU time barely shrinks with the
+//! model's side, and a fixed cost per pass, paid about 155 times a job, is
+//! the reading that would explain it. The bench's crate documentation ("The
+//! `pass-cost` workload") has the native figures.
+//!
+//! The frames are paced by `requestAnimationFrame` and one is in flight at a
+//! time; the page's device has the default limits and needs timestamp
+//! queries, and with `kernels=depth` it fetches the weights and plans the
+//! model as `model=depth` does, with one slot. The report has the shared
+//! first lines, `config`, `frames`, the `timings_*` lines, `canvas_unavailable`
+//! and `gpu_errors`, then [`pass_cost`]'s lines, then `status: done`.
+//!
+//! ```text
+//! http://127.0.0.1:8000/?model=pass-cost&frames=300
+//! http://127.0.0.1:8000/?model=pass-cost&frames=300&passes=1,32,128&variants=per-pass,every:8,every:32,one-pass
+//! http://127.0.0.1:8000/?model=pass-cost&frames=200&kernels=depth&side=112&variants=per-pass,ends,one-pass
+//! http://127.0.0.1:8000/?model=pass-cost&frames=300&variants=per-pass,ends,one-pass&render=on
+//! ```
+//!
+//! The first measures the four variants at 1, 8, 32 and 128 passes, 16
+//! cells of 300 timed frames, about 40 seconds at 120 Hz; the second variant
+//! D beside A and C; the third the depth model's first kernels at 112 pixels,
+//! whose weights it needs (`just setup-depth-anything`), and whose frames of
+//! 128 kernels outlast a period; the fourth the passes with the render pass
+//! after them, as the loop places it. A browser quantises timestamps
+//! ("GPU times" below), so read the derived figures at 32 and 128 passes.
+//!
+//! ## What Chrome measured
+//!
+//! Chrome 154 (WebGPU), macOS, Apple M1 Pro, 120 Hz display, 2026-10-22,
+//! `render` off, cells interleaved, no frame skipped, one run per URL, no run
+//! discarded. Every span was a multiple of 65.5 µs, the step Chrome quantised
+//! the timestamps to in these runs (a span of one trivial pass read 0.0), so
+//! the figures at 8 passes are a step or two and only 32 and 128 are read
+//! below. Spans are medians in µs; the derived columns are the report's, in
+//! µs per pass.
+//!
+//! The first URL above (`?model=pass-cost&frames=300`, trivial kernels, 300
+//! timed frames per cell):
+//!
+//! | Variant, `P` | span | `per_pass_us` / `per_dispatch_us` | `over_one_pass_us` | `over_ends_us` | `between_us` |
+//! |---|---|---|---|---|---|
+//! | `per-pass`, 8 | 262.1 | 37.45 | 28.09 | 28.09 | 131.1 |
+//! | `per-pass`, 32 | 852.0 | 27.48 | 21.14 | 21.14 | 524.3 |
+//! | `per-pass`, 128 | 3604.5 | 28.38 | 23.22 | 22.71 | 2293.8 |
+//! | `ends`, 8 | 65.5 | 9.36 | 0.00 | | |
+//! | `ends`, 32 | 196.6 | 6.34 | 0.00 | | |
+//! | `ends`, 128 | 720.9 | 5.68 | 0.52 | | |
+//! | `one-pass`, 8 | 65.5 | 9.36 | | | |
+//! | `one-pass`, 32 | 196.6 | 6.34 | | | |
+//! | `one-pass`, 128 | 655.4 | 5.16 | | | |
+//! | `every:8`, 8 | 131.1 | 18.72 | 9.36 | | |
+//! | `every:8`, 32 | 327.7 | 10.57 | 4.23 | | |
+//! | `every:8`, 128 | 1245.2 | 9.80 | 4.64 | | |
+//!
+//! At 128 passes, `encode_us` p50 was 1 000 µs for `per-pass` (7.09 per
+//! pass), 900 for `every:8`, 800 for `ends` and 200 for `one-pass`;
+//! `submit_us` was 100 for `per-pass`. Every CPU figure was a multiple of
+//! 100 µs, consistent with the coarsened `performance.now()` above, so these
+//! are coarse.
+//!
+//! The third URL (the depth model's first `P` kernels at 112 pixels, 200 timed
+//! frames per cell), span p50 with p99 where it was taken:
+//!
+//! | `P` | `per-pass` | `ends` | `one-pass` |
+//! |---|---|---|---|
+//! | 1 | 262.1 | 262.1 | 262.1 |
+//! | 8 | 852.0 (1441.8) | 786.4 | 786.4 |
+//! | 32 | 5374.0 (9240.6) | 5832.7 (8060.9) | 5832.7 (8257.5) |
+//! | 128 | 26607.6 (37224.4) | 24248.3 (32571.4) | 25428.0 (33554.4) |
+//!
+//! At 128 kernels `per-pass` had `over_ends_us` 18.58, `over_one_pass_us`
+//! 9.29 and `between_us` 4063.2 at the median, and `encode_us` p50 was 1 500
+//! µs for `per-pass`, 1 200 for `ends` and 500 for `one-pass`. The second URL
+//! (variant D at 32 and 128 beside A and C) and the fourth (`render=on`)
+//! were not run in Chrome.
+//!
+//! What the numbers say, and what they do not (one run each):
+//!
+//! - **In Chrome a separate pass costs almost nothing but its timestamp
+//!   writes.** With trivial kernels at 128 passes, a pair of timestamps on
+//!   every pass cost about 23 µs per pass over the ends only (`over_ends_us`
+//!   22.71), while separate passes with no timestamps of their own cost
+//!   0.52 µs per pass more than one pass. Timing every 8th pass cut the cost
+//!   to 4.64 µs per pass. Natively it is the other way round: a pass boundary
+//!   costs about 30 µs and its timestamps about nothing (the bench's crate
+//!   documentation, "The `pass-cost` workload").
+//! - **On the depth model's kernels the timestamps were about a tenth of the
+//!   span.** At 128 kernels, timestamps on every pass added about 2.4 ms
+//!   (18.58 µs per pass) to a span of 24 to 27 ms. One pass for all (25.4 ms)
+//!   was not faster than separate passes without per-pass timestamps
+//!   (24.2 ms); the difference is inside the noise, as at 32 kernels, where
+//!   the p99s are 38% to 72% above the medians.
+//! - **For #49, merging kernels into fewer passes is not the main lever in
+//!   Chrome.** What a pass costs there is its timestamps, at most about a
+//!   tenth of a job's GPU time on these figures, so pass overhead does not
+//!   explain why a job's GPU time barely shrinks with the model's side; that
+//!   is a reading of one run per configuration, not a measurement of a job.
+//!   If the timestamps' tenth is worth having back, the cheaper lever is
+//!   fewer timestamp pairs (one per frame, or one every `k` slices), which
+//!   trades away the per-slice measurements the cost model plans with.
+//! - **Chrome's spans were not slower than native's**: the depth model's 128
+//!   kernels in one pass took 25.4 ms here against 33.7 and 43.3 ms in the
+//!   two native runs. These are one run each, in different sessions of the
+//!   same day, and they rank nothing.
+//!
 //! # The host's side of a frame, in a browser
 //!
 //! The order is the one the `beatlm` crate documentation sets out ("The host's
@@ -376,8 +493,9 @@
 //! # What is shared with the bench
 //!
 //! The load is the bench's own: [`workload`] and its `shaders.wgsl`, the
-//! depth model's realisation [`slots`], and the percentiles of the report and
-//! calibration's median, are compiled from `beatlm-bench`'s files by path, so
+//! depth model's realisation [`slots`], the pass-cost measurement
+//! [`pass_cost`], and the percentiles of the report and calibration's median,
+//! are compiled from `beatlm-bench`'s files by path, so
 //! the two hosts time the same kernels at the same sizes and quote the same
 //! statistic. The model, its loader and its reference comparison come from
 //! `beatlm::model` and `beatlm::load`, the kernels from `beatlm::codegen`, the
@@ -412,6 +530,10 @@ pub mod depth;
 pub mod diagnosis;
 pub mod onbeat;
 pub mod pace;
+// The bench's measurement of what a compute pass costs, by path, so a page
+// and the bench encode the same passes and report the same lines.
+#[path = "../../beatlm-bench/src/pass_cost.rs"]
+pub mod pass_cost;
 pub mod render_cost;
 pub mod report;
 // The bench's realisation of a program with one slot per job in flight, by

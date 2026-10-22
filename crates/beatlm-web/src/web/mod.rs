@@ -10,6 +10,7 @@ mod fetch;
 mod frame;
 mod model;
 mod page;
+mod pass_cost;
 mod wait;
 
 use anyhow::{Context, Result};
@@ -59,9 +60,18 @@ pub fn start() {
 /// The configuration in one line, for the status the page shows while it
 /// sets up.
 fn describe(config: &Config) -> String {
-    let model = match config.model {
+    let model = match &config.model {
         Model::Synthetic => "model=synthetic".to_owned(),
         Model::Depth { side } => format!("model=depth side={side}"),
+        // No promise and no estimator: the measurement has only its own
+        // settings.
+        Model::PassCost(settings) => {
+            return format!(
+                "model=pass-cost frames={} {}",
+                config.frames,
+                settings.describe()
+            );
+        }
     };
     let latency = match (config.on_beat, config.latency) {
         (Some(on_beat), _) => {
@@ -152,6 +162,10 @@ async fn latency(config: &Config) -> Result<(Option<Micros>, u32)> {
 /// blocks on the device instead. The depth model's setup comes between the
 /// device and the loop ([`depth_load`]).
 async fn setup(mut config: Config) -> Result<()> {
+    // The measurement has no job, promise or audio: it runs apart.
+    if let Model::PassCost(settings) = &config.model {
+        return pass_cost::run(&config, settings).await;
+    }
     // The audio context starts only from a user gesture, so an on-beat run
     // waits for the start button before anything else, and says so.
     let audio = match config.on_beat {
@@ -185,6 +199,7 @@ async fn setup(mut config: Config) -> Result<()> {
         _ => None,
     };
     let (gpu, workload, load) = match config.model {
+        Model::PassCost(_) => anyhow::bail!("the pass-cost measurement runs apart"),
         Model::Synthetic => {
             let need = config.arena_bytes.map_or(Need::Defaults, Need::Arena);
             let gpu = device::open(page::canvas()?, need).await?;
@@ -214,19 +229,7 @@ async fn setup(mut config: Config) -> Result<()> {
         }
     };
 
-    let env = Environment {
-        adapter: gpu.info.name.clone(),
-        backend: gpu.info.backend.to_string(),
-        user_agent: page::window()?
-            .navigator()
-            .user_agent()
-            .map_err(|error| anyhow::anyhow!("cannot read the user agent: {error:?}"))?,
-        date: String::from(js_sys::Date::new_0().to_iso_string()),
-        timestamp_query: gpu.timestamp_query,
-        adapter_limits: gpu.adapter_limits,
-        device_limits: gpu.device_limits,
-        arena_realised_bytes: gpu.arena_realised_bytes,
-    };
+    let env = environment(&gpu)?;
     match config.on_beat {
         Some(_) => page::show(&format!("status: running {}", describe(&config))),
         None => page::show(&format!(
@@ -249,6 +252,28 @@ async fn setup(mut config: Config) -> Result<()> {
     };
     let host = frame::Host::new(gpu, workload, run).context("cannot start the frame loop")?;
     frame::run(host, env, config)
+}
+
+/// Where the run happens and what the device was created with, for the
+/// report's first lines.
+///
+/// # Errors
+///
+/// A page whose user agent cannot be read.
+fn environment(gpu: &device::Gpu) -> Result<Environment> {
+    Ok(Environment {
+        adapter: gpu.info.name.clone(),
+        backend: gpu.info.backend.to_string(),
+        user_agent: page::window()?
+            .navigator()
+            .user_agent()
+            .map_err(|error| anyhow::anyhow!("cannot read the user agent: {error:?}"))?,
+        date: String::from(js_sys::Date::new_0().to_iso_string()),
+        timestamp_query: gpu.timestamp_query,
+        adapter_limits: gpu.adapter_limits,
+        device_limits: gpu.device_limits,
+        arena_realised_bytes: gpu.arena_realised_bytes,
+    })
 }
 
 /// Runs a synthetic slice and render pass once and waits for them.

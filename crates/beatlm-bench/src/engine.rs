@@ -329,7 +329,9 @@ fn planned_program(args: &Args) -> Result<(Program, Numbers)> {
             let shape = net::DEFAULT_SHAPE;
             Ok((net::program(&shape, args.fusion)?, Numbers::net(&shape)))
         }
-        WorkloadKind::Synthetic => anyhow::bail!("the synthetic workload has no program"),
+        WorkloadKind::Synthetic | WorkloadKind::PassCost => {
+            anyhow::bail!("the {} workload has no program", args.workload.name())
+        }
     }
 }
 
@@ -358,7 +360,8 @@ impl<'g> Engine<'g> {
         // there was a calibration.
         let mut measured_cost = None;
         let net = match args.workload {
-            WorkloadKind::Synthetic => None,
+            // `main` runs `pass-cost` through `pass_bench.rs`, never here.
+            WorkloadKind::Synthetic | WorkloadKind::PassCost => None,
             WorkloadKind::Net | WorkloadKind::Depth => {
                 let (whole, numbers) = planned_program(args)?;
                 // The job's kernels before splitting; `args` counted them

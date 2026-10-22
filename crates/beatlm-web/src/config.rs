@@ -11,10 +11,13 @@
 //! - `frames`: frame indices the run lasts, at least one (default
 //!   [`DEFAULT_FRAMES`]).
 //! - `model`: the job, `synthetic` (the default; the bench's busy-loop slices)
-//!   or `depth` (Depth Anything V2 Small, [`crate::depth`]).
+//!   or `depth` (Depth Anything V2 Small, [`crate::depth`]); or `pass-cost`,
+//!   no job at all but the bench's measurement of what a compute pass costs
+//!   ([`crate::pass_cost`]), with parameters of its own (below).
 //! - `side`: the depth model's input side in pixels, a positive multiple of 14
 //!   up to 518 (default [`NATIVE_DEFAULT_SIDE`]).
-//!   Only with `model=depth`.
+//!   Only with `model=depth`, or `model=pass-cost&kernels=depth` (default
+//!   [`crate::pass_cost::DEFAULT_DEPTH_SIDE`] there).
 //! - `latency`: the promised latency in frames, which the display's period
 //!   turns into time.
 //! - `latency_ms`: the promised latency in milliseconds, a decimal; the page
@@ -48,6 +51,23 @@
 //!     it): inputs at the first `beats` beats, the run lasting to the beat
 //!     the last is placed on and a little after
 //!     ([`crate::onbeat::run_frames`]), 1 to [`MAX_BEATS`].
+//!
+//! `model=pass-cost` schedules nothing, so `latency`, `latency_ms`,
+//! `arena_bytes`, `estimator` and `sync` are refused with it; `frames` is the
+//! timed frames of each cell. These apply, each only with it, and spell their
+//! values as the bench's flags of the same names do:
+//!
+//! - `passes`: the dispatches per frame, a comma-separated list (default
+//!   `1,8,32,128`).
+//! - `variants`: `per-pass`, `ends`, `one-pass` and `every:<k>`,
+//!   comma-separated (default all four, `k` 8).
+//! - `kernels`: what each dispatch runs, `trivial` (the default) or `depth`,
+//!   the depth model's first kernels at `side`, whose weights the page then
+//!   fetches as for `model=depth`.
+//! - `groups`: workgroups per trivial dispatch (default 1); not with
+//!   `kernels=depth`.
+//! - `render`: `on` to end each frame with the synthetic render pass, as the
+//!   loop's frames do; `off` (the default).
 //!
 //! # The estimator parameter
 //!
@@ -215,6 +235,7 @@ use crate::onbeat::{
     DEFAULT_BPM, DEFAULT_MARGIN, MAX_BEATS, MAX_BPM, MAX_CHANGE_AFTER_S, MAX_MARGIN, MIN_BPM,
     Tempo, TempoChange,
 };
+use crate::pass_cost::{self, DEFAULT_DEPTH_SIDE, Dispatches};
 
 /// Frames a run lasts when `frames` is not given: the bench's default.
 pub const DEFAULT_FRAMES: u64 = 600;
@@ -262,7 +283,14 @@ pub const DEFAULT_FRAME_QUANTILE: f64 = 0.9;
 /// The parameters the query string accepts, as the error for an unknown one
 /// lists them.
 const PARAMETERS: &str = "frames, model, side, latency, latency_ms, arena_bytes, estimator, \
-                          sync, bpm, bpm_change, margin_ms, beats";
+                          sync, bpm, bpm_change, margin_ms, beats, passes, variants, kernels, \
+                          groups, render";
+
+/// The parameters only `model=pass-cost` reads.
+const PASS_COST_PARAMETERS: [&str; 5] = ["passes", "variants", "kernels", "groups", "render"];
+
+/// The parameters of the loop, which `model=pass-cost` refuses.
+const LOOP_PARAMETERS: [&str; 5] = ["latency", "latency_ms", "arena_bytes", "estimator", "sync"];
 
 /// The parameters only `sync=onbeat` reads.
 const ON_BEAT_PARAMETERS: [&str; 4] = ["bpm", "bpm_change", "margin_ms", "beats"];
@@ -274,7 +302,7 @@ const ESTIMATOR_FORMS: &str = "quantile, quantile:<q>, quantile:<q>:<window>, me
                                frame-scaled:<q>:<frame_window>:<window>";
 
 /// The job each frame submits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Model {
     /// The bench's synthetic slices, `model=synthetic`.
     Synthetic,
@@ -283,6 +311,9 @@ pub enum Model {
         /// The input's side in pixels.
         side: u32,
     },
+    /// No job: the bench's measurement of a compute pass's cost,
+    /// `model=pass-cost`, with what it measures.
+    PassCost(pass_cost::Settings),
 }
 
 /// The promise of the fixed-latency policy, as the query gave it.
@@ -296,7 +327,7 @@ pub enum Latency {
 }
 
 /// A run's configuration.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     /// Frames to run, `frames`; at least one.
     pub frames: u64,
@@ -358,6 +389,10 @@ impl Default for Config {
 pub fn parse(query: &str) -> Result<Config> {
     let mut frames = DEFAULT_FRAMES;
     let mut depth = false;
+    let mut measure_passes = false;
+    let mut settings = pass_cost::Settings::default();
+    let mut kernels_depth = false;
+    let mut groups = 1;
     let mut side = None;
     let mut latency = None;
     let mut latency_ms = None;
@@ -381,10 +416,38 @@ pub fn parse(query: &str) -> Result<Config> {
         match name {
             "frames" => frames = number(name, value)?,
             "model" => {
-                depth = match value {
-                    "synthetic" => false,
+                (depth, measure_passes) = match value {
+                    "synthetic" => (false, false),
+                    "depth" => (true, false),
+                    "pass-cost" => (false, true),
+                    _ => bail!(
+                        "query parameter model: {value:?} is not synthetic, depth or pass-cost"
+                    ),
+                };
+            }
+            "passes" => {
+                settings.passes =
+                    pass_cost::parse_passes(value).context("query parameter passes")?;
+            }
+            "variants" => {
+                settings.variants =
+                    pass_cost::parse_variants(value).context("query parameter variants")?;
+            }
+            "kernels" => {
+                kernels_depth = match value {
+                    "trivial" => false,
                     "depth" => true,
-                    _ => bail!("query parameter model: {value:?} is not synthetic or depth"),
+                    _ => bail!("query parameter kernels: {value:?} is not trivial or depth"),
+                };
+            }
+            "groups" => {
+                groups = pass_cost::parse_groups(value).context("query parameter groups")?;
+            }
+            "render" => {
+                settings.render = match value {
+                    "on" => true,
+                    "off" => false,
+                    _ => bail!("query parameter render: {value:?} is not on or off"),
                 };
             }
             "side" => side = Some(number::<u32>(name, value)?),
@@ -405,6 +468,44 @@ pub fn parse(query: &str) -> Result<Config> {
             "beats" => beats = Some(number::<u64>(name, value)?),
             _ => bail!("unknown query parameter {name:?}; the page accepts {PARAMETERS}"),
         }
+    }
+    if frames == 0 {
+        bail!("frames must be at least 1");
+    }
+    if measure_passes {
+        // Nothing is scheduled, so the loop's parameters would be silently
+        // ignored; they are refused instead.
+        if let Some(name) = LOOP_PARAMETERS.iter().find(|name| seen.contains(name)) {
+            bail!(
+                "query parameter {name} has no effect with model=pass-cost, which schedules nothing"
+            );
+        }
+        if let Some(name) = ON_BEAT_PARAMETERS.iter().find(|name| seen.contains(name)) {
+            bail!("query parameter {name} belongs to on-beat delivery; it needs sync=onbeat");
+        }
+        settings.dispatches = if kernels_depth {
+            if seen.contains(&"groups") {
+                bail!("groups is the trivial kernel's; it has no effect with kernels=depth");
+            }
+            Dispatches::Depth {
+                side: depth_side(side, DEFAULT_DEPTH_SIDE)?,
+            }
+        } else {
+            if side.is_some() {
+                bail!("side is the depth model's input side; it needs kernels=depth here");
+            }
+            Dispatches::Trivial { groups }
+        };
+        return Ok(Config {
+            frames,
+            model: Model::PassCost(settings),
+            ..Config::default()
+        });
+    }
+    if let Some(name) = PASS_COST_PARAMETERS.iter().find(|name| seen.contains(name)) {
+        bail!(
+            "query parameter {name} belongs to the pass-cost measurement; it needs model=pass-cost"
+        );
     }
     let on_beat = if on_beat {
         if latency.is_some() || latency_ms.is_some() {
@@ -433,9 +534,6 @@ pub fn parse(query: &str) -> Result<Config> {
         }
         None
     };
-    if frames == 0 {
-        bail!("frames must be at least 1");
-    }
     if arena_bytes == Some(0) {
         bail!("arena_bytes must be at least 1");
     }
@@ -445,11 +543,9 @@ pub fn parse(query: &str) -> Result<Config> {
                 "arena_bytes checks the synthetic workload's limits; the depth model's plan sets its own"
             );
         }
-        let side = side.unwrap_or(NATIVE_DEFAULT_SIDE);
-        if side == 0 || side % PATCH != 0 || side > MAX_SIDE {
-            bail!("side must be a positive multiple of {PATCH} up to {MAX_SIDE}, not {side}");
+        Model::Depth {
+            side: depth_side(side, NATIVE_DEFAULT_SIDE)?,
         }
-        Model::Depth { side }
     } else {
         if side.is_some() {
             bail!("side is the depth model's input side; it needs model=depth");
@@ -461,7 +557,7 @@ pub fn parse(query: &str) -> Result<Config> {
         (Some(frames), None) => Latency::Frames(frames),
         (None, Some(time)) => Latency::Time(time),
         (None, None) => match model {
-            Model::Synthetic => Latency::Frames(DEFAULT_LATENCY),
+            Model::Synthetic | Model::PassCost(_) => Latency::Frames(DEFAULT_LATENCY),
             Model::Depth { .. } => Latency::Time(NATIVE_DEFAULT_LATENCY),
         },
     };
@@ -473,6 +569,16 @@ pub fn parse(query: &str) -> Result<Config> {
         estimator: chosen.unwrap_or_default(),
         on_beat,
     })
+}
+
+/// The depth model's input side, `side` or else `default`: a positive
+/// multiple of [`PATCH`] up to [`MAX_SIDE`].
+fn depth_side(side: Option<u32>, default: u32) -> Result<u32> {
+    let side = side.unwrap_or(default);
+    if side == 0 || !side.is_multiple_of(PATCH) || side > MAX_SIDE {
+        bail!("side must be a positive multiple of {PATCH} up to {MAX_SIDE}, not {side}");
+    }
+    Ok(side)
 }
 
 /// Parses a tempo, the value of `bpm` or the tempo of `bpm_change`: a decimal
@@ -697,6 +803,62 @@ mod tests {
         assert_eq!(Config::default().frames, 600);
         assert_eq!(Config::default().latency, Latency::Frames(2));
         assert_eq!(Config::default().model, Model::Synthetic);
+    }
+
+    #[test]
+    fn the_pass_cost_measurement_reads_its_own_parameters_and_refuses_the_loops() {
+        let settings = |query: &str| match parse(query).unwrap().model {
+            Model::PassCost(settings) => settings,
+            other => panic!("expected pass-cost, got {other:?}"),
+        };
+        assert_eq!(settings("?model=pass-cost"), pass_cost::Settings::default());
+        let config = parse("?model=pass-cost&frames=300").unwrap();
+        assert_eq!(config.frames, 300);
+        let s =
+            settings("?model=pass-cost&passes=1,64&variants=one-pass,every:16&groups=8&render=on");
+        assert_eq!(s.passes, vec![1, 64]);
+        assert_eq!(
+            s.variants,
+            vec![pass_cost::Variant::OnePass, pass_cost::Variant::Every(16)]
+        );
+        assert_eq!(s.dispatches, Dispatches::Trivial { groups: 8 });
+        assert!(s.render);
+        assert_eq!(
+            settings("?model=pass-cost&kernels=depth").dispatches,
+            Dispatches::Depth {
+                side: DEFAULT_DEPTH_SIDE
+            }
+        );
+        assert_eq!(
+            settings("?kernels=depth&side=154&model=pass-cost").dispatches,
+            Dispatches::Depth { side: 154 }
+        );
+        for bad in [
+            "?model=pass-cost&passes=0",
+            "?model=pass-cost&passes=1,1",
+            "?model=pass-cost&variants=every:0",
+            "?model=pass-cost&variants=all",
+            "?model=pass-cost&kernels=net",
+            "?model=pass-cost&groups=0",
+            "?model=pass-cost&render=yes",
+            "?model=pass-cost&side=112",
+            "?model=pass-cost&kernels=depth&side=100",
+            "?model=pass-cost&kernels=depth&groups=2",
+            "?model=pass-cost&frames=0",
+            "?model=pass-cost&latency=2",
+            "?model=pass-cost&latency_ms=80",
+            "?model=pass-cost&arena_bytes=64",
+            "?model=pass-cost&estimator=capped",
+            "?model=pass-cost&sync=latency",
+            "?model=pass-cost&bpm=100",
+            "?model=pass-cost&passes=8&passes=8",
+            "?passes=8",
+            "?model=depth&variants=ends",
+            "?kernels=trivial",
+            "?model=synthetic&render=off",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
