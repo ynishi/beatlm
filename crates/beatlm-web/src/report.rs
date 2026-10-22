@@ -20,7 +20,9 @@
 //! (`timing_lag_frames`), the frame's first compute pass apart from the later
 //! ones (`first_pass_us`, `later_pass_us`, `first_pass_over_later_mean`), and
 //! a job's estimated GPU time when the loop began and ended
-//! (`job_estimate_us`); and, for the depth model, where the time of the slow
+//! (`job_estimate_us`), and the frames' measured slice time against what they
+//! were planned at with the frame scale read from it (`frame_ratio`,
+//! `frame_scale`, the bench's lines); and, for the depth model, where the time of the slow
 //! slice measurements comes from (`tail_*`, which [`crate::diagnosis`] lists
 //! with what each tests). The last line is `status: done`, so a reader can tell a
 //! finished report from one still being written.
@@ -49,8 +51,9 @@
 //! [`depth::Capacity`] defines it from the loop's own measurements).
 //! [`DepthReport`] says what each is. The `config:` line's `estimator=` is the
 //! page's `estimator` parameter in the form [`crate::config::estimator`]
-//! reads back: the bench's bare name (`quantile`, `mean-sigmas`, `capped`)
-//! when it is exactly what the name means, else the parameterised form. A run
+//! reads back: the bench's bare name (`quantile`, `mean-sigmas`, `capped`,
+//! `frame-scaled`) when it is exactly what the name means, else the
+//! parameterised form. A run
 //! asked for its latency in time also says what it asked for and the period it
 //! was turned into frames at (`latency_asked_ms`, `latency_period_us`); the
 //! frames are `config`'s `latency`.
@@ -82,7 +85,7 @@ use crate::depth::{
 };
 use crate::diagnosis::{Diagnosis, tail};
 use crate::pace::NOMINAL_PERIOD;
-use crate::stats::{histogram, nearest_rank, summarize};
+use crate::stats::{frame_ratio_value, frame_scale_value, histogram, nearest_rank, summarize};
 use crate::workload::{DEFAULT_RENDER_ITERS, DEFAULT_SLICE_ITERS};
 
 /// The two limits a memory plan can need raised, as a device or an adapter
@@ -509,6 +512,12 @@ fn write_diagnosis(out: &mut String, d: &Diagnosis) -> std::fmt::Result {
         out,
         "job_estimate_us: loop_start={} loop_end={}",
         d.job_estimate_us.0, d.job_estimate_us.1
+    )?;
+    writeln!(out, "frame_ratio: {}", frame_ratio_value(&d.frame_ratios))?;
+    writeln!(
+        out,
+        "frame_scale: {}",
+        frame_scale_value(d.frame_scale, d.frames_recorded, &d.frame_scales)
     )
 }
 
@@ -931,6 +940,8 @@ mod tests {
         assert_eq!(config_of("mean-sigmas:0.3:2"), "mean-sigmas:0.3:2");
         assert_eq!(config_of("capped"), "capped");
         assert_eq!(config_of("quantile:0.9:32"), "quantile");
+        assert_eq!(config_of("frame-scaled"), "frame-scaled");
+        assert_eq!(config_of("frame-scaled:0.8"), "frame-scaled:0.8:64:32");
         // Without the parameter it is the core's default, the bench's name.
         let text = report(&Environment::default(), &Outcome::default());
         assert!(

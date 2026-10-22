@@ -535,8 +535,10 @@
 //! | `gpu_frame_us` | per timed frame, render plus every slice, on the GPU: p50, p99, max |
 //! | `longest_dispatch_us` | per timed frame that ran a slice, the longest single measured compute pass: how long one dispatch held up the queue; p50, p99, max |
 //! | `gpu_frames_over_period` | timed frames whose render plus slices took longer than the frame period, of the timed frames: a real overrun that the estimates were supposed to prevent |
+//! | `frame_ratio` | per timed frame that ran slices, their measured GPU time over the sum of their estimates when the frame was planned (`CostModel::frame_estimate`: every slice, except that `frame-scaled` counts only the slices warm in the loop): how many such frames, and min, p50, p90, max; `none` when there were none |
+//! | `frame_scale` | `none` unless `--estimator frame-scaled`; then the frame scale when the run ended (`final`, `warming_up` before the frame window filled), the frames the cost model recorded (`frames_recorded`), and the plans made with a measured scale (`planned_scaled`) with its min, p50, p90 and max over them |
 //! | `background_dispatches` | dispatches the competing load submitted, from the one completed before the first frame to the last one queued when it was stopped; present only with `--background-load` |
-//! | `slice[i]` | the cost model's final estimate for slice `i` against the mean of its measured durations |
+//! | `slice[i]` | the cost model's final estimate for slice `i` against the mean of its measured durations; under `frame-scaled` the estimate is a median: of the loop's measurements once the slice is warm (`beatlm_core::cost::WARM_SAMPLES`), which the scheduler plans at times `frame_scale`, and of all its measurements, calibration's included, before, when the scheduler plans it at their frame quantile instead |
 //! | `workload`, `size`, `fusion`, `split` (in `config`) | present only for a planned program, as `workload=net` or `workload=depth size=N`, then `fusion=on` or `fusion=off`, then `split=on max_dispatch_us=N` or `split=off`; the synthetic report has none. `slices` there is the kernel count before splitting |
 //! | `kernel_parts[i]` | `net` and `depth` only: kernel `i` of the unsplit program, its parts, and the median calibration measured for it run whole (`calibrated_us`, `none` with splitting off) |
 //! | `calibrated_job_us` | `net` and `depth` only: the sum of the `calibrated_us` medians, what one job took paced behind the render pass before it was split; `none` with splitting off |
@@ -565,9 +567,17 @@
 //! # Choosing the cost estimate
 //!
 //! `--estimator` picks the statistic the cost model reads a slice's
-//! measurements with: `mean-sigmas`, `quantile` or `capped` (the parameters are
-//! constants in `engine.rs`). The default is the one the measurements recorded
-//! in `beatlm_core::cost` chose, with the table of every run.
+//! measurements with: `mean-sigmas`, `quantile`, `capped` or `frame-scaled`
+//! (the parameters are constants in `engine.rs`). The default is the one the
+//! measurements recorded in `beatlm_core::cost` chose, with the table of every
+//! run. `frame-scaled` plans a slice at its median times a slowdown measured
+//! over whole frames, and is opt-in; `beatlm_core::cost` ("Planning a frame
+//! against its total") says why and with which parameters. For it the engine
+//! hands each frame's measured slice time back with the estimates those
+//! slices were planned at, which the timer carries in each pass's label, and
+//! calibration records its measurements as calibration's
+//! (`CostModel::record_calibration`), which every other estimator folds as
+//! the loop's.
 //!
 //! # The competing load
 //!

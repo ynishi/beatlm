@@ -29,7 +29,7 @@ use std::rc::Rc;
 use anyhow::{Context, Result, anyhow, bail};
 use beatlm::gpu::{FrameTiming, MAX_SLICES, PassSpan, SliceTimer};
 use beatlm_core::budget::Budget;
-use beatlm_core::cost::{CostModel, Estimator, SliceId};
+use beatlm_core::cost::{CostModel, Estimator, FrameScale, SliceId};
 use beatlm_core::schedule::{Due, FramePlan, JobId, Scheduler, SliceRun};
 use beatlm_core::sync::{MissPolicy, SyncPolicy};
 use beatlm_core::time::{FrameIndex, FrameInfo, Micros, TimePoint};
@@ -47,6 +47,7 @@ use crate::pace::{FrameStart, NOMINAL_PERIOD, Pace, Pacer, ms_to_us};
 use crate::render_cost::{RENDER_PRIOR, RenderCost};
 use crate::report::{DepthReport, Environment, Outcome, STARTUP_FRAMES, render};
 use crate::slots::Net;
+use crate::stats::frame_ratio;
 use crate::workload::Workload;
 
 /// What a slice is assumed to cost until it has been measured: the bench's.
@@ -57,8 +58,14 @@ pub(super) const SLICE_PRIOR: Micros = Micros::new(2_000);
 /// cannot.
 const DRAIN_US: u64 = 1_000_000;
 
-/// The label a timed slice carries from the scheduler to the cost model.
-type Tag = (JobId, SliceId);
+/// The label a timed slice carries from the scheduler to the cost model: its
+/// job, the slice, and what a frame's ratio takes the slice at when the frame
+/// was planned ([`CostModel::frame_estimate`], `None` for a slice left out of
+/// it), the bench's label and for its reason: the frame's measured slice time
+/// is compared with what the same slices were planned at
+/// ([`CostModel::record_frame`]), however many frames later the timing comes
+/// back.
+type Tag = (JobId, SliceId, Option<Micros>);
 
 /// Whether the loop asks for another callback.
 enum Turn {
@@ -321,11 +328,18 @@ impl Host {
                 .texture
                 .create_view(&wgpu::TextureViewDescriptor::default())
         });
+        // The estimates the plan was made with; nothing records into the cost
+        // model before the frame is encoded.
+        let cost = &self.cost;
         match &mut self.timer {
             Some(timer) => {
                 let mut timestamps = timer.begin_frame(frame.index);
                 for run in &plan.runs {
-                    let writes = timestamps.compute_pass((run.job, run.slice))?;
+                    let writes = timestamps.compute_pass((
+                        run.job,
+                        run.slice,
+                        cost.frame_estimate(run.slice),
+                    ))?;
                     encode_slice(&self.load, &self.workload, &mut encoder, run, writes)?;
                 }
                 if let Some(view) = &view {
@@ -373,6 +387,9 @@ impl Host {
         self.outcome
             .dispatches_per_frame
             .push(plan.runs.len() as u64);
+        if let FrameScale::Measured(scale) = self.cost.frame_scale() {
+            self.outcome.diagnosis.frame_scales.push(scale);
+        }
         if new_job.is_some() {
             self.outcome.submitted += 1;
         }
@@ -437,8 +454,12 @@ impl Host {
             let reason = diagnosis::reason(dispatched, due, index);
             self.outcome.diagnosis.missed(reason);
             if reason == Reason::Unstarted {
-                let estimates: Vec<Micros> =
-                    self.slices.iter().map(|&s| self.cost.estimate(s)).collect();
+                // What the projection read: the planning estimates.
+                let estimates: Vec<Micros> = self
+                    .slices
+                    .iter()
+                    .map(|&s| self.cost.planning_estimate(s))
+                    .collect();
                 self.outcome.diagnosis.abandoned.push(Unstarted {
                     frame: index,
                     now_us: now.get(),
@@ -460,11 +481,12 @@ impl Host {
         }
     }
 
-    /// The sum of every slice's estimate now.
+    /// The sum of every slice's planning estimate now: the job as the
+    /// projection sees it.
     fn job_estimate(&self) -> u64 {
         self.slices
             .iter()
-            .map(|&s| self.cost.estimate(s).get())
+            .map(|&s| self.cost.planning_estimate(s).get())
             .sum()
     }
 
@@ -489,12 +511,14 @@ impl Host {
         self.outcome.missed += plan.missed.len() as u64;
     }
 
-    /// Feeds one frame's measurements to the cost model and the report.
+    /// Feeds one frame's measurements to the cost model and the report: each
+    /// slice's, then the frame's measured slice time against the estimates
+    /// its timed slices were planned with.
     fn absorb(&mut self, timing: FrameTiming<Tag>) {
         let passes: Vec<(SliceId, Micros)> = timing
             .compute
             .iter()
-            .map(|&((_, slice), duration)| (slice, duration))
+            .map(|&((_, slice, _), duration)| (slice, duration))
             .collect();
         self.outcome.diagnosis.passes(&passes);
         // Only a depth run writes the `tail_*` lines that read them.
@@ -502,12 +526,25 @@ impl Host {
             self.outcome.diagnosis.frames.push(timed(&timing));
         }
         let mut gpu = Micros::ZERO;
-        for ((_, slice), duration) in &timing.compute {
+        // The ratio's two sides, over the timed slices that had a frame
+        // estimate when the frame was planned.
+        let (mut predicted, mut in_ratio) = (Micros::ZERO, Micros::ZERO);
+        for ((_, slice, planned), duration) in &timing.compute {
             self.cost.record(*slice, *duration);
             let entry = self.outcome.measured.entry(*slice).or_insert((0, 0));
             entry.0 = entry.0.saturating_add(duration.get());
             entry.1 += 1;
             gpu = gpu.saturating_add(*duration);
+            if let Some(planned) = planned {
+                predicted = predicted.saturating_add(*planned);
+                in_ratio = in_ratio.saturating_add(*duration);
+            }
+        }
+        if !timing.compute.is_empty() {
+            self.cost.record_frame(predicted, in_ratio);
+            if let Some(ratio) = frame_ratio(predicted, in_ratio) {
+                self.outcome.diagnosis.frame_ratios.push(ratio);
+            }
         }
         if let Some(longest) = timing.compute.iter().map(|(_, d)| d.get()).max() {
             self.outcome.longest_dispatch_us.push(longest);
@@ -549,6 +586,8 @@ impl Host {
                 .estimates
                 .insert(slice, self.cost.estimate(slice));
         }
+        self.outcome.diagnosis.frame_scale = self.cost.frame_scale();
+        self.outcome.diagnosis.frames_recorded = self.cost.frames_recorded();
         self.outcome.gpu_errors = device::gpu_errors();
         self.outcome
     }
@@ -568,7 +607,7 @@ fn timed(timing: &FrameTiming<Tag>) -> TimedFrame {
             .compute
             .iter()
             .zip(&timing.compute_spans)
-            .map(|(&((_, slice), duration), span)| (slice, pass(duration, span)))
+            .map(|(&((_, slice, _), duration), span)| (slice, pass(duration, span)))
             .collect(),
         render: timing
             .render

@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 
+use beatlm_core::cost::FrameScale;
 use beatlm_core::time::Micros;
 
 /// The median, the 99th percentile and the maximum of a set of samples.
@@ -60,6 +61,69 @@ pub fn histogram<I: IntoIterator<Item = u64>>(values: I) -> BTreeMap<u64, u64> {
     counts
 }
 
+/// A frame's measured slice time over what its slices were planned at, the
+/// ratio the frame-scaled estimate reads; `None` when they were planned at
+/// zero.
+// The browser host calls it from its wasm32-only frame loop, so a native
+// build of `beatlm-web` compiles it unused.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+#[allow(clippy::cast_precision_loss)]
+pub fn frame_ratio(predicted: Micros, measured: Micros) -> Option<f64> {
+    // Microsecond counts this size are exact in an f64.
+    (predicted > Micros::ZERO).then(|| measured.get() as f64 / predicted.get() as f64)
+}
+
+/// ` min=… p50=… p90=… max=…` of `samples`, to two decimals, by nearest rank
+/// as [`summarize`]; empty when there are none.
+fn ratio_summary(samples: &[f64]) -> String {
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    match (
+        sorted.first(),
+        nearest_rank(&sorted, 50),
+        nearest_rank(&sorted, 90),
+        sorted.last(),
+    ) {
+        (Some(min), Some(p50), Some(p90), Some(max)) => {
+            format!(" min={min:.2} p50={p50:.2} p90={p90:.2} max={max:.2}")
+        }
+        _ => String::new(),
+    }
+}
+
+/// The value of the report's `frame_ratio` line: over the timed frames, the
+/// ratio of the measured time of their slices with a frame estimate
+/// (`CostModel::frame_estimate` when the frame was planned) to the sum of
+/// those estimates, for the frames where that sum is above zero; `none` when
+/// there were none. Every slice has one under every estimator but the
+/// frame-scaled one, where only warm slices do, and these are the ratios its
+/// frame scale is a quantile of; under another, how far the frames' measured
+/// time fell from what was planned.
+pub fn frame_ratio_value(ratios: &[f64]) -> String {
+    if ratios.is_empty() {
+        return "none".to_owned();
+    }
+    format!("frames={}{}", ratios.len(), ratio_summary(ratios))
+}
+
+/// The value of the report's `frame_scale` line: `none` for an estimator
+/// without a frame scale; otherwise the scale when the run ended (`final`,
+/// `warming_up` while the frame window was not yet full), the frames the
+/// cost model recorded, and the plans made with a measured scale
+/// (`planned_scaled`) with the spread of the scale over them.
+pub fn frame_scale_value(last: FrameScale, recorded: u64, planned: &[f64]) -> String {
+    let last = match last {
+        FrameScale::None => return "none".to_owned(),
+        FrameScale::WarmingUp { .. } => "warming_up".to_owned(),
+        FrameScale::Measured(scale) => format!("{scale:.2}"),
+    };
+    format!(
+        "final={last} frames_recorded={recorded} planned_scaled={}{}",
+        planned.len(),
+        ratio_summary(planned)
+    )
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -103,6 +167,37 @@ mod tests {
         let mut samples = vec![1_000; 28];
         samples.extend([9_000, 9_000, 9_000, 20_000]);
         assert_eq!(median(&mut samples), Some(Micros::new(1_000)));
+    }
+
+    #[test]
+    fn a_frame_ratio_needs_a_prediction() {
+        assert_eq!(frame_ratio(Micros::ZERO, Micros::new(5)), None);
+        assert_eq!(frame_ratio(Micros::new(400), Micros::new(500)), Some(1.25));
+    }
+
+    #[test]
+    fn the_frame_lines_say_none_and_the_spread() {
+        assert_eq!(frame_ratio_value(&[]), "none");
+        assert_eq!(
+            frame_ratio_value(&[1.5, 1.0, 2.0, 1.25]),
+            "frames=4 min=1.00 p50=1.25 p90=2.00 max=2.00"
+        );
+        assert_eq!(frame_scale_value(FrameScale::None, 9, &[1.0]), "none");
+        assert_eq!(
+            frame_scale_value(
+                FrameScale::WarmingUp {
+                    recorded: 3,
+                    needed: 64
+                },
+                3,
+                &[]
+            ),
+            "final=warming_up frames_recorded=3 planned_scaled=0"
+        );
+        assert_eq!(
+            frame_scale_value(FrameScale::Measured(1.234), 70, &[1.0, 1.234]),
+            "final=1.23 frames_recorded=70 planned_scaled=2 min=1.00 p50=1.00 p90=1.23 max=1.23"
+        );
     }
 
     #[test]

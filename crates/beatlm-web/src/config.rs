@@ -34,8 +34,8 @@
 //! # The estimator parameter
 //!
 //! The value is a name and, after colons, its parameters. The bare names are
-//! the bench's `--estimator` spellings (`quantile`, `mean-sigmas`, `capped`),
-//! each meaning exactly the bench's parameters. The report's `config:` line
+//! the bench's `--estimator` spellings (`quantile`, `mean-sigmas`, `capped`,
+//! `frame-scaled`), each meaning exactly the bench's parameters. The report's `config:` line
 //! prints (`estimator=`, by [`estimator_name`]) the bare name when the
 //! estimator is exactly what it means, as the bench's does, so the default
 //! prints `estimator=quantile`, and the parameterised form otherwise; either
@@ -50,14 +50,20 @@
 //! | `mean-sigmas:<alpha>:<sigmas>` | the same with `alpha` in `(0, 1]` and `sigmas` not negative |
 //! | `capped` | `CappedDeviation`, `alpha` 0.2, `sigmas` 2, `cap` [`COST_CAP`] (0.5) |
 //! | `capped:<alpha>:<sigmas>:<cap>` | the same with `cap` not negative |
+//! | `frame-scaled` | `FrameScaled`, `window` [`DEFAULT_WINDOW`] (32), `frame_window` [`DEFAULT_FRAME_WINDOW`] (64), `frame_quantile` [`DEFAULT_FRAME_QUANTILE`] (0.9) |
+//! | `frame-scaled:<q>` | the same with `frame_quantile` `q`, a number in `(0, 1]` |
+//! | `frame-scaled:<q>:<frame_window>` | the same with a frame window of `frame_window` frames, `1..=`[`MAX_WINDOW`] |
+//! | `frame-scaled:<q>:<frame_window>:<window>` | the same with a slice window of `window` measurements, `1..=`[`MAX_WINDOW`] |
 //!
 //! The parameters of the bare names are the ones the core's choice of
 //! estimator was measured with (`beatlm_core::cost`, "Choosing the
-//! estimator"), which are also the bench's. The old spelling `mean` is
-//! refused. A quantile of 0
+//! estimator"), which are also the bench's; `frame-scaled`'s are the ones
+//! `beatlm_core::cost` ("Planning a frame against its total") gives reasons
+//! for. The old spelling `mean` is refused. A quantile of 0
 //! (the window's minimum) is refused here although the core accepts it, since
-//! it plans every slice for its fastest measurement. The remaining ranges are
-//! the core's, and its error is quoted when one is out of range.
+//! it plans every slice for its fastest measurement, and a frame quantile of
+//! 0 for the same reason. The remaining ranges are the core's, and its error
+//! is quoted when one is out of range.
 //!
 //! It applies to both jobs: the cost model the loop plans with is built with
 //! it. For the depth model that model is the one calibration measured the
@@ -126,8 +132,9 @@
 //!   sum of per-slice quantiles is too high on average and still not a bound
 //!   on the slow frames. The clustering is measured; that it is the whole cause is not.
 //! - **The default stays `quantile:0.9:32`.** The frame budget is the promise
-//!   that must hold; delivery at 120 Hz is left to an estimate made for the
-//!   frame rather than the slice (a follow-up issue).
+//!   that must hold. Delivery at 120 Hz was left to an estimate made for the
+//!   frame rather than the slice, `frame-scaled` (#45); repeated with it,
+//!   below, this comparison did not make it the default.
 //! - **At 83 ms (10 frames) the native default is infeasible on this display
 //!   whatever the estimator.** The `quantile:0.5:32` run measured a run of the
 //!   model in the loop of 68 ms against about 4.6 ms of slice budget per frame:
@@ -136,6 +143,42 @@
 //! - **`capped` delivering least, though its estimates are closest to the
 //!   means, is one run and unexplained.** Do not rank `capped` against
 //!   `quantile:0.9:32` on it.
+//!
+//! **With the frame scale (#45).** The same configuration, the same day,
+//! each pair back to back, one run per cell, no run discarded. "First" is
+//! the version of `frame-scaled` that let calibration's measurements into
+//! the median it scales; "second" keeps them out
+//! (`beatlm_core::cost`, "Planning a frame against its total", says how and
+//! why). F is the report's `frame_scale` over the run.
+//!
+//! | Version | Estimator | Delivered | Missed | Rate | GPU frames over the period | F p50 / p90 (end) | `tail_outlier_frames` (half or more slow) | Loop over calibration, median / mean | Frames needed of 26 |
+//! |---|---|---|---|---|---|---|---|---|---|
+//! | first | `quantile` | 17 | 49 | 0.2576 | 65 of 1497 | | | | |
+//! | first | `frame-scaled` | 8 | 54 | 0.1290 | 28 of 1498 | 2.80 / 6.00 (2.53) | 99 against 99.3 | 1.98 / 2.43 | 23 |
+//! | second | `quantile` | 16 | 51 | 0.2388 | 64 of 1494 | | | | |
+//! | second | `frame-scaled` | 11 | 52 | 0.1746 | 25 of 1491 | 2.04 / 3.91 (1.58) | 53 against 85.0 | 1.83 / 2.27 | 24 |
+//!
+//! The diagnosis columns are from the `frame-scaled` runs. What they show,
+//! and what they do not:
+//!
+//! - **It did not deliver more than the default in either run** (8 against
+//!   17, 11 against 16).
+//! - **It cut the GPU frames over the period to about 40% of the
+//!   default's** (28 of 65, 25 of 64).
+//! - **The clustering that motivated it was absent from both runs:** frames
+//!   with half or more of their measurements slow were as many as
+//!   independent measurements would give, or fewer, where the runs above had
+//!   175 against 26.7. The loop instead ran 1.8 to 2.4 times calibration.
+//! - **Capacity was near its limit,** 23 and 24 of the 26 frames a job had
+//!   even with exact estimates, on this machine at that time, which caps any
+//!   estimator's delivery.
+//! - **Natively** (Apple M1 Pro, Metal, the bench's depth workload at latency
+//!   5) one run of the second version delivered 116 of 116 against the
+//!   default's 101 of 113; one run each ranks nothing, and that machine was
+//!   slower that day than when #41 was measured (`main` delivered 97 of 101,
+//!   calibration at 53.6 ms). `beatlm_core::cost` has the table.
+//!
+//! `frame-scaled` stays opt-in, and the default stays `quantile:0.9:32`.
 //!
 //! **Why a latency in time.** A promise in frames is worth the display's
 //! period, so the native default of 5 frames, a decision made at 60 Hz for
@@ -186,13 +229,23 @@ pub const COST_SIGMAS: f64 = 2.0;
 /// The most `estimator=capped` pads the mean by, as a multiple of it.
 pub const COST_CAP: f64 = 0.5;
 
+/// The frames `estimator=frame-scaled` reads its frame scale from: the
+/// bench's `COST_FRAME_WINDOW`.
+pub const DEFAULT_FRAME_WINDOW: usize = 64;
+
+/// The quantile of the frame ratios `estimator=frame-scaled` reads: the
+/// bench's, the default estimator's quantile.
+pub const DEFAULT_FRAME_QUANTILE: f64 = 0.9;
+
 /// The parameters the query string accepts, as the error for an unknown one
 /// lists them.
 const PARAMETERS: &str = "frames, model, side, latency, latency_ms, arena_bytes, estimator";
 
 /// The forms `estimator` accepts, as the error for another value lists them.
 const ESTIMATOR_FORMS: &str = "quantile, quantile:<q>, quantile:<q>:<window>, mean-sigmas, \
-                               mean-sigmas:<alpha>:<sigmas>, capped or capped:<alpha>:<sigmas>:<cap>";
+                               mean-sigmas:<alpha>:<sigmas>, capped, capped:<alpha>:<sigmas>:<cap>, \
+                               frame-scaled, frame-scaled:<q>, frame-scaled:<q>:<frame_window> or \
+                               frame-scaled:<q>:<frame_window>:<window>";
 
 /// The job each frame submits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -369,16 +422,43 @@ pub fn estimator(value: &str) -> Result<Estimator> {
             sigmas: float(sigmas)?,
             cap: float(cap)?,
         },
+        ("frame-scaled", []) => bare_frame_scaled(),
+        ("frame-scaled", [q]) => Estimator::FrameScaled {
+            frame_quantile: float(q)?,
+            frame_window: DEFAULT_FRAME_WINDOW,
+            window: DEFAULT_WINDOW,
+        },
+        ("frame-scaled", [q, frame_window]) => Estimator::FrameScaled {
+            frame_quantile: float(q)?,
+            frame_window: number("estimator", frame_window)?,
+            window: DEFAULT_WINDOW,
+        },
+        ("frame-scaled", [q, frame_window, window]) => Estimator::FrameScaled {
+            frame_quantile: float(q)?,
+            frame_window: number("estimator", frame_window)?,
+            window: number("estimator", window)?,
+        },
         _ => bail!("query parameter estimator: {value:?} is not {ESTIMATOR_FORMS}"),
     };
-    if let Estimator::WindowedQuantile { window, quantile } = chosen {
-        // `quantile > 0.0` is false for NaN, and `<= 1.0` for infinity.
-        if !(quantile > 0.0 && quantile <= 1.0) {
-            bail!("query parameter estimator: the quantile {quantile} is not in (0, 1]");
+    // `q > 0.0` is false for NaN, and `<= 1.0` for infinity.
+    let in_unit_interval = |name: &str, q: f64| -> Result<()> {
+        if q > 0.0 && q <= 1.0 {
+            Ok(())
+        } else {
+            bail!("query parameter estimator: the {name} {q} is not in (0, 1]")
         }
-        if !(1..=MAX_WINDOW).contains(&window) {
-            bail!("query parameter estimator: the window {window} is not in 1..={MAX_WINDOW}");
+    };
+    match chosen {
+        Estimator::WindowedQuantile { window, quantile } => {
+            in_unit_interval("quantile", quantile)?;
+            if !(1..=MAX_WINDOW).contains(&window) {
+                bail!("query parameter estimator: the window {window} is not in 1..={MAX_WINDOW}");
+            }
         }
+        Estimator::FrameScaled { frame_quantile, .. } => {
+            in_unit_interval("frame quantile", frame_quantile)?;
+        }
+        Estimator::MeanPlusSigmas { .. } | Estimator::CappedDeviation { .. } => {}
     }
     // The core owns the ranges of the other parameters; building a model is
     // how its check is asked.
@@ -413,6 +493,15 @@ const fn bare_capped() -> Estimator {
     }
 }
 
+/// The estimator the bare `frame-scaled` names, the bench's.
+const fn bare_frame_scaled() -> Estimator {
+    Estimator::FrameScaled {
+        window: DEFAULT_WINDOW,
+        frame_window: DEFAULT_FRAME_WINDOW,
+        frame_quantile: DEFAULT_FRAME_QUANTILE,
+    }
+}
+
 /// `estimator` in a form [`estimator`] reads back: the bench's bare name when
 /// the estimator is exactly what that name means, else the name with every
 /// parameter written. What the report's `config:` line prints.
@@ -427,12 +516,20 @@ pub fn estimator_name(estimator: Estimator) -> String {
     if estimator == bare_capped() {
         return "capped".to_owned();
     }
+    if estimator == bare_frame_scaled() {
+        return "frame-scaled".to_owned();
+    }
     match estimator {
         Estimator::MeanPlusSigmas { alpha, sigmas } => format!("mean-sigmas:{alpha}:{sigmas}"),
         Estimator::WindowedQuantile { window, quantile } => format!("quantile:{quantile}:{window}"),
         Estimator::CappedDeviation { alpha, sigmas, cap } => {
             format!("capped:{alpha}:{sigmas}:{cap}")
         }
+        Estimator::FrameScaled {
+            window,
+            frame_window,
+            frame_quantile,
+        } => format!("frame-scaled:{frame_quantile}:{frame_window}:{window}"),
     }
 }
 
@@ -582,6 +679,27 @@ mod tests {
                 cap: 0.0
             }
         );
+        let scaled = |frame_quantile, frame_window, window| Estimator::FrameScaled {
+            window,
+            frame_window,
+            frame_quantile,
+        };
+        assert_eq!(estimator("frame-scaled").unwrap(), scaled(0.9, 64, 32));
+        assert_eq!(estimator("frame-scaled:0.8").unwrap(), scaled(0.8, 64, 32));
+        assert_eq!(
+            estimator("frame-scaled:0.95:128").unwrap(),
+            scaled(0.95, 128, 32)
+        );
+        assert_eq!(
+            estimator("frame-scaled:1:1:4096").unwrap(),
+            scaled(1.0, 1, 4096)
+        );
+        assert_eq!(
+            parse("?model=depth&side=266&frames=1500&latency_ms=200&estimator=frame-scaled")
+                .unwrap()
+                .estimator,
+            scaled(0.9, 64, 32)
+        );
     }
 
     #[test]
@@ -617,6 +735,18 @@ mod tests {
             "Quantile",
             "mean-sigmas:",
             "quantile%3A0.9",
+            "frame-scaled:",
+            "frame-scaled:0",
+            "frame-scaled:1.5",
+            "frame-scaled:NaN",
+            "frame-scaled:0.9:0",
+            "frame-scaled:0.9:4097",
+            "frame-scaled:0.9:64:0",
+            "frame-scaled:0.9:64:4097",
+            "frame-scaled:0.9:64:32:1",
+            "frame-scaled:0.9:6.5",
+            "frame",
+            "Frame-scaled",
         ] {
             assert!(estimator(value).is_err(), "{value:?}");
             let query = format!("?estimator={value}");
@@ -635,6 +765,14 @@ mod tests {
         );
         let said = estimator("p99").unwrap_err().to_string();
         assert!(said.contains("quantile:<q>:<window>"), "{said}");
+        assert!(
+            said.contains("frame-scaled:<q>:<frame_window>:<window>"),
+            "{said}"
+        );
+        let said = estimator("frame-scaled:0").unwrap_err().to_string();
+        assert!(said.contains("frame quantile 0 is not in (0, 1]"), "{said}");
+        let said = estimator("frame-scaled:0.9:0").unwrap_err().to_string();
+        assert!(said.contains("frame window must be in"), "{said}");
     }
 
     #[test]
@@ -655,6 +793,13 @@ mod tests {
             ("capped:0.2:2:0.5", "capped"),
             ("capped:0.2:2:0.6", "capped:0.2:2:0.6"),
             ("capped:0.25:1.5:0.75", "capped:0.25:1.5:0.75"),
+            ("frame-scaled", "frame-scaled"),
+            ("frame-scaled:0.9", "frame-scaled"),
+            ("frame-scaled:0.9:64", "frame-scaled"),
+            ("frame-scaled:0.9:64:32", "frame-scaled"),
+            ("frame-scaled:0.8", "frame-scaled:0.8:64:32"),
+            ("frame-scaled:0.9:128", "frame-scaled:0.9:128:32"),
+            ("frame-scaled:0.9:64:16", "frame-scaled:0.9:64:16"),
         ] {
             let chosen = estimator(value).unwrap();
             assert_eq!(estimator_name(chosen), name, "{value}");
