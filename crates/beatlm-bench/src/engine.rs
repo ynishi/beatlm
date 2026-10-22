@@ -569,10 +569,10 @@ impl<'g> Engine<'g> {
         }
     }
 
-    /// Starts the readback, polls the device with `poll`, and feeds what has
-    /// completed to the cost model and the report.
+    /// Polls the device with `poll`, and feeds what has completed to the cost
+    /// model and the report. The frame's map was requested when it was
+    /// submitted.
     fn read_back(&mut self, poll: wgpu::PollType) -> Result<()> {
-        self.timer.start_readback();
         self.gpu.device.poll(poll).context("device poll failed")?;
         for timing in self.timer.collect_ready() {
             self.absorb(timing);
@@ -645,12 +645,16 @@ impl<'g> Engine<'g> {
         }
         self.workload
             .encode_render(&mut encoder, &self.target, timestamps.render_pass()?);
-        timestamps.resolve(&mut encoder);
+        let resolved = timestamps.resolve(&mut encoder);
         let commands = encoder.finish();
 
         let submitting = Instant::now();
         self.gpu.queue.submit([commands]);
         let submitted = Instant::now();
+        // Straight after the submit, with nothing that can fail in between,
+        // so a submitted frame always comes back to the timer; after the
+        // instant is taken, so the map request is not charged to the submit.
+        self.timer.submitted(resolved);
 
         self.outcome
             .plan_us

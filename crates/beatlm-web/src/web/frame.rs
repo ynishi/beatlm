@@ -418,7 +418,7 @@ impl Host {
         // The estimates the plan was made with; nothing records into the cost
         // model before the frame is encoded.
         let cost = &self.cost;
-        match &mut self.timer {
+        let resolved = match &mut self.timer {
             Some(timer) => {
                 let mut timestamps = timer.begin_frame(frame.index);
                 for run in &plan.runs {
@@ -441,7 +441,7 @@ impl Host {
                         writes,
                     );
                 }
-                timestamps.resolve(&mut encoder);
+                Some(timestamps.resolve(&mut encoder))
             }
             None => {
                 for run in &plan.runs {
@@ -458,13 +458,19 @@ impl Host {
                         None,
                     );
                 }
+                None
             }
-        }
+        };
         let commands = encoder.finish();
 
         let submitting = self.performance.now();
         self.gpu.queue.submit([commands]);
         let submitted = self.performance.now();
+        // Straight after the submit, with nothing that can fail in between,
+        // so a submitted frame always comes back to the timer.
+        if let (Some(timer), Some(resolved)) = (&mut self.timer, resolved) {
+            timer.submitted(resolved);
+        }
         match canvas {
             Some(texture) => self.gpu.queue.present(texture),
             None => self.outcome.canvas_unavailable += 1,
@@ -507,17 +513,15 @@ impl Host {
         Ok(())
     }
 
-    /// Requests the maps of the frames just submitted and feeds every frame
-    /// whose map has completed to the cost model and the report.
+    /// Feeds every frame whose map has completed to the cost model and the
+    /// report. The map of the frame just submitted was requested with its
+    /// submission.
     ///
     /// `Device::poll` is not called: in a browser it does nothing, and the map
     /// callbacks have run from the event loop before this callback began.
     fn read_back(&mut self) {
         let ready = match &mut self.timer {
-            Some(timer) => {
-                timer.start_readback();
-                timer.collect_ready()
-            }
+            Some(timer) => timer.collect_ready(),
             None => return,
         };
         for timing in ready {

@@ -142,8 +142,16 @@ and this project adheres to
 - A job projected to miss its deadline is abandoned at once only when another
   job waits behind it; a lone one keeps running and is decided at its
   deadline, so its slices are measured and estimates can come down.
+- `FrameTimestamps::resolve` returns a `ResolvedFrame`, which the host hands
+  to `SliceTimer::submitted` straight after the `queue.submit` carrying the
+  encoder; that call requests the map. `SliceTimer::start_readback` is gone
+  (breaking).
 
 ### Fixed
+
+- `SliceTimer`: a frame resolved into an encoder that was then dropped
+  instead of submitted is no longer read; its slot held an earlier frame's
+  timestamps, which were reported as its own and fed to the cost model.
 
 - `beatlm-web`: a depth result reaches the screen only in the frame that
   delivers it; a later job on the same slot could show its depth before then.

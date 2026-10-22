@@ -247,9 +247,9 @@ fn measure(
             None
         };
         workload.encode_render(&mut encoder, target, render);
-        timestamps.resolve(&mut encoder);
+        let resolved = timestamps.resolve(&mut encoder);
         gpu.queue.submit([encoder.finish()]);
-        timer.start_readback();
+        timer.submitted(resolved);
         gpu.device
             .poll(wgpu::PollType::wait_indefinitely())
             .context("device poll failed")?;

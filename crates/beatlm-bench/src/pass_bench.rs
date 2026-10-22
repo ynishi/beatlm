@@ -90,11 +90,12 @@ pub fn run(gpu: &Gpu, args: &Args) -> Result<PassOutcome> {
         if settings.render {
             workload.encode_render(&mut encoder, &target, None);
         }
-        timestamps.resolve(&mut encoder);
+        let resolved = timestamps.resolve(&mut encoder);
         let commands = encoder.finish();
         let submitting = Instant::now();
         queue.submit([commands]);
         let submitted = Instant::now();
+        timer.submitted(resolved);
         if !untimed {
             measurements.record_cpu(
                 index,
@@ -102,7 +103,6 @@ pub fn run(gpu: &Gpu, args: &Args) -> Result<PassOutcome> {
                 nanos_between(submitting, submitted),
             );
         }
-        timer.start_readback();
         read_back(gpu, &mut timer, &mut measurements)?;
     }
     let (dropped, _) = pacer.finish();

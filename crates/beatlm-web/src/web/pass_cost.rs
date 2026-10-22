@@ -138,11 +138,12 @@ pub async fn run(config: &Config, settings: &Settings) -> Result<()> {
         if let Some((_, view)) = &canvas {
             workload.encode_render(&mut encoder, view, None);
         }
-        timestamps.resolve(&mut encoder);
+        let resolved = timestamps.resolve(&mut encoder);
         let commands = encoder.finish();
         let submitting = performance.now();
         gpu.queue.submit([commands]);
         let submitted = performance.now();
+        timer.submitted(resolved);
         if let Some((texture, _)) = canvas {
             gpu.queue.present(texture);
         }
@@ -154,7 +155,6 @@ pub async fn run(config: &Config, settings: &Settings) -> Result<()> {
             );
         }
         submitted_at = submitted;
-        timer.start_readback();
     }
     outcome.frames = total;
     outcome.timer = timer.stats();

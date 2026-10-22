@@ -52,6 +52,16 @@
 //! Step 2 before step 3 is the load-bearing part: queue order is what makes a
 //! slice complete before the frame that uses it is drawn.
 //!
+//! The timestamps of step 4 come from [`gpu::SliceTimer`], and reach it along
+//! the same steps: the frame's passes take their timestamp writes from it, the
+//! frame's encoder ends with the resolve, and the
+//! [`ResolvedFrame`](gpu::ResolvedFrame) that returns goes back to the timer
+//! ([`gpu::SliceTimer::submitted`]) straight after the `queue.submit` carrying
+//! that encoder. Only frames handed back that way are read; an encoder dropped
+//! instead of submitted takes its frame's timing with it, which is lost and
+//! never misread as a later frame's ([`gpu`] has the rule, and why the step is
+//! the host's).
+//!
 //! ## Concurrency model
 //!
 //! **A synchronous `tick`, called once per frame on the thread that runs the
