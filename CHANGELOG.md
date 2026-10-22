@@ -166,6 +166,10 @@ and this project adheres to
   timer label) live once in `beatlm_host::frame`. The page's calibration now
   runs the bench's timer-capacity checks before each pass, so a split the
   loop's timer cannot hold is refused before calibration spends its frames.
+- Both hosts drive one clock-free frame step, `beatlm_host::step::FrameStep`
+  (plan, after_submit, absorb, complete, finish into a `Tally`), and keep
+  only their clock, device calls and I/O. The order plan → after_submit →
+  complete is held by types. No plan, count or report line changed.
 
 ### Fixed
 
