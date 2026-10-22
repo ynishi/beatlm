@@ -170,6 +170,9 @@ and this project adheres to
   (plan, after_submit, absorb, complete, finish into a `Tally`), and keep
   only their clock, device calls and I/O. The order plan → after_submit →
   complete is held by types. No plan, count or report line changed.
+- Which calibration frames count (the second half of each pass) and the
+  first pass's per-kernel medians come from `beatlm_host::calibration`;
+  each host still drives the two passes itself.
 
 ### Fixed
 

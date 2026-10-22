@@ -9,10 +9,11 @@
 //! 1. **Whole kernels, to decide.** The network is built unsplit on one slot
 //!    and run as one whole job followed by the synthetic render pass per frame,
 //!    each frame submitted and waited for, reading every kernel's timed compute
-//!    pass. A kernel's duration is the [`median`] of its measurements in the
-//!    second half of the timed frames, whatever `--estimator` is. The decision
-//!    is the core's (`Program::parts_within`, which owns the rule); this module
-//!    only measures. A kernel is split for what it usually takes after the GPU
+//!    pass. A kernel's duration is the [`median`](beatlm_host::stats::median)
+//!    of its measurements in the second half of the timed frames ([`counted`]
+//!    says why only those), whatever `--estimator` is ([`KernelSamples`]). The
+//!    decision is the core's (`Program::parts_within`, which owns the rule);
+//!    this module only measures. A kernel is split for what it usually takes after the GPU
 //!    has run the paced load for half a second, not for what an estimator that
 //!    also reads the first half, or pads by the deviation, would have made of
 //!    it.
@@ -50,9 +51,9 @@ use beatlm::gpu::{MAX_SLICES, SliceTimer};
 use beatlm_core::cost::{CostModel, Estimator, SliceId};
 use beatlm_core::kernel::Program;
 use beatlm_core::time::{FrameIndex, Micros};
+use beatlm_host::calibration::{KernelSamples, counted};
 use beatlm_host::frame::timer_capacity;
 use beatlm_host::presets::CALIBRATION_FRAMES;
-use beatlm_host::stats::median;
 use beatlm_host::workload::Workload;
 
 use crate::device::Gpu;
@@ -128,26 +129,15 @@ pub fn calibrate(
     }
 
     // Pass 1: whole kernels, to decide.
-    let mut samples: Vec<Vec<u64>> = vec![Vec::new(); whole.kernels().len()];
+    let mut first = KernelSamples::new(whole.kernels().len());
     {
         let net = Net::new(&gpu.device, &gpu.queue, numbers, 1, whole.clone())
             .context("cannot build the network to calibrate")?;
         measure(gpu, workload, target, &net, |frame, slice, duration| {
-            let list = usize::try_from(slice.get())
-                .ok()
-                .and_then(|i| samples.get_mut(i));
-            if let (true, Some(list)) = (frame > CALIBRATION_FRAMES / 2, list) {
-                list.push(duration.get());
-            }
+            first.record(frame, slice, duration);
         })?;
     }
-    let mut durations = Vec::with_capacity(samples.len());
-    for (kernel, list) in samples.iter_mut().enumerate() {
-        durations.push(
-            median(list)
-                .with_context(|| format!("calibration measured kernel {kernel} no time"))?,
-        );
-    }
+    let durations = first.durations()?;
 
     let parts = whole
         .parts_within(&durations, settings.bound)
@@ -174,13 +164,11 @@ pub fn calibrate(
     {
         let net = Net::new(&gpu.device, &gpu.queue, numbers, 1, program.clone())
             .context("cannot build the split network to calibrate")?;
-        // The same second half as pass 1: the first half is the GPU settling
-        // into the paced load, and an estimator that keeps every sample would
-        // otherwise start the loop from it.
-        // Recorded as calibration's: the frame-scaled estimate keeps them out
-        // of the median it scales; every other one folds them as the loop's.
+        // The frames pass 1 counts ([`counted`]), recorded as calibration's:
+        // the frame-scaled estimate keeps them out of the median it scales;
+        // every other one folds them as the loop's.
         measure(gpu, workload, target, &net, |frame, slice, duration| {
-            if frame > CALIBRATION_FRAMES / 2 {
+            if counted(frame) {
                 cost.record_calibration(slice, duration);
             }
         })?;

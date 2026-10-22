@@ -19,6 +19,7 @@ use beatlm::load::depth_anything_v2::{Config, inventory};
 use beatlm_core::cost::{CostModel, Estimator, SliceId};
 use beatlm_core::kernel::Program;
 use beatlm_core::time::{FrameIndex, Micros};
+use beatlm_host::calibration::counted;
 use beatlm_host::frame::timer_capacity;
 use beatlm_host::presets::{CALIBRATION_FRAMES, SLICE_PRIOR};
 use beatlm_host::slots::{Net, Numbers};
@@ -140,7 +141,7 @@ pub struct Calibration {
 /// part is expected within [`MAX_DISPATCH_US`], and measures the parts, each
 /// pass [`CALIBRATION_FRAMES`] timed frames of one whole job followed by the
 /// synthetic render pass, as the bench's `calibrate.rs` does and for its
-/// reasons.
+/// reasons, each counting the frames [`counted`] keeps.
 ///
 /// The bench paces each frame on its grid and waits on the device for its
 /// timings; here each frame starts at an animation frame, and the next one
@@ -224,7 +225,7 @@ pub async fn calibrate(
         })
         .await?;
         measure(gpu, workload, &net, |frame, compute| {
-            if depth::counted(frame) {
+            if counted(frame) {
                 for &(slice, duration) in compute {
                     // Calibration's, which the frame-scaled estimate keeps
                     // out of the median it scales; the bench's call.

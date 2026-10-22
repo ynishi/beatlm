@@ -531,11 +531,12 @@
 //!
 //! The load, the depth model's slots, the frame's step (its plan, the labels
 //! of its timed passes, what each measurement feeds, the delivery and miss
-//! counts, and the rules it is made of), the timer's capacity, the pass-cost
-//! measurement, the report's shared lines and its statistics come from
-//! [`beatlm_host`], the crate both hosts depend on, whose documentation lists
-//! what it holds; so the two hosts time the same kernels at the same sizes,
-//! decide and count a frame the same way and quote the same statistic. The
+//! counts, and the rules it is made of), the timer's capacity, which of
+//! calibration's measurements count, the pass-cost measurement, the report's
+//! shared lines and its statistics come from [`beatlm_host`], the crate both
+//! hosts depend on, whose documentation lists what it holds; so the two hosts
+//! time the same kernels at the same sizes, decide and count a frame the same
+//! way, calibrate from the same frames and quote the same statistic. The
 //! model, its loader and its reference comparison come from `beatlm::model`
 //! and `beatlm::load`, the kernels from `beatlm::codegen`, the timer, the
 //! limits and the arenas from `beatlm::gpu`, and the decisions from
@@ -545,9 +546,13 @@
 //! `requestAnimationFrame` loop and its pacer, `performance.now()`, the canvas
 //! and the display, the timer it may lack, the beats, the diagnosis of the
 //! misses, and a warm-up, a calibration and a drain that wait on the event
-//! loop rather than block. Calibration's two passes follow the bench's
-//! `calibrate.rs` in that form: the bench blocks on the device between them,
-//! which a page cannot.
+//! loop rather than block. Each host drives calibration's two passes itself
+//! (`web/model.rs` here, `calibrate.rs` in the bench), because driving them is
+//! waiting between frames: the bench blocks on the device, a page awaits the
+//! next animation frame. Which timed frames count, and the first pass's
+//! per-kernel medians, come from [`beatlm_host::calibration`]; the page also
+//! keeps each whole run's
+//! GPU time, for its report's `gpu_run_us` ([`depth::WholeRuns`]).
 //!
 //! # Builds
 //!

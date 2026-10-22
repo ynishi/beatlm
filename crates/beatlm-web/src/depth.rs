@@ -17,9 +17,8 @@ use beatlm_core::kernel::{Fusion, Program};
 use beatlm_core::memory::{MemoryPlan, TensorId};
 use beatlm_core::schedule::{FramePlan, JobId};
 use beatlm_core::time::Micros;
-use beatlm_host::presets::CALIBRATION_FRAMES;
+use beatlm_host::calibration::{KernelSamples, counted};
 use beatlm_host::slots::{self, Numbers};
-use beatlm_host::stats::median;
 use beatlm_host::workload::{DEFAULT_STAGE_STORAGE_BUFFERS, RenderOrder, written_fits};
 
 use crate::pace::NOMINAL_PERIOD;
@@ -220,20 +219,13 @@ pub fn latency_ms(frames: u32, period: Micros) -> f64 {
     f64::from(frames) * period.get() as f64 / 1_000.0
 }
 
-/// Whether a calibration frame's measurements count: those of the second half
-/// of the timed frames, as the bench's calibration keeps them, after the GPU
-/// has settled into the paced load. `frame` counts from 1 for the first timed
-/// frame.
-#[must_use]
-pub fn counted(frame: u64) -> bool {
-    frame > CALIBRATION_FRAMES / 2
-}
-
-/// What calibration's first pass keeps: each kernel's counted measurements,
-/// and each counted run's GPU time, the sum of its kernels.
+/// What calibration's first pass keeps: each kernel's counted measurements
+/// ([`KernelSamples`], as the bench keeps them), and each counted run's GPU
+/// time, the sum of its kernels, which only the page's report quotes
+/// (`gpu_run_us`).
 #[derive(Debug, Clone, Default)]
 pub struct WholeRuns {
-    samples: Vec<Vec<u64>>,
+    kernels: KernelSamples,
     runs: Vec<u64>,
 }
 
@@ -242,7 +234,7 @@ impl WholeRuns {
     #[must_use]
     pub fn new(kernels: usize) -> Self {
         Self {
-            samples: vec![Vec::new(); kernels],
+            kernels: KernelSamples::new(kernels),
             runs: Vec::new(),
         }
     }
@@ -255,16 +247,11 @@ impl WholeRuns {
             return;
         }
         let mut total = 0u64;
-        for (slice, duration) in compute {
-            let list = usize::try_from(slice.get())
-                .ok()
-                .and_then(|i| self.samples.get_mut(i));
-            if let Some(list) = list {
-                list.push(duration.get());
-            }
+        for &(slice, duration) in compute {
+            self.kernels.record(frame, slice, duration);
             total = total.saturating_add(duration.get());
         }
-        if compute.len() == self.samples.len() {
+        if compute.len() == self.kernels.kernels() {
             self.runs.push(total);
         }
     }
@@ -275,21 +262,13 @@ impl WholeRuns {
         &self.runs
     }
 
-    /// Each kernel's duration: the median of its counted measurements, the
-    /// statistic the decision reads (`beatlm-bench`'s `calibrate.rs`).
+    /// Each kernel's duration, as [`KernelSamples::durations`] gives it.
     ///
     /// # Errors
     ///
     /// A kernel that was never measured in a counted frame.
     pub fn durations(&mut self) -> Result<Vec<Micros>> {
-        self.samples
-            .iter_mut()
-            .enumerate()
-            .map(|(kernel, list)| {
-                median(list)
-                    .with_context(|| format!("calibration measured kernel {kernel} no time"))
-            })
-            .collect()
+        self.kernels.durations()
     }
 }
 
@@ -638,6 +617,7 @@ mod tests {
     use beatlm_core::sync::{MissPolicy, SyncPolicy};
     use beatlm_core::time::{FrameIndex, FrameInfo, TimePoint};
     use beatlm_host::frame::{Admission, Submit};
+    use beatlm_host::presets::CALIBRATION_FRAMES;
 
     /// A fixed-latency depth run of `frames` frames at `latency` frames, as
     /// the page runs it: `latency + 1` slots, jobs of two 1 ms slices, an input
