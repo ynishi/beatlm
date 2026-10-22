@@ -13,80 +13,202 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::{Context, Result, bail};
-use beatlm::gpu::{Arenas, FrameTiming, SliceTimer, profile, required_limits};
+use beatlm::gpu::{Arenas, FrameTiming, ResolvedFrame, SliceTimer, profile, required_limits};
 use beatlm_core::memory::{DType, MemoryPlan, TensorDesc, TensorId};
 use beatlm_host::workload::{RENDER_HEIGHT, RENDER_WIDTH, TARGET_FORMAT};
 
 use super::page;
 use crate::report::SizeLimits;
 
-/// Errors the device reported outside an error scope since it was created.
+/// Errors the device reported outside an error scope since it was created:
+/// what the `uncapturederror` handler counted.
 ///
 /// A static because wgpu requires the handler to be `Send` and `Sync`, which a
 /// handle on the page or the run is not in a browser build; the page has one
 /// run, so one count serves it.
-static GPU_ERRORS: AtomicU64 = AtomicU64::new(0);
+static UNCAPTURED_ERRORS: AtomicU64 = AtomicU64::new(0);
+
+/// Errors a frame's error scope caught ([`Submission`]), which never reach
+/// the handler; a static for the reason [`UNCAPTURED_ERRORS`] is one.
+static SCOPED_ERRORS: AtomicU64 = AtomicU64::new(0);
+
+/// Frames' error scopes popped whose promise has not settled yet
+/// ([`Submission`]); a static for the reason [`UNCAPTURED_ERRORS`] is one.
+static SCOPES_PENDING: AtomicU64 = AtomicU64::new(0);
 
 /// Why the device was lost, once it has been; a static for the reason
-/// [`GPU_ERRORS`] is one.
+/// [`UNCAPTURED_ERRORS`] is one.
 static DEVICE_LOST: Mutex<Option<String>> = Mutex::new(None);
 
-/// How many errors the device has reported so far.
+/// How many errors the device has reported so far: those raised outside any
+/// error scope and those a frame's scope caught, so `gpu_errors` in the
+/// report counts every rejected frame.
+///
+/// A frame's scope keeps only the first error it catches, as every error
+/// scope does, so a rejected frame counts once however many of its calls
+/// raised one (an invalid encoder's `finish` and the `submit` that refuses
+/// it). A scope whose promise has not settled is not counted yet
+/// ([`scopes_pending`]). It leaves out errors the scopes of [`accepted`]
+/// caught, which fail the run before it starts.
 pub fn gpu_errors() -> u64 {
-    GPU_ERRORS.load(Ordering::Relaxed)
+    UNCAPTURED_ERRORS
+        .load(Ordering::Relaxed)
+        .saturating_add(SCOPED_ERRORS.load(Ordering::Relaxed))
 }
 
-/// How the page learns that the device rejected a frame it submitted: from
-/// [`GPU_ERRORS`], with no work in the frame.
+/// How many frames' error scopes have not settled, and so are not yet in
+/// [`gpu_errors`]: a run that reports the count waits for this to reach
+/// zero, as it waits for its frames' timings.
+pub fn scopes_pending() -> u64 {
+    SCOPES_PENDING.load(Ordering::Relaxed)
+}
+
+/// How the page learns that the device rejected a frame it submitted, and
+/// keeps the timer from reading it: the rule is **a frame is collected only
+/// once the error scope around its own submission settled with no error, and
+/// while no uncaptured error has been raised since it was submitted**. The
+/// page submits a timed frame only through a [`Submission`] and collects
+/// only through [`collect_ready`](Self::collect_ready), so no frame skips it.
 ///
-/// A rejected submission reaches the page only as an `uncapturederror`, which
-/// does not say which submission it was. A check of the count just before
-/// [`SliceTimer::collect_ready`] marks whatever the timer was handed since
-/// ([`SliceTimer::invalidate_submitted`]) once the handler has counted the
-/// error; valid frames among it lose their timing, and `gpu_errors` in the
-/// report says why.
+/// **A frame rejected at its own submission is never read**, whatever order
+/// the browser delivers its map and its error in. [`Submission`] pushes a
+/// validation scope before the frame's `finish`, pops it straight after its
+/// `queue.submit`, and hands the frame to the timer held
+/// ([`SliceTimer::submitted_held`]); the frame is accepted once the scope's
+/// promise settles with no error and rejected if it caught one, so only that
+/// frame loses its timing. The scope's error is counted in `gpu_errors` and
+/// logged as the handler logs, because a scoped error never reaches the
+/// handler.
 ///
-/// That narrows the window in which a rejected frame is read; it does not
-/// close it, because the specification does not order the event before the
-/// map. A submission is validated on the device timeline before the map
-/// requested after it can complete, but the two reach the page by different
-/// paths: the map's success steps are one global task on the WebGPU task
-/// source, while dispatching an uncaptured error issues a task that only then
-/// queues a second one to fire the event ("dispatch error"). The map's task
-/// can therefore run first, and an animation-frame callback in between
-/// collects the frame on the timestamps an earlier lap left in its slot. The
-/// specification also lets a user agent throttle or not fire the event at
-/// all, and an error it never fires is never counted. What the watch does
-/// guarantee is narrower: a rejected frame whose error is counted before the
-/// callback that would collect it is never read. Browsers deliver the error
-/// and the map completion together in practice, which is what the watch
-/// relies on; it is not a proof.
+/// The scope takes `finish` and `queue.submit` because those are the calls
+/// that report a frame's rejection: an encoder's recording errors, its
+/// passes' included, are raised by `finish`, and a command buffer that is
+/// invalid or uses a resource it may not is refused by `submit`; recording
+/// itself raises nothing. Validation is the only filter, because a rejected
+/// command buffer always raises a validation error, and neither call
+/// allocates, so neither raises an out-of-memory one. The map is requested
+/// after the pop, so its own errors stay outside the scope.
 ///
-/// An error scope per frame would say which frame, and collecting a frame
-/// only after its scope's promise settled would close the window, at the
-/// cost of two calls into the browser and a promise to await every frame, and
-/// would take the frame's errors away from the count the report gives.
+/// **An error outside every frame's scope** (an allocation that ran out of
+/// memory, the map's own errors) reaches the page only as an
+/// `uncapturederror`, which does not say which submission it was. A check of
+/// that count just before [`SliceTimer::collect_ready`] marks everything the
+/// timer holds in flight, held frames included
+/// ([`SliceTimer::invalidate_submitted`]), once the handler has counted the
+/// error; valid frames among it lose their timing. That guarantee is weaker:
+/// the specification does not order the event before a map's completion (the
+/// map's success steps are one task on the WebGPU task source, while
+/// dispatching an uncaptured error queues a task that queues a second to fire
+/// the event), and it lets a user agent throttle or not fire the event at
+/// all. What it does guarantee is that a frame in flight when such an error
+/// is counted, before the callback that would collect it, is never read.
+///
+/// The scope costs a push and a pop into the browser, a promise and a task
+/// per frame (the loop charges the push to `cpu_encode_us` and so to
+/// `cpu_start_to_submit_us`, the pop and the task's creation to
+/// `cpu_start_to_tick_end_us`; `cpu_queue_submit_us` holds neither), and
+/// holds each frame's collection until its scope settles. Frames are
+/// collected in submission order (`SliceTimer::collect_ready` has the rule),
+/// so a frame whose scope has not settled also holds back the frames after
+/// it, and a rejected one holds back nothing; a held frame keeps its readback
+/// slot as any frame in flight does, so a frame that needs the slot goes
+/// untimed and counts in `timings_skipped`.
 pub struct ErrorWatch {
     seen: u64,
 }
 
 impl ErrorWatch {
-    /// A watch that counts from the errors reported so far.
+    /// A watch that counts uncaptured errors from those reported so far.
     pub fn from_now() -> Self {
-        Self { seen: gpu_errors() }
+        Self {
+            seen: UNCAPTURED_ERRORS.load(Ordering::Relaxed),
+        }
     }
 
     /// [`SliceTimer::collect_ready`], after marking everything `timer` was
-    /// handed as submitted and has not returned when the device has reported
-    /// an error since the last call. The page collects only through this, so
-    /// no collection skips the check.
+    /// handed and has not returned when the device has raised an uncaptured
+    /// error since the last call.
     pub fn collect_ready<T>(&mut self, timer: &mut SliceTimer<T>) -> Vec<FrameTiming<T>> {
-        let errors = gpu_errors();
+        let errors = UNCAPTURED_ERRORS.load(Ordering::Relaxed);
         if errors != self.seen {
             self.seen = errors;
             timer.invalidate_submitted();
         }
         timer.collect_ready()
+    }
+}
+
+/// One frame's submission, from [`open`](Self::open) to the frame's return to
+/// the timer held: the frame's validation error scope. [`ErrorWatch`] has the
+/// rule.
+///
+/// Dropped instead of handed back, on an error path, it pops its scope and
+/// discards what the scope caught; the frame it was opened for is then never
+/// handed to the timer either, so nothing is read.
+///
+/// **A pop the browser refuses accepts the frame.** wgpu's pop future yields
+/// `None` both when the scope caught nothing and when the `popErrorScope`
+/// promise rejects (the specification rejects it with an `OperationError`
+/// when the device's scope stack is empty), so the two cannot be told apart
+/// here, and such a frame is read as one the device ran.
+#[must_use = "hand it back with Submission::submitted straight after queue.submit"]
+pub struct Submission {
+    scope: wgpu::ErrorScopeGuard,
+}
+
+impl Submission {
+    /// Opens a frame's submission on `device`: call it after the frame is
+    /// recorded and before its encoder is finished, and hand the result back
+    /// straight after `queue.submit` ([`Submission::submitted`]), with no
+    /// other call on the device in between. A host whose encode time is a
+    /// measurement compared with the native bench's (`model=pass-cost`)
+    /// opens it before the frame's encoder is created instead, so the push
+    /// is not in the span: recording raises nothing, and an error the
+    /// frame's own creation calls raise is the frame's.
+    pub fn open(device: &wgpu::Device) -> Self {
+        Self {
+            scope: device.push_error_scope(wgpu::ErrorFilter::Validation),
+        }
+    }
+
+    /// Closes the submission straight after `queue.submit`, and hands
+    /// `resolved` to `timer` held until the scope settles. Either may be
+    /// `None`, for a frame with no timer; the scope still counts what it
+    /// caught.
+    pub fn submitted<T>(self, timer: Option<&mut SliceTimer<T>>, resolved: Option<ResolvedFrame>) {
+        // Popped before the map is requested, so the map's own errors stay
+        // outside the frame's scope.
+        let caught = self.scope.pop();
+        let held = match (timer, resolved) {
+            (Some(timer), Some(resolved)) => timer.submitted_held(resolved),
+            _ => None,
+        };
+        SCOPES_PENDING.fetch_add(1, Ordering::Relaxed);
+        wasm_bindgen_futures::spawn_local(async move {
+            let caught = caught.await;
+            // Counted before the frame is settled, so a run that sees the
+            // frame collected or failed also sees its error counted.
+            if caught.is_some() {
+                SCOPED_ERRORS.fetch_add(1, Ordering::Relaxed);
+            }
+            SCOPES_PENDING.fetch_sub(1, Ordering::Relaxed);
+            match caught {
+                None => {
+                    if let Some(held) = held {
+                        held.accept();
+                    }
+                }
+                Some(error) => {
+                    page::log_error(&format!(
+                        "gpu_error: {}",
+                        page::one_line(&error.to_string())
+                    ));
+                    if let Some(held) = held {
+                        held.reject();
+                    }
+                }
+            }
+        });
     }
 }
 
@@ -196,7 +318,7 @@ pub async fn open(canvas: web_sys::HtmlCanvasElement, need: Need) -> Result<Gpu>
     // run, and the report counts the errors; a lost device fails the run at
     // the next callback.
     device.on_uncaptured_error(Arc::new(|error: wgpu::Error| {
-        GPU_ERRORS.fetch_add(1, Ordering::Relaxed);
+        UNCAPTURED_ERRORS.fetch_add(1, Ordering::Relaxed);
         page::log_error(&format!(
             "gpu_error: {}",
             page::one_line(&error.to_string())

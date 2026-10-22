@@ -346,7 +346,8 @@ pub struct PassCostOutcome {
     /// Frames of `render=on` whose canvas texture could not be acquired, so
     /// their render pass did not run.
     pub canvas_unavailable: u64,
-    /// Errors the device reported outside an error scope during the run.
+    /// Errors the device raised during the run: outside every scope, or in a
+    /// frame's own scope, which keeps one per frame.
     pub gpu_errors: u64,
 }
 

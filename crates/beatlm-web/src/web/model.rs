@@ -301,8 +301,9 @@ async fn measure(
             }
             timestamps.resolve(&mut encoder)
         };
+        let submission = device::Submission::open(&gpu.device);
         gpu.queue.submit([encoder.finish()]);
-        timer.submitted(resolved);
+        submission.submitted(Some(&mut timer), Some(resolved));
         if let Some((texture, _)) = canvas {
             gpu.queue.present(texture);
         }

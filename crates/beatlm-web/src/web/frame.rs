@@ -61,8 +61,10 @@ use crate::onbeat::{self, Beats};
 use crate::pace::{FrameStart, NOMINAL_PERIOD, Pace, Pacer, ms_to_us};
 use crate::report::{DepthReport, Environment, Outcome, render};
 
-/// How long after the last frame the host waits for timings still in flight
-/// before it reports without them, in microseconds: a second, whatever the
+/// How long after the last frame the host waits for timings still in flight,
+/// and for frames' error scopes still settling
+/// ([`device::scopes_pending`]), before it reports without them, in
+/// microseconds: a second, whatever the
 /// display's rate. The bench blocks on the device instead, which a page
 /// cannot.
 const DRAIN_US: u64 = 1_000_000;
@@ -320,8 +322,11 @@ impl Host {
             Pace::Done => {
                 self.read_back();
                 let drain_from = *self.drain_from_us.get_or_insert(now_us);
+                // Untimed frames' scopes are not in the timer's count, and
+                // `gpu_errors` counts a scope's error only once it settles.
                 let in_flight = self.timer.as_ref().map_or(0, SliceTimer::in_flight);
-                if in_flight == 0 || now_us.saturating_sub(drain_from) >= DRAIN_US {
+                let settled = in_flight == 0 && device::scopes_pending() == 0;
+                if settled || now_us.saturating_sub(drain_from) >= DRAIN_US {
                     Ok(Turn::Finished)
                 } else {
                     Ok(Turn::Continue)
@@ -434,6 +439,7 @@ impl Host {
                 None
             }
         };
+        let submission = device::Submission::open(&self.gpu.device);
         let commands = encoder.finish();
 
         let submitting = self.performance.now();
@@ -441,9 +447,7 @@ impl Host {
         let submitted = self.performance.now();
         // Straight after the submit, with nothing that can fail in between,
         // so a submitted frame always comes back to the timer.
-        if let (Some(timer), Some(resolved)) = (&mut self.timer, resolved) {
-            timer.submitted(resolved);
-        }
+        submission.submitted(self.timer.as_mut(), resolved);
         match canvas {
             Some(texture) => self.gpu.queue.present(texture),
             None => self.outcome.canvas_unavailable += 1,
@@ -479,7 +483,7 @@ impl Host {
     ///
     /// `Device::poll` is not called: in a browser it does nothing, and the map
     /// callbacks have run from the event loop before this callback began.
-    /// Frames the device may have rejected are marked first
+    /// A frame the device may have rejected is never among them
     /// ([`device::ErrorWatch`]).
     fn read_back(&mut self) {
         let ready = match &mut self.timer {
