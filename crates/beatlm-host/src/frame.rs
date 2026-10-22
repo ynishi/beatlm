@@ -62,6 +62,29 @@ pub type Tag = (JobId, SliceId, Option<Micros>);
 /// `beatlm-web`'s `diagnosis` module has what was found next. Its run, a later
 /// one of the same configuration, measured 1 573 µs with slices: the two runs
 /// differ, and neither shows the render carrying the slices.
+///
+/// # Why this frame's budget reads the last render
+///
+/// A fast render widens the next frame's budget, and the suspicion (#5) was
+/// that the scheduler then packs a slice the next, normal render pushes over
+/// the period. Budgets from the median or the 90th percentile of the recent
+/// renders were measured against the last one and did not do better:
+/// - natively (Apple M1 Pro, Metal, release, 2026-10-23, Depth Anything V2
+///   Small at 266 pixels, latency 5, `--submit free`, both render orders, two
+///   runs each) all three delivered 119 of 120 with no frame over the period;
+///   a fast render widened the budget by 223–320 µs at the 90th percentile,
+///   inside the 2 000 µs margin, and frames after one ran no more slices under
+///   the last render than under the others;
+/// - in Chrome 154 (WebGPU, 120 Hz, the same model, `latency_ms=200`, 1 500
+///   frames, one run each) the page's default render order delivered 161 of
+///   163 with the last render, 180 of 183 with the median and 160 of 164 with
+///   the 90th percentile, with 15, 20 and 18 frames over the period; under
+///   `render_order=free`, where the render measures the slices beside it,
+///   they delivered 31, 36 and 18, the 90th percentile budgeting the inflated
+///   render and starving the jobs.
+///
+/// Nothing measured favours a smoothed budget, so it reads the last render;
+/// the forecast for the frames to come is already the median.
 #[derive(Debug, Clone)]
 pub struct RenderCost {
     /// The render measured last, or the prior.
